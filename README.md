@@ -57,16 +57,17 @@ On Windows the programs end in `.exe`. The model can be asked for a sum of 1 to 
 e, each after the first with a + or - (`prog r=c-d-e+b:`), a product of two (`prog r=a*e:`), or a word
 of 1 to 8 small letters (`prog print hello:`); anything else is refused.
 
-To watch it, open `docs/subleq.html` in a browser: pick a task, see the program the model wrote, and
-step through it on the gate machine, every memory cell and every step explained.
+To watch it, open [the playground](https://darpan-97.github.io/terngate-subleq/subleq.html): pick a
+task, see the program the model wrote, and step through it on the gate machine, every memory cell and
+every step explained. From a clone, `docs/subleq.html` opens in a browser as it is.
 
 ## Documentation
 
 - [The computer, and the model that programs it](docs/subleq.md): how the computer is built from the
   gate model's gates, what the model is shown, how many programs it writes right, how it was taught,
   and how it teaches itself
-- [The SUBLEQ playground](docs/subleq.html); its data, `docs/subleq_data.js`, is made by
-  `out/subleq_write export`
+- [The SUBLEQ playground](https://darpan-97.github.io/terngate-subleq/subleq.html) (`docs/subleq.html`);
+  its data, `docs/subleq_data.js`, is made by `out/subleq_write export`
 
 ## Files
 

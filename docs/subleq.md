@@ -132,6 +132,78 @@ The other 36 have no such inputs that keep every step inside what the machine do
 divides by counting down, so a number it counts must not be below 0, and a divisor must be above 0;
 every value stays from -32768 to 32767. The right ones took 4 steps on average and 14 at most.
 
+### The computer as a transformer
+
+The computer above is ordinary code. `models/subleq_computer.tlm2` is the same computer as a third
+transformer, run by the same engine as the two models -- but nothing in it was learned:
+`subleq/computer_build.nitropz` sets every one of its weights by hand. Given a program's memory as bytes,
+it writes the run itself, a byte a pass. `out/subleq_computer run subleq/programs/product.txt 0 0 7 3`
+(c = 7, d = 3; r is the word at 22):
+
+```
+  step 1: the model writes 3 at 20, next 3   | the machine writes 3 at 20, next 3
+  step 2: the model writes 2 at 20, next 6   | the machine writes 2 at 20, next 6
+  step 3: the model writes 65529 at 18, next 9   | the machine writes 65529 at 18, next 9
+  step 4: the model writes 7 at 22, next 12   | the machine writes 7 at 22, next 12
+  ...
+  step 14: the model writes 21 at 22, next 12   | the machine writes 21 at 22, next 12
+  step 15: the model writes 0 at 18, next 0   | the machine writes 0 at 18, next 0
+  step 16: the model writes 0 at 20, next 15   | the machine writes 0 at 20, next 15
+  step 17: the model writes 0 at 18, next 65535   | the machine writes 0 at 18, next 65535
+  the model ended with STOP
+every step the same as the machine's
+```
+
+The left side is what the model wrote, read back; the right is the gate machine. A byte is a type and a
+nibble (16 * type + nibble). The prompt states each word of memory that is not 0 -- its value's four
+nibbles, then its address's three -- and then pc 0. Each step the model writes the word it changes and
+where (11 bytes with the next pc), or the byte it prints (6), and at the end STOP, or END where the
+playground's trace ends a run without a stop (pc past 509, an address past 511).
+
+How a transformer can do that exactly, with every layer weight -1, 0 or +1 and every layer's input
+rounded to whole numbers from -127 to 127:
+
+- One channel is 127 in every byte's embedding and the largest number at every layer, so the rounding
+  is always relative to it: a channel holding a whole number comes back as exactly that number. A bank
+  of channels holding 1, 2, 4 .. 64 gives the constants the engine has no biases for.
+- Attention is exact when the winning position scores 60 more than every other (the engine's softmax
+  then gives the rest exactly 0). Heads that look a fixed distance back gather a statement's nibbles
+  into its last byte; that byte is then one key (the address, a bit in each of the head's slowest
+  rotation pairs) and one value (16 bits). A read finds the latest statement of an address: a
+  statement nearer scores more. A word nobody has stated reads as 0, from a default each reading byte
+  offers itself, scoring between a right address and one a bit off.
+- A feed-forward unit is a ReLU exactly (its gate is far past where the engine's SiLU clamps), so it
+  computes with whole numbers: mem[b] - mem[a] takes four layers -- each nibble compared, the carry into
+  each nibble, into each bit, then each bit -- 16 bits exact, as the gate machine's sub16.
+- The step is worked out at the last byte of the pc before it, in 8 layers: fetch mem[pc], mem[pc + 1],
+  mem[pc + 2]; read mem[a] and mem[b]; subtract; decide "0 or less" and the next pc, or a print, STOP
+  or END. In layer 9 every byte of the step copies those from there and writes the byte after its own.
+
+It has 9 layers, 3 heads of 128, 384 channels and 128 hidden units a layer: 6.6 million weights, 1.46 MB
+packed -- 95 times the file of a trained model, because a read must find an address across the whole
+view, and only a head's slowest rotation pairs hold an address that far. (Computers have been built into
+transformers before, as constructions: Giannou et al., "Looped Transformers as Programmable Computers",
+2023, and Liang et al., "Looped ReLU MLPs May Be All You Need as Practical Programmable Computers",
+2025. Both keep the whole memory inside the network and rewrite it each pass; a model that writes a byte
+at a time can only add to what it has written, so here memory is what it has written, found by attention.)
+
+| checked | how it came out |
+|---|---|
+| the programs of `out/subleq_computer check`: sums, a product, a quotient, printing, 16-bit wrap, STOP and END, code that rewrites a jump and runs it, words never stated | 12 of 12, every step; the two that run past the view right at every step written |
+| memories drawn at random (`random`): code that writes over itself, prints, jumps out of range, operands past 511 or into words never stated | 400 of 400, every step: 12,447 steps |
+| five reviewers trying to break it: every borrow pattern, results 0, -1, 32767 and -32768 against far and near jumps, pc 507 to 511, reads 2,000 bytes back past a neighbour one address bit away | every failure they found was a word never stated, now read as 0 |
+| with a fault planted -- an address bit not compared, a carry flipped, a unit of the next pc flipped, no default read | each goes wrong |
+| the nitropz engine and the playground's | every chance bit for bit, a whole run |
+| `subleq/computer_build.nitropz` and `docs/subleq_computer.js`, written apart | the same file, byte for byte |
+
+What it cannot do yet: a run must fit the model's view of 2,048 bytes -- the prompt (7 bytes a word that
+is not 0, and 4) and the steps (11 bytes each, 6 a print). The product above takes 144 + 187 bytes; a
+quotient of 200 by 1, 800 steps, gets 167 right and fills the view. Going on would need the model to
+state memory again within the view, which it does not; and a longer view will not do, since at 4,096
+bytes back an address's bits no longer outscore a near address one bit off. It is slow: the product
+above takes about 1.2 seconds, and a run filling the view about 15 (7 ms a byte, the engine attending to
+every byte before); in the browser's engine about five times that.
+
 ### Teaching itself
 
 A model can teach itself what it can already sometimes do. It tries tasks it was never shown a program

@@ -1,0 +1,1142 @@
+# computer_build.nitropz [OUT [FAULT]] -- the hand-built computer: a transformer whose every weight is
+# set here by hand, not trained, that runs SUBLEQ itself in the same engine the trained models run in
+# (core/engine.nitropz; the playground's docs/subleq_engine.js), a byte a pass. Written to OUT
+# (models/subleq_computer.tlm2 unless named); the bytes it reads and writes are computer_lib.nitropz's,
+# and subleq/computer.nitropz runs it against the gate machine. FAULT plants a fault for the checks'
+# controls: "addrbit" (address bit 0 not compared when reading mem[a] and mem[b]), "carry" (one carry
+# unit's sign flipped), "mux" (one unit of the next pc's choice flipped), "nodefault" (no default read).
+#
+# Shape: 9 layers, 3 heads of 128, DIM 384, HIDDEN 128, CONTEXT 2048. What makes the engine exact:
+#   * channel 0, the ANCHOR, is 127 in every byte's embedding and the largest number at every read, so
+#     the 8-bit rounding is relative to it: a channel holding a whole number v, read x m, rounds to v * m;
+#   * a BANK of constants 1, 2, 4 .. 64 gives any whole number to 254 with ternary weights (the biases the
+#     engine has not got);
+#   * every byte's embedding has the same sum of squares and everything a layer writes is TINY (1e-6 of
+#     the anchor), so RMSNorm's scale is the same everywhere and the rounding scale s is one number:
+#     each write's matrix scale is worked out from it (calibrate), and each read's gain brings a TINY
+#     channel back to whole numbers;
+#   * a feed-forward unit is relu(gate) * up exactly (gates far past 60, where SiLU's clamp makes it a
+#     ReLU, and a hidden anchor 127 * 1 pinning that rounding);
+#   * an attention head's winner gets weight exactly 1 when every rival scores 60 less: heads that look a
+#     fixed distance back (RoPE alone), and memory reads (the address's 9 bits in the head's slowest
+#     RoPE pairs, the latest statement of it winning by a recency pair).
+# The layers, at the last byte of each step's pc (N3), where the step is worked out:
+#   1  heads 1, 2, 3 back gather nibbles; feed-forward: pc + 1, pc + 2, whether pc >= 510
+#   2  heads 4, 5, 6 back; feed-forward: at every A2, its word as a key (address) and a value (16 bits);
+#      at every N3 the value 0 (the default, read when no statement of an address exists); pc + 3
+#   3  three reads: mem[pc], mem[pc + 1], mem[pc + 2]; feed-forward: a print, a >= 512, b >= 512, a stop
+#   4  two reads: mem[a], mem[b]; feed-forward: per nibble, greater or equal
+#   5  the carry into each nibble     6  the carry into each bit     7  the bits of mem[b] - mem[a]
+#   8  0 or less; the next pc; what comes next (a word, a print, STOP or END)
+#   9  every byte copies those from the latest N3, and writes the byte after its own
+# The playground's JavaScript makes the same file byte for byte (subleq/computer_check.js holds it to that).
+import std
+import std_io
+import os
+import fs
+import mathf
+import fastmath
+
+fn tell(text): write(1, text, slen(text))
+
+fn fail(text):
+    tell(concat(concat("computer_build: ", text), "\n"))
+    exit(1)
+
+# ---- the shape ----
+let DIM = 384
+let HEADS = 3
+let HEAD = 128
+let PAIRS = 64
+let HIDDEN = 128
+let CONTEXT = 2048
+let LAYERS = 9
+let RHO = 16
+let TINY: f64 = 0.000001
+let FAULT = ""
+
+# ---- the model being made: weights -1/0/1 a byte each, scales and gains as doubles ----
+let MATS = alloc(LAYERS * 7 * 4)     # each layer's q k v o gate up down, a byte a weight
+let SC = alloc(LAYERS * 7 * 8)       # their scales
+let GAINS = alloc(LAYERS * 2 * DIM * 8)  # each layer's two norms' gains
+let EMB = alloc(256 * DIM)           # the embedding, a whole number a byte (times 1/127)
+let FIN = alloc(DIM * 8)             # the last norm's gains
+let UNIT = alloc(DIM * 8)            # a channel's raw size of one whole unit (0: nothing writes it yet)
+let MAXABS = alloc(DIM * 4)          # the largest whole number a channel holds
+let HN = alloc(LAYERS * 4)           # the next free hidden unit, a layer
+let HV = alloc(LAYERS * HEADS * 4)   # the next free value slot, a head
+let NEXT_CH = 0
+let S_ROUND: f64 = 0.0               # s: every read's rounding scale
+let F32 = alloc(8)
+
+fn f32(x: f64) -> f64:               # x as a float (as the file keeps it)
+    storef32(F32, x)
+    return loadf32(F32)
+
+fn mat(l, m): return load(MATS + (l * 7 + m) * 4)
+fn cols(m):                          # a row's length: DIM, but HIDDEN for the down matrix
+    if m == 6: return HIDDEN
+    return DIM
+fn rows(m):
+    if m == 4 or m == 5: return HIDDEN
+    return DIM
+fn w_get(l, m, row, i): return load8(mat(l, m) + row * cols(m) + i)
+fn w_put(l, m, row, i, v): store8(mat(l, m) + row * cols(m) + i, v)
+fn sc_at(l, k): return SC + (l * 7 + k) * 8
+fn gain_at(l, which, ch): return GAINS + ((l * 2 + which) * DIM + ch) * 8
+
+fn start():
+    let l = 0
+    while l < LAYERS:
+        let m = 0
+        while m < 7:
+            let size = rows(m) * cols(m)
+            let a = alloc(size)
+            mem_fill(a, 0, size)
+            store(MATS + (l * 7 + m) * 4, a)
+            storef(sc_at(l, m), 1.0)
+            m += 1
+        let i = 0
+        while i < DIM:
+            storef(gain_at(l, 0, i), 1.0)
+            storef(gain_at(l, 1, i), 1.0)
+            i += 1
+        store(HN + l * 4, 1)                 # hidden unit 0 is the hidden anchor
+        let h = 0
+        while h < HEADS:
+            store(HV + (l * HEADS + h) * 4, 0)
+            h += 1
+        w_put(l, 4, 0, 0, 1)                 # its gate: the anchor (127); its up: bank 1
+        w_put(l, 5, 0, 1, 1)
+        w_put(l, 2, 0, 0, 1)                 # head 0's value slot 0: the anchor
+        store(HV + (l * HEADS) * 4, 1)
+        l += 1
+    mem_fill(EMB, 0, 256 * DIM)
+    let i = 0
+    while i < DIM:
+        storef(FIN + i * 8, 1.0)
+        storef(UNIT + i * 8, 0.0)
+        store(MAXABS + i * 4, 0)
+        i += 1
+    chan(1, 127)                             # the anchor
+    chan(7, 64)                              # the bank
+    let v = 0
+    while v < 256:
+        store8(EMB + v * DIM, 127)
+        let b = 0
+        while b < 7:
+            store8(EMB + v * DIM + 1 + b, 1 << b)
+            b += 1
+        v += 1
+
+fn chan(n, most):                    # n residual channels: the first's number
+    if NEXT_CH + n > DIM: fail("out of channels")
+    let at = NEXT_CH
+    let i = 0
+    while i < n:
+        store(MAXABS + (at + i) * 4, most)
+        i += 1
+    NEXT_CH += n
+    return at
+
+fn hidden(l):
+    let at = load(HN + l * 4)
+    if at >= HIDDEN: fail(concat("out of hidden units in layer ", str(l)))
+    store(HN + l * 4, at + 1)
+    return at
+
+# ---- rows: terms (channel, +-1) gathered, then set ----
+let TG = alloc(64 * 8)               # the gate's terms, the up's, the outputs'
+let TU = alloc(64 * 8)
+let TO = alloc(16 * 8)
+let NG = 0
+let NU = 0
+let NO = 0
+
+fn g(ch, s):
+    store(TG + NG * 8, ch)
+    store(TG + NG * 8 + 4, s)
+    NG += 1
+fn u(ch, s):
+    store(TU + NU * 8, ch)
+    store(TU + NU * 8 + 4, s)
+    NU += 1
+fn o(ch, s):
+    store(TO + NO * 8, ch)
+    store(TO + NO * 8 + 4, s)
+    NO += 1
+
+fn put_term(l, m, row, ch, s):
+    if s != 1 and s != -1: fail("a weight not -1 or 1")
+    if w_get(l, m, row, ch) != 0: fail("a weight set twice")
+    w_put(l, m, row, ch, s)
+
+fn put_constant(l, m, row, n):       # a whole number through the anchor and the bank, the largest first
+    if n == 0: return 0
+    let r = n
+    let sign = 1
+    if n < 0:
+        r = 0 - n
+        sign = -1
+    if r > 254: fail("a constant past 254")
+    if r >= 127:
+        put_term(l, m, row, 0, sign)
+        r -= 127
+    let i = 6
+    while i >= 0:
+        if r >= (1 << i):
+            put_term(l, m, row, 1 + i, sign)
+            r -= 1 << i
+        i -= 1
+    return 0
+
+fn put_list(l, m, row, terms, count):
+    let i = 0
+    while i < count:
+        put_term(l, m, row, load(terms + i * 8), load(terms + i * 8 + 4))
+        i += 1
+
+# a feed-forward unit: relu(gate) * up, both whole numbers. ff: up 1 (a plain relu); ffu: up = the up
+# terms and up_const. The terms gathered are used and cleared.
+fn ff_unit(l, gate_const, plain, up_const):
+    let k = hidden(l)
+    put_list(l, 4, k, TG, NG)
+    put_constant(l, 4, k, gate_const)
+    if plain: put_constant(l, 5, k, 1)
+    else:
+        put_list(l, 5, k, TU, NU)
+        put_constant(l, 5, k, up_const)
+    let i = 0
+    while i < NO:
+        let ch = load(TO + i * 8)
+        if w_get(l, 6, ch, k) != 0: fail("a down weight set twice")
+        w_put(l, 6, ch, k, load(TO + i * 8 + 4))
+        i += 1
+    NG = 0
+    NU = 0
+    NO = 0
+    return k
+fn ff(l, gate_const): return ff_unit(l, gate_const, 1, 0)
+fn ffu(l, gate_const, up_const): return ff_unit(l, gate_const, 0, up_const)
+
+# ---- reads: the gain making channel ch round to mult a whole unit ----
+fn read_as(l, which, ch, mult: f64):
+    if loadf(UNIT + ch * 8) == 0.0: fail(concat("a channel read before anything writes it: ", str(ch)))
+    let m: f64 = mult
+    if m < 0.0: m = 0.0 - m
+    if f64(load(MAXABS + ch * 4)) * m > 127.0: fail(concat("a read could pass the anchor: ", str(ch)))
+    let gn: f64 = f32(mult * loadf(UNIT) / loadf(UNIT + ch * 8))
+    let at = gain_at(l, which, ch)
+    if loadf(at) != 1.0 and loadf(at) != gn: fail(concat("a channel read two ways at once: ", str(ch)))
+    storef(at, gn)
+
+# ---- the embedding: a byte's type one-hot (or DUMMY for the bytes below 16) and its nibble's bits ----
+fn embed(type_at, dummy, nib):
+    let v = 0
+    while v < 256:
+        let t = v >> 4
+        if t == 0: store8(EMB + v * DIM + dummy, 1)
+        else: store8(EMB + v * DIM + type_at + t - 1, 1)
+        let j = 0
+        while j < 4:
+            if (v >> j) & 1: store8(EMB + v * DIM + nib + j, 1)
+            else: store8(EMB + v * DIM + nib + j, -1)
+            j += 1
+        v += 1
+    let ss0 = -1
+    v = 0
+    while v < 256:                   # every row's sum of squares the same
+        let ss = 0
+        let i = 0
+        while i < DIM:
+            let e = load8(EMB + v * DIM + i)
+            ss += e * e
+            i += 1
+        if ss0 < 0: ss0 = ss
+        elif ss != ss0: fail("the embedding's rows differ in size")
+        v += 1
+    let i = 0
+    while i < DIM:
+        let used = 0
+        v = 0
+        while v < 256:
+            if load8(EMB + v * DIM + i) != 0: used = 1
+            v += 1
+        if used: storef(UNIT + i * 8, 1.0 / 127.0)
+        i += 1
+    # s, worked out as the engine works it, on byte 0's row
+    let rs: f64 = f32(1.0 / 127.0)
+    let ss: f64 = 0.0
+    i = 0
+    while i < DIM:
+        let x: f64 = f64(load8(EMB + i)) * rs
+        ss = ss + x * x
+        i += 1
+    let inv: f64 = fast_rsqrt(ss / f64(DIM) + 0.00001)
+    S_ROUND = 127.0 / (f64(load8(EMB)) * rs * inv * 1.0)
+
+# ---- attention ----
+let POS_L = alloc(16 * 4)            # the heads that look a fixed distance back: layer, head, distance
+let POS_H = alloc(16 * 4)
+let POS_D = alloc(16 * 4)
+let NPOS = 0
+
+fn pos_head(l, h, offset):           # each pair's query at angle 0 (the anchor), its key at the angle
+    let j = 0                        #   `offset` positions turn, from the bank
+    while j < PAIRS:
+        let at = h * HEAD + 2 * j
+        let th: f64 = f64(offset) / fpow(10000.0, f64(2 * j) / f64(HEAD))
+        w_put(l, 0, at, 0, 1)
+        put_constant(l, 1, at, i32(ffloor(127.0 * fcos(th) + 0.5)))
+        put_constant(l, 1, at + 1, i32(ffloor(127.0 * fsin(th) + 0.5)))
+        j += 1
+    store(POS_L + NPOS * 4, l)
+    store(POS_H + NPOS * 4, h)
+    store(POS_D + NPOS * 4, offset)
+    NPOS += 1
+
+fn value(l, h, src):                 # head h's next value slot <- src; the attention output's index
+    let slot = load(HV + (l * HEADS + h) * 4)
+    if slot >= HEAD: fail("a head out of value slots")
+    store(HV + (l * HEADS + h) * 4, slot + 1)
+    let at = h * HEAD + slot
+    w_put(l, 2, at, src, 1)
+    return at
+
+fn from_att(l, at, dst): w_put(l, 3, dst, at, 1)
+
+let ROPE_C = 0                       # the engine's rotation tables (model_rope), for sizing heads
+let ROPE_S = 0
+
+fn rope():
+    ROPE_C = alloc(CONTEXT * PAIRS * 8)
+    ROPE_S = alloc(CONTEXT * PAIRS * 8)
+    let p = 0
+    while p < CONTEXT:
+        let j = 0
+        while j < PAIRS:
+            let angle: f64 = f64(p) / fpow(10000.0, f64(2 * j) / f64(HEAD))
+            storef(ROPE_C + (p * PAIRS + j) * 8, fcos(angle))
+            storef(ROPE_S + (p * PAIRS + j) * 8, fsin(angle))
+            j += 1
+        p += 1
+
+let QV = alloc(128 * 8)
+let KV = alloc(128 * 8)
+
+fn score(d) -> f64:                  # QV against KV turned d positions apart
+    let t: f64 = 0.0
+    let j = 0
+    while j < PAIRS:
+        let c: f64 = loadf(ROPE_C + (d * PAIRS + j) * 8)
+        let s: f64 = loadf(ROPE_S + (d * PAIRS + j) * 8)
+        let q0: f64 = loadf(QV + 2 * j * 8)
+        let q1: f64 = loadf(QV + (2 * j + 1) * 8)
+        t = t + ((q0 * c - q1 * s) * loadf(KV + 2 * j * 8) + (q0 * s + q1 * c) * loadf(KV + (2 * j + 1) * 8))
+        j += 1
+    return t
+
+# the smallest score gap of the layer's fixed-distance heads over the whole view (q and k come from the
+# constants alone), and the q and k scale making it `want` after the 1 / sqrt(HEAD)
+fn size_positional(l, want: f64):
+    let worst: f64 = 1.0e300
+    let k = 0
+    while k < NPOS:
+        if load(POS_L + k * 4) == l:
+            let h = load(POS_H + k * 4)
+            let offset = load(POS_D + k * 4)
+            let r = 0
+            while r < HEAD:
+                let a = 0
+                let b = 0
+                let i = 0
+                while i < DIM:
+                    let c = 0
+                    if i == 0: c = 127
+                    elif i <= 7: c = 1 << (i - 1)
+                    a += w_get(l, 0, h * HEAD + r, i) * c
+                    b += w_get(l, 1, h * HEAD + r, i) * c
+                    i += 1
+                storef(QV + r * 8, f64(a))
+                storef(KV + r * 8, f64(b))
+                r += 1
+            let at: f64 = score(offset)
+            let d = 0
+            while d < CONTEXT:
+                if d != offset:
+                    let gap: f64 = at - score(d)
+                    if gap < worst: worst = gap
+                d += 1
+        k += 1
+    if worst <= 0.0: fail("a fixed-distance head does not peak where it should")
+    let unit: f64 = 1.0 / S_ROUND
+    let sq: f64 = fsqrt(want / (worst * unit * unit / fsqrt(f64(HEAD))))
+    storef(sc_at(l, 0), sq)
+    storef(sc_at(l, 1), sq)
+
+# ---- what a sublayer writes, made TINY a whole unit (see the top) ----
+fn calibrate(l, attn, per_unit: f64, from, count):   # channels from .. from + count - 1
+    if attn: storef(sc_at(l, 3), TINY * S_ROUND / (loadf(sc_at(l, 2)) * per_unit))
+    else:
+        if loadf(sc_at(l, 4)) == 1.0: storef(sc_at(l, 4), 1000000.0)
+        storef(sc_at(l, 6), TINY * S_ROUND * S_ROUND / (loadf(sc_at(l, 4)) * loadf(sc_at(l, 5))))
+    let i = 0
+    while i < count:
+        storef(UNIT + (from + i) * 8, TINY)
+        i += 1
+
+# ---- the computer ----
+let TYPE = 0
+let DUMMY = 0
+let NIB = 0
+let G1 = 0                           # G1 .. G6: the bits of the byte 1 .. 6 back, 4 channels each, in a row
+let P1 = 0
+let PC2 = 0
+let HI2 = 0
+let LO2 = 0
+let KC = 0
+let WV = 0
+let PC3 = 0
+let BIG = 0
+let RECENCY = 54
+
+fn is_type(t): return TYPE + t - 1
+fn gch(d): return G1 + (d - 1) * 4
+fn pc_bit(i):                        # pc's bits at an N3: N0 is 3 back, N1 2, N2 1, N3 the byte itself
+    if i < 4: return gch(3) + i
+    if i < 8: return gch(2) + i - 4
+    if i < 12: return gch(1) + i - 8
+    return NIB + i - 12
+fn addr_bit(i):                      # at an A2: its word's address -- A0 2 back, A1 1, A2's own bit 0
+    if i < 4: return gch(2) + i
+    if i < 8: return gch(1) + i - 4
+    return NIB
+fn val_bit(i): return gch(6 - (i >> 2)) + (i & 3)   # V0 6 back .. V3 3 back
+
+# bit i of a count-bit number, from a channel function's choice: 0 pc, 1 P1
+fn bit_of(which, i):
+    if which == 0: return pc_bit(i)
+    return P1 + i
+
+# +1 on bits from `from` (+-1 bits): out_i = s_i + 2 c_i - 4 AND(from..i), c_i = AND(from..i-1)
+fn increment(l, which, from, n, dst):
+    let i = 0
+    while i < n:
+        if i < from:
+            u(bit_of(which, i), 1)
+            o(dst + i, 1)
+            ffu(l, 1, 0)
+        elif i == from:
+            u(bit_of(which, i), 1)
+            o(dst + i, -1)
+            ffu(l, 1, 0)
+        else:
+            u(bit_of(which, i), 1)
+            o(dst + i, 1)
+            ffu(l, 1, 0)
+            let j = from
+            while j < i:
+                g(bit_of(which, j), 1)
+                j += 1
+            o(dst + i, 1)
+            ff(l, 0 - (i - from) + 2)
+            j = from
+            while j <= i:
+                g(bit_of(which, j), 1)
+                j += 1
+            o(dst + i, -1)
+            ffu(l, 0 - (i - from + 1) + 2, 2)
+        i += 1
+
+# a memory read: query = the 9 address bits (qbase: 0 pc, 1 P1, 2 PC2, 3 MA, 4 MB), key = KC, both in
+# the slowest pairs; the default (8 pairs: query 119, key 127 at an N3); a recency pair; value: WV's 16 bits
+let MA = 0
+let MB = 0
+let MC = 0
+let XX = 0
+let YY = 0
+
+fn query_bit(qbase, i):
+    if qbase == 0: return pc_bit(i)
+    if qbase == 1: return P1 + i
+    if qbase == 2: return PC2 + i
+    if qbase == 3: return MA + i
+    return MB + i
+
+fn content_head(l, h, qbase, dst):
+    let i = 0
+    while i < 9:
+        let at = h * HEAD + 2 * (PAIRS - 9 + i)
+        let skip = 0                 # the control: address bit 0 not compared reading mem[a], mem[b]
+        if str_cmp(FAULT, "addrbit") == 0 and l == 3 and i == 0: skip = 1
+        if skip == 0:
+            w_put(l, 0, at, query_bit(qbase, i), 1)
+            w_put(l, 1, at, KC + i, 1)
+        i += 1
+    if str_cmp(FAULT, "nodefault") != 0:
+        let s = 0
+        while s < 8:
+            let sp = h * HEAD + 2 * (PAIRS - 18 + s)
+            put_constant(l, 0, sp, 119)
+            w_put(l, 1, sp, is_type(11), 1)
+            s += 1
+    let at = h * HEAD + 2 * RECENCY
+    put_constant(l, 0, at + 1, RHO)
+    put_constant(l, 1, at, RHO)
+    let j = 0
+    while j < 16:
+        from_att(l, value(l, h, WV + j), dst + j)
+        j += 1
+
+fn size_content(l):                  # one position of recency worth 1000 (after the 1 / sqrt(HEAD))
+    let unit: f64 = 1.0 / S_ROUND
+    let tr: f64 = 1.0 / fpow(10000.0, f64(2 * RECENCY) / f64(HEAD))
+    let sq: f64 = fsqrt(1000.0 * fsqrt(f64(HEAD)) / (f64(RHO * RHO) * tr * unit * unit))
+    storef(sc_at(l, 0), sq)
+    storef(sc_at(l, 1), sq)
+
+fn xb(k, j): return XX + 4 * k + j
+fn yb(k, j): return YY + 4 * k + j
+
+fn build():
+    start()
+    TYPE = chan(15, 1)
+    DUMMY = chan(1, 1)
+    NIB = chan(4, 1)
+    embed(TYPE, DUMMY, NIB)
+    rope()
+    let N3 = is_type(11)
+    let A2 = is_type(7)
+
+    # ---------- layer 1 (0) ----------
+    G1 = chan(4, 1)
+    let d = 2
+    while d <= 6:
+        chan(4, 1)
+        d += 1
+    d = 1
+    while d <= 3:
+        pos_head(0, d - 1, d)
+        let j = 0
+        while j < 4:
+            from_att(0, value(0, d - 1, NIB + j), gch(d) + j)
+            j += 1
+        d += 1
+    size_positional(0, 4000.0)
+    calibrate(0, 1, 1.0, G1, 12)
+    let i = 0
+    while i < 16:
+        read_as(0, 1, pc_bit(i), 1.0)
+        i += 1
+    P1 = chan(16, 1)
+    PC2 = chan(9, 1)
+    HI2 = chan(1, 2)
+    LO2 = chan(1, 2)
+    increment(0, 0, 0, 16, P1)
+    increment(0, 0, 1, 9, PC2)
+    i = 9
+    while i <= 14:
+        g(pc_bit(i), 1)
+        i += 1
+    o(HI2, 1)
+    ff(0, 6)
+    i = 9
+    while i <= 14:
+        g(pc_bit(i), 1)
+        i += 1
+    o(HI2, -1)
+    ff(0, 4)
+    i = 1
+    while i <= 8:
+        g(pc_bit(i), 1)
+        i += 1
+    o(LO2, 1)
+    ff(0, -6)
+    calibrate(0, 0, 1.0, P1, 16 + 9 + 2)
+
+    # ---------- layer 2 (1) ----------
+    d = 4
+    while d <= 6:
+        pos_head(1, d - 4, d)
+        let j = 0
+        while j < 4:
+            from_att(1, value(1, d - 4, NIB + j), gch(d) + j)
+            j += 1
+        d += 1
+    size_positional(1, 4000.0)
+    calibrate(1, 1, 1.0, gch(4), 12)
+    KC = chan(9, 1)
+    WV = chan(16, 1)
+    PC3 = chan(16, 1)
+    BIG = chan(1, 1)
+    read_as(1, 0 + 1, A2, 1.0)
+    i = 0
+    while i < 9:
+        read_as(1, 1, addr_bit(i), 1.0)
+        i += 1
+    i = 0
+    while i < 16:
+        read_as(1, 1, val_bit(i), 1.0)
+        i += 1
+    i = 0
+    while i < 9:
+        g(A2, 1)
+        u(addr_bit(i), 1)
+        o(KC + i, 1)
+        ffu(1, 0, 0)
+        i += 1
+    i = 0
+    while i < 16:
+        g(A2, 1)
+        u(val_bit(i), 1)
+        o(WV + i, 1)
+        ffu(1, 0, 0)
+        i += 1
+    read_as(1, 1, N3, 1.0)
+    if str_cmp(FAULT, "nodefault") != 0:
+        i = 0
+        while i < 16:
+            g(N3, 1)
+            o(WV + i, -1)
+            ff(1, 0)
+            i += 1
+    i = 0
+    while i < 16:
+        read_as(1, 1, P1 + i, 1.0)
+        i += 1
+    increment(1, 1, 1, 16, PC3)
+    read_as(1, 1, HI2, 0.5)
+    read_as(1, 1, LO2, 0.5)
+    g(HI2, 1)
+    g(LO2, 1)
+    o(BIG, 1)
+    ff(1, 0)
+    g(HI2, 1)
+    g(LO2, 1)
+    o(BIG, -1)
+    ff(1, -1)
+    calibrate(1, 0, 1.0, KC, 9 + 16 + 16 + 1)
+
+    # ---------- layer 3 (2): fetch ----------
+    MA = chan(16, 1)
+    MB = chan(16, 1)
+    MC = chan(16, 1)
+    i = 0
+    while i < 9:
+        read_as(2, 0, pc_bit(i), 127.0)
+        read_as(2, 0, P1 + i, 127.0)
+        read_as(2, 0, PC2 + i, 127.0)
+        read_as(2, 0, KC + i, 127.0)
+        i += 1
+    read_as(2, 0, N3, 127.0)
+    i = 0
+    while i < 16:
+        read_as(2, 0, WV + i, 127.0)
+        i += 1
+    content_head(2, 0, 0, MA)
+    content_head(2, 1, 1, MB)
+    content_head(2, 2, 2, MC)
+    size_content(2)
+    calibrate(2, 1, 127.0, MA, 48)
+    let PRN2 = chan(1, 2)
+    let FA2 = chan(1, 2)
+    let FB2 = chan(1, 2)
+    let STOP2 = chan(1, 2)
+    i = 0
+    while i < 16:
+        read_as(2, 1, MA + i, 1.0)
+        read_as(2, 1, MB + i, 1.0)
+        i += 1
+    read_as(2, 1, NIB + 3, 1.0)
+    i = 0
+    while i < 16:
+        g(MB + i, 1)
+        i += 1
+    o(PRN2, 1)
+    o(FB2, -1)
+    ff(2, -14)
+    i = 9
+    while i < 16:
+        g(MA + i, 1)
+        i += 1
+    o(FA2, 1)
+    ff(2, 7)
+    i = 9
+    while i < 16:
+        g(MA + i, 1)
+        i += 1
+    o(FA2, -1)
+    ff(2, 5)
+    i = 9
+    while i < 16:
+        g(MB + i, 1)
+        i += 1
+    o(FB2, 1)
+    ff(2, 7)
+    i = 9
+    while i < 16:
+        g(MB + i, 1)
+        i += 1
+    o(FB2, -1)
+    ff(2, 5)
+    g(NIB + 3, 1)
+    o(STOP2, 1)
+    ff(2, 1)
+    calibrate(2, 0, 1.0, PRN2, 4)
+
+    # ---------- layer 4 (3): mem[a], mem[b]; per nibble, greater or equal ----------
+    XX = chan(16, 1)
+    YY = chan(16, 1)
+    i = 0
+    while i < 9:
+        read_as(3, 0, MA + i, 127.0)
+        read_as(3, 0, MB + i, 127.0)
+        read_as(3, 0, KC + i, 127.0)
+        i += 1
+    read_as(3, 0, N3, 127.0)
+    i = 0
+    while i < 16:
+        read_as(3, 0, WV + i, 127.0)
+        i += 1
+    content_head(3, 0, 3, XX)
+    content_head(3, 1, 4, YY)
+    size_content(3)
+    calibrate(3, 1, 127.0, XX, 32)
+    let GT = chan(4, 2)
+    let EQ = chan(4, 2)
+    let k = 0
+    while k < 4:
+        let j = 0
+        while j < 4:
+            read_as(3, 1, xb(k, j), f64(1 << j))
+            read_as(3, 1, yb(k, j), f64(1 << j))
+            j += 1
+        k += 1
+    let one3 = ff(3, 2)
+    k = 0
+    while k < 4:
+        let sign = 1
+        let pass = 0
+        while pass < 4:              # z, z - 2, -z, -z - 2
+            if pass >= 2: sign = -1
+            let j = 0
+            while j < 4:
+                g(yb(k, j), sign)
+                g(xb(k, j), 0 - sign)
+                j += 1
+            if pass == 0:
+                o(GT + k, 1)
+                o(EQ + k, -1)
+                ff(3, 0)
+            elif pass == 1:
+                o(GT + k, -1)
+                o(EQ + k, 1)
+                ff(3, -2)
+            elif pass == 2:
+                o(EQ + k, -1)
+                ff(3, 0)
+            else:
+                o(EQ + k, 1)
+                ff(3, -2)
+            pass += 1
+        w_put(3, 6, EQ + k, one3, 1)
+        k += 1
+    calibrate(3, 0, 1.0, GT, 8)
+
+    # ---------- layer 5 (4): the carry into each nibble ----------
+    let CIN = chan(4, 1)
+    k = 0
+    while k < 4:
+        read_as(4, 1, GT + k, 0.5)
+        read_as(4, 1, EQ + k, 0.5)
+        k += 1
+    g(GT + 0, 1)
+    o(CIN + 1, 1)
+    ff(4, 0)
+    g(EQ + 0, 1)
+    o(CIN + 1, 1)
+    ff(4, 0)
+    g(GT + 1, 1)
+    o(CIN + 2, 1)
+    ff(4, 0)
+    g(EQ + 1, 1)
+    g(GT + 0, 1)
+    o(CIN + 2, 1)
+    ff(4, -1)
+    g(EQ + 1, 1)
+    g(EQ + 0, 1)
+    o(CIN + 2, 1)
+    ff(4, -1)
+    g(GT + 2, 1)
+    o(CIN + 3, 1)
+    ff(4, 0)
+    g(EQ + 2, 1)
+    g(GT + 1, 1)
+    o(CIN + 3, 1)
+    ff(4, -1)
+    g(EQ + 2, 1)
+    g(EQ + 1, 1)
+    g(GT + 0, 1)
+    o(CIN + 3, 1)
+    ff(4, -2)
+    g(EQ + 2, 1)
+    g(EQ + 1, 1)
+    g(EQ + 0, 1)
+    o(CIN + 3, 1)
+    ff(4, -2)
+    calibrate(4, 0, 1.0, CIN, 4)
+
+    # ---------- layer 6 (5): the carry into each bit (0 or 2) ----------
+    let C = chan(16, 2)
+    k = 0
+    while k < 4:
+        let j = 0
+        while j < 3:
+            read_as(5, 1, xb(k, j), f64(1 << j))
+            read_as(5, 1, yb(k, j), f64(1 << j))
+            j += 1
+        k += 1
+    k = 1
+    while k < 4:
+        read_as(5, 1, CIN + k, 2.0)
+        k += 1
+    k = 0
+    while k < 4:
+        let m = 0
+        while m < 4:
+            let bit = 4 * k + m
+            let cin_const = 0
+            if k == 0: cin_const = 2
+            if m == 0:
+                if k > 0: g(CIN + k, 1)
+                o(C + bit, 1)
+                ff(5, cin_const)
+            else:
+                let pass = 0
+                while pass < 2:
+                    let j = 0
+                    while j < m:
+                        g(yb(k, j), 1)
+                        g(xb(k, j), -1)
+                        j += 1
+                    if k > 0: g(CIN + k, 1)
+                    if pass == 0:
+                        o(C + bit, 1)
+                        ff(5, cin_const)
+                    else:
+                        o(C + bit, -1)
+                        ff(5, cin_const - 2)
+                    pass += 1
+            m += 1
+        k += 1
+    calibrate(5, 0, 1.0, C, 16)
+
+    # ---------- layer 7 (6): the bits of mem[b] - mem[a] (+-1) ----------
+    let R = chan(16, 1)
+    k = 0
+    while k < 4:
+        let j = 0
+        while j < 4:
+            read_as(6, 1, xb(k, j), 1.0)
+            read_as(6, 1, yb(k, j), 1.0)
+            j += 1
+        k += 1
+    i = 0
+    while i < 16:
+        read_as(6, 1, C + i, 1.0)
+        i += 1
+    let one7 = ff(6, 1)
+    i = 0
+    while i < 16:
+        let pass = 0
+        while pass < 3:
+            g(YY + i, 1)
+            g(XX + i, -1)
+            g(C + i, 1)
+            if pass == 0:
+                o(R + i, 1)
+                ff(6, 2)
+            elif pass == 1:
+                o(R + i, -1)
+                ffu(6, 0, 2)
+            else:
+                o(R + i, 1)
+                ffu(6, -2, 2)
+            pass += 1
+        w_put(6, 6, R + i, one7, -1)
+        i += 1
+    if str_cmp(FAULT, "carry") == 0:
+        let kk = 0
+        while w_get(5, 6, C + 5, kk) == 0: kk += 1
+        w_put(5, 6, C + 5, kk, 0 - w_get(5, 6, C + 5, kk))
+    calibrate(6, 0, 1.0, R, 16)
+
+    # ---------- layer 8 (7): 0 or less, the next pc (+-2), what comes next (0 or 1 each) ----------
+    let NEXT = chan(16, 2)
+    let M_NORMAL = chan(1, 1)
+    let M_PRINT = chan(1, 1)
+    let M_STOP = chan(1, 1)
+    let M_END = chan(1, 1)
+    i = 0
+    while i < 16:
+        read_as(7, 1, R + i, 1.0)
+        read_as(7, 1, MC + i, 1.0)
+        read_as(7, 1, PC3 + i, 1.0)
+        i += 1
+    read_as(7, 1, PRN2, 1.0)
+    read_as(7, 1, FA2, 1.0)
+    read_as(7, 1, FB2, 1.0)
+    read_as(7, 1, STOP2, 3.0)
+    read_as(7, 1, BIG, 2.0)
+    i = 0
+    while i < 16:
+        u(PC3 + i, 1)
+        o(NEXT + i, 1)
+        ffu(7, 2, 0)                                 # 2 (pc + 3)
+        g(R + 15, 1)
+        g(PRN2, -1)
+        u(MC + i, 1)
+        u(PC3 + i, -1)
+        o(NEXT + i, 1)
+        ffu(7, 1, 0)                                 # negative: + (c - (pc + 3))
+        let j = 0
+        while j < 16:
+            g(R + j, -1)
+            j += 1
+        g(PRN2, -1)
+        u(MC + i, 1)
+        u(PC3 + i, -1)
+        o(NEXT + i, 1)
+        ffu(7, -14, 0)                               # zero: likewise
+        i += 1
+    g(STOP2, 1)
+    o(M_STOP, 1)
+    o(M_NORMAL, -1)
+    ff(7, 0)
+    g(STOP2, 1)
+    o(M_STOP, -1)
+    o(M_NORMAL, 1)
+    ff(7, -1)
+    let pass = 0
+    while pass < 2:                                  # END: 2 BIG + FA2 + FB2 - 6 STOP >= 2
+        g(BIG, 1)
+        g(FA2, 1)
+        g(FB2, 1)
+        g(STOP2, -1)
+        if pass == 0:
+            o(M_END, 1)
+            o(M_NORMAL, -1)
+            ff(7, -1)
+        else:
+            o(M_END, -1)
+            o(M_NORMAL, 1)
+            ff(7, -2)
+        pass += 1
+    pass = 0
+    while pass < 2:                                  # PRINT: PRN2 - 2 BIG - FA2 - 6 STOP >= 2
+        g(PRN2, 1)
+        g(BIG, -1)
+        g(FA2, -1)
+        g(STOP2, -1)
+        if pass == 0:
+            o(M_PRINT, 1)
+            o(M_NORMAL, -1)
+            ff(7, -1)
+        else:
+            o(M_PRINT, -1)
+            o(M_NORMAL, 1)
+            ff(7, -2)
+        pass += 1
+    o(M_NORMAL, 1)
+    ff(7, 1)
+    calibrate(7, 0, 1.0, NEXT, 16 + 4)
+
+    # ---------- layer 9 (8): copy from the latest N3; the byte after this one ----------
+    let CR = chan(16, 1)
+    let CB = chan(9, 1)
+    let CN = chan(16, 1)
+    let CP = chan(8, 1)
+    let CM = chan(4, 1)
+    let at = 2 * (PAIRS - 1)                         # the slowest pair: is it an N3
+    read_as(8, 0, N3, 127.0)
+    put_constant(8, 0, at, 127)
+    w_put(8, 1, at, N3, 1)
+    let ra = 2 * RECENCY
+    put_constant(8, 0, ra + 1, RHO)
+    put_constant(8, 1, ra, RHO)
+    i = 0
+    while i < 16:
+        read_as(8, 0, R + i, 127.0)
+        from_att(8, value(8, 0, R + i), CR + i)
+        i += 1
+    i = 0
+    while i < 9:
+        read_as(8, 0, MB + i, 127.0)
+        from_att(8, value(8, 0, MB + i), CB + i)
+        i += 1
+    i = 0
+    while i < 16:
+        read_as(8, 0, NEXT + i, 63.5)
+        from_att(8, value(8, 0, NEXT + i), CN + i)
+        i += 1
+    i = 0
+    while i < 8:
+        read_as(8, 0, XX + i, 127.0)
+        from_att(8, value(8, 0, XX + i), CP + i)
+        i += 1
+    i = 0
+    while i < 4:
+        read_as(8, 0, M_NORMAL + i, 127.0)
+        from_att(8, value(8, 0, M_NORMAL + i), CM + i)
+        i += 1
+    size_content(8)
+    calibrate(8, 1, 127.0, CR, 16 + 9 + 16 + 8 + 4)
+    let t = 1
+    while t <= 15:
+        read_as(8, 1, is_type(t), 1.0)
+        t += 1
+    i = 0
+    while i < 53:
+        read_as(8, 1, CR + i, 1.0)
+        i += 1
+    # the byte after each type: its type, and its nibble's 4 bits (a channel each, or -1: -1 when none)
+    let after = [2, CR + 4, CR + 5, CR + 6, CR + 7,  3, CR + 8, CR + 9, CR + 10, CR + 11,  4, CR + 12, CR + 13, CR + 14, CR + 15,  5, CB, CB + 1, CB + 2, CB + 3,  6, CB + 4, CB + 5, CB + 6, CB + 7,  7, CB + 8, -1, -1, -1,  8, CN, CN + 1, CN + 2, CN + 3,  9, CN + 4, CN + 5, CN + 6, CN + 7,  10, CN + 8, CN + 9, CN + 10, CN + 11,  11, CN + 12, CN + 13, CN + 14, CN + 15,  0, 0, 0, 0, 0,  13, CP + 4, CP + 5, CP + 6, CP + 7,  8, CN, CN + 1, CN + 2, CN + 3,  14, -1, -1, -1, -1,  15, -1, -1, -1, -1]
+    t = 1
+    while t <= 15:
+        if t != 11:
+            let row = after + (t - 1) * 5 * 4
+            emit(t, -1, load(row), row + 4)
+        t += 1
+    let mode_type = [1, 12, 14, 15]
+    let mode_src = [CR, CR + 1, CR + 2, CR + 3,  CP, CP + 1, CP + 2, CP + 3,  -1, -1, -1, -1,  -1, -1, -1, -1]
+    let m = 0
+    while m < 4:
+        emit(11, CM + m, load(mode_type + m * 4), mode_src + m * 4 * 4)
+        m += 1
+    calibrate(8, 0, 1.0, 0, 0)
+    storef(sc_at(8, 6), loadf(sc_at(8, 6)) / TINY)
+    i = 0
+    while i < DIM:
+        let v: f64 = 0.0
+        if (i >= TYPE and i < TYPE + 15) or (i >= NIB and i < NIB + 4): v = 8192.0   # a sure readout: a bit wrong costs ~25
+        storef(FIN + i * 8, v)
+        i += 1
+    if str_cmp(FAULT, "mux") == 0: w_put(7, 6, NEXT, 1, 0 - w_get(7, 6, NEXT, 1))
+    tell(concat(concat(concat(str(NEXT_CH), " of "), str(DIM)), " channels; hidden units a layer:"))
+    let l = 0
+    while l < LAYERS:
+        tell(concat(" ", str(load(HN + l * 4))))
+        l += 1
+    tell("\n")
+
+# under the current byte being type t (and, for an N3, the mode channel `mode`): the byte of type nt
+# with its nibble's bits from the 4 channels at srcs (-1: the bit is 0)
+fn emit(t, mode, nt, srcs):
+    let j = -1
+    while j < 4:
+        g(is_type(t), 1)
+        let gate_const = 0
+        if mode >= 0:
+            g(mode, 1)
+            gate_const = -1
+        if j < 0:
+            o(is_type(nt), 1)
+            ffu(8, gate_const, 100)
+        else:
+            let s = load(srcs + j * 4)
+            if s < 0:
+                o(NIB + j, -1)
+                ffu(8, gate_const, 1)
+            else:
+                u(s, 1)
+                o(NIB + j, 1)
+                ffu(8, gate_const, 0)
+        j += 1
+
+# ---- the file: "TLM2" ----
+fn write_model(path):
+    let trits = LAYERS * (4 * DIM * DIM + 3 * HIDDEN * DIM)
+    let trit_bytes = ((trits + 4) / 5 + 3) / 4 * 4
+    let size = 28 + LAYERS * 7 * 8 + trit_bytes + 256 * 4 + 256 * DIM + (2 * LAYERS + 1) * DIM * 4
+    let out = alloc(size)
+    mem_fill(out, 0, size)
+    store8(out, 84)
+    store8(out + 1, 76)
+    store8(out + 2, 77)
+    store8(out + 3, 50)
+    store(out + 4, 256)
+    store(out + 8, DIM)
+    store(out + 12, LAYERS)
+    store(out + 16, HEADS)
+    store(out + 20, HIDDEN)
+    store(out + 24, CONTEXT)
+    let at = out + 28
+    let i = 0
+    while i < LAYERS * 7:
+        storef(at + i * 8, loadf(SC + i * 8))
+        i += 1
+    at = at + LAYERS * 7 * 8
+    let trit_start = at
+    let held = 0
+    let unit = 1
+    let count = 0
+    let l = 0
+    while l < LAYERS:
+        let m = 0
+        while m < 7:
+            let n = rows(m) * cols(m)
+            let a = mat(l, m)
+            let k = 0
+            while k < n:
+                held += (load8(a + k) + 1) * unit
+                unit *= 3
+                count += 1
+                if count == 5:
+                    store8(at, held)
+                    at += 1
+                    held = 0
+                    unit = 1
+                    count = 0
+                k += 1
+            m += 1
+        l += 1
+    if count > 0: store8(at, held)
+    at = trit_start + trit_bytes
+    i = 0
+    while i < 256:
+        storef32(at + i * 4, 1.0 / 127.0)
+        i += 1
+    at = at + 256 * 4
+    mem_copy(at, EMB, 256 * DIM)
+    at = at + 256 * DIM
+    l = 0
+    while l < LAYERS:
+        let w = 0
+        while w < 2:
+            i = 0
+            while i < DIM:
+                storef32(at, loadf(gain_at(l, w, i)))
+                at += 4
+                i += 1
+            w += 1
+        l += 1
+    i = 0
+    while i < DIM:
+        storef32(at, loadf(FIN + i * 8))
+        at += 4
+        i += 1
+    if at != out + size: fail("the file's size")
+    if fs_write_file(path, out, size) != size: fail(concat("cannot write ", path))
+    return size
+
+let ARG = alloc(4096)
+fn main():
+    let path = "models/subleq_computer.tlm2"
+    if os_arg(0, ARG, 4096) > 0: path = concat(ARG, "")
+    if os_arg(1, ARG, 4096) > 0: FAULT = concat(ARG, "")
+    build()
+    let size = write_model(path)
+    tell(concat(concat(concat(concat(path, ": "), str(size)), " bytes"), "\n"))
+    return 0
+
+exit(main())

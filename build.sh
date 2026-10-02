@@ -5,7 +5,9 @@
 # built from the gates the gate model writes; subleq_corpus, the tasks and programs the model learns from;
 # subleq_write, the model writing programs (its test, check, live and export); subleq_explore, the model
 # trying programs of its own, for teaching itself; subleq_compile, arithmetic compiled into steps the model
-# writes. subleq_write and subleq_machine are made images as well
+# writes; subleq_computer_build, the hand-built computer (a transformer whose weights are set by hand:
+# models/subleq_computer.tlm2), and subleq_computer, which runs it against the gate machine.
+# subleq_write and subleq_machine are made images as well
 # (OUT/subleq_write.nitropzb, OUT/subleq_machine.nitropzb), for check.sh to compare with the ones in
 # images/. The compiler is the one in nitropz/ unless NITROPZ names another.
 set -u
@@ -21,7 +23,7 @@ for prog in train pack chances; do
   sh "$P/nitropz" native "$HERE/core/$prog.nitropz" "$OUT/$prog$ext" || { echo "build.sh: core/$prog did not build" >&2; exit 1; }
   echo "$OUT/$prog$ext"
 done
-for prog in machine corpus write explore compile; do
+for prog in machine corpus write explore compile computer computer_build; do
   sh "$P/nitropz" native "$HERE/subleq/$prog.nitropz" "$OUT/subleq_$prog$ext" || { echo "build.sh: subleq/$prog did not build" >&2; exit 1; }
   echo "$OUT/subleq_$prog$ext"
 done

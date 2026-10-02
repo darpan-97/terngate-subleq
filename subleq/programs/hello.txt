@@ -1,0 +1,7 @@
+prog print hello:
+    'h out
+    'e out
+    'l out
+    'l out
+    'o out
+    z z -1

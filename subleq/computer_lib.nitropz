@@ -1,0 +1,202 @@
+module computer_lib
+
+# computer_lib -- the bytes of the hand-built computer (models/subleq_computer.tlm2, made by
+# subleq/computer_build.nitropz): a transformer whose weights were set by hand, not trained, that runs
+# SUBLEQ itself, a byte a pass. Here: the prompt (a program's memory), the run it writes read back as
+# steps, and the reference those steps are held to -- subleq_lib's gate machine, ending where the
+# playground's trace() ends a run.
+#
+# A byte is 16 * type + nibble, the types 1 to 15 (so no byte is 0 or 10):
+#   V0 V1 V2 V3  a word's value, the lowest nibble first     A0 A1 A2  its address (9 bits)
+#   N0 N1 N2 N3  the next pc                                 P0 P1     a byte printed
+#   STOP         the machine stopped (a jump to 32768 or past)
+#   END          the run ended without one (pc past 509, or an address past 511)
+# The prompt states every word of memory that is not 0 -- V0..V3 then A0..A2 -- and then pc 0 as N0..N3;
+# a word nobody has stated reads as 0, as memory starts. Each step the model writes b's new value at b
+# and the next pc ([V0..V3 A0..A2] [N0..N3]), or the byte printed and the next pc ([P0 P1] [N0..N3]), or
+# STOP or END (nibble 0).
+
+import std
+import subleq_lib
+
+let CP_V0 = 1
+let CP_A0 = 5
+let CP_A2 = 7
+let CP_N0 = 8
+let CP_N3 = 11
+let CP_P0 = 12
+let CP_STOP = 14
+let CP_END = 15
+
+pub fn cp_byte(t, nib): return 16 * t + (nib & 15)
+
+# ---- the prompt ----
+pub fn cp_prompt(out):               # every word of SL_MEM that is not 0, then pc 0, into out; its length
+    let k = 0
+    let i = 0
+    while i < SL_SIZE:
+        let v = load(SL_MEM + i * 4) & 65535
+        if v != 0:
+            let j = 0
+            while j < 4:
+                store8(out + k, cp_byte(CP_V0 + j, v >> (4 * j)))
+                k += 1
+                j += 1
+            j = 0
+            while j < 3:
+                store8(out + k, cp_byte(CP_A0 + j, i >> (4 * j)))
+                k += 1
+                j += 1
+        i += 1
+    let j = 0
+    while j < 4:
+        store8(out + k, cp_byte(CP_N0 + j, 0))
+        k += 1
+        j += 1
+    return k
+
+# ---- the reference: the gate machine, a row a step, ending as trace() ends ----
+let REF_MAX = 4096
+let REF_PC = alloc(REF_MAX * 4)
+let REF_B = alloc(REF_MAX * 4)
+let REF_AFTER = alloc(REF_MAX * 4)
+let REF_NEXT = alloc(REF_MAX * 4)
+let REF_PRINTED = alloc(REF_MAX * 4)     # a byte printed, or -1
+let REF_ROWS = 0
+let REF_STOPPED = 0                  # 1: a jump to 32768 or past; 0: ended otherwise (or the limit)
+
+pub fn cp_reference(limit):          # SL_MEM is changed: run it on a copy if it is needed after
+    REF_ROWS = 0
+    REF_STOPPED = 0
+    let pc = 0
+    while pc < 32768 and REF_ROWS < limit and REF_ROWS < REF_MAX and pc <= SL_SIZE - 3:
+        let a = load(SL_MEM + pc * 4)
+        let b = load(SL_MEM + (pc + 1) * 4)
+        let c = load(SL_MEM + (pc + 2) * 4)
+        if a >= SL_SIZE or (b != 65535 and b >= SL_SIZE): return REF_ROWS
+        let printed = -1
+        let after = 0
+        let next = 0
+        if b == 65535:
+            printed = load(SL_MEM + a * 4) & 255
+            next = sl_add16(pc, 3)
+        else:
+            after = sl_sub16(load(SL_MEM + b * 4), load(SL_MEM + a * 4))
+            store(SL_MEM + b * 4, after)
+            next = sl_choose16(sl_at_most_zero(after), sl_add16(pc, 3), c)
+        store(REF_PC + REF_ROWS * 4, pc)
+        store(REF_B + REF_ROWS * 4, b)
+        store(REF_AFTER + REF_ROWS * 4, after)
+        store(REF_NEXT + REF_ROWS * 4, next)
+        store(REF_PRINTED + REF_ROWS * 4, printed)
+        REF_ROWS += 1
+        pc = next
+    if pc >= 32768: REF_STOPPED = 1
+    return REF_ROWS
+
+# ---- what the model wrote, read back ----
+let OUT_B = alloc(REF_MAX * 4)
+let OUT_AFTER = alloc(REF_MAX * 4)
+let OUT_NEXT = alloc(REF_MAX * 4)
+let OUT_PRINTED = alloc(REF_MAX * 4)
+let OUT_ROWS = 0
+let OUT_END = 0                      # 0: none, 1: STOP, 2: END
+let OUT_BAD = -1                     # the first byte not where the format has it, or -1
+
+fn nib_of(bytes, at, t):             # the nibble of bytes[at] if its type is t, else -1
+    let v = load8(bytes + at) & 255
+    if (v >> 4) != t: return -1
+    return v & 15
+
+fn field(bytes, at, t, count):       # count nibbles of types t, t + 1, ..., the lowest first; -1 if not
+    let v = 0
+    let k = 0
+    while k < count:
+        let n = nib_of(bytes, at + k, t + k)
+        if n < 0:
+            OUT_BAD = at + k
+            return -1
+        v = v | (n << (4 * k))
+        k += 1
+    return v
+
+pub fn cp_decode(bytes, n):
+    OUT_ROWS = 0
+    OUT_END = 0
+    OUT_BAD = -1
+    let i = 0
+    while i < n and OUT_ROWS < REF_MAX:
+        let t = (load8(bytes + i) & 255) >> 4
+        if t == CP_STOP or t == CP_END:
+            if (load8(bytes + i) & 15) != 0:         # (their nibble is always 0)
+                OUT_BAD = i
+                return OUT_ROWS
+            OUT_END = 2
+            if t == CP_STOP: OUT_END = 1
+            return OUT_ROWS
+        if t == CP_V0:
+            if i + 11 > n: return OUT_ROWS
+            let after = field(bytes, i, CP_V0, 4)
+            let b = field(bytes, i + 4, CP_A0, 3)
+            let next = field(bytes, i + 7, CP_N0, 4)
+            if after < 0 or b < 0 or next < 0: return OUT_ROWS
+            store(OUT_B + OUT_ROWS * 4, b)
+            store(OUT_AFTER + OUT_ROWS * 4, after)
+            store(OUT_NEXT + OUT_ROWS * 4, next)
+            store(OUT_PRINTED + OUT_ROWS * 4, -1)
+            OUT_ROWS += 1
+            i += 11
+        elif t == CP_P0:
+            if i + 6 > n: return OUT_ROWS
+            let printed = field(bytes, i, CP_P0, 2)
+            let next = field(bytes, i + 2, CP_N0, 4)
+            if printed < 0 or next < 0: return OUT_ROWS
+            store(OUT_B + OUT_ROWS * 4, 65535)
+            store(OUT_AFTER + OUT_ROWS * 4, 0)
+            store(OUT_NEXT + OUT_ROWS * 4, next)
+            store(OUT_PRINTED + OUT_ROWS * 4, printed)
+            OUT_ROWS += 1
+            i += 6
+        else:
+            OUT_BAD = i
+            return OUT_ROWS
+    return OUT_ROWS
+
+# ---- the two held together: every step, then how the run ended ----
+let CP_WHY = 0                       # why not, or 0
+let CP_AT = -1                       # the step that differs, or -1
+let CP_FULL = 0                      # 1: every step written was right, but the view filled first
+
+# after cp_reference and cp_decode: the steps right (all of them: CP_WHY 0). full: the model's view
+# filled before the run ended (then only the steps it wrote are held to the machine's)
+pub fn cp_compare(limit, full):
+    CP_WHY = 0
+    CP_AT = -1
+    CP_FULL = 0
+    let s = 0
+    while s < REF_ROWS:
+        if s >= OUT_ROWS:
+            if full and OUT_END == 0:
+                CP_FULL = 1
+                return s
+            CP_AT = s
+            CP_WHY = "the model wrote no such step"
+            return s
+        let printed = load(REF_PRINTED + s * 4)
+        if load(OUT_PRINTED + s * 4) != printed or load(OUT_NEXT + s * 4) != load(REF_NEXT + s * 4):
+            CP_AT = s
+            CP_WHY = "a different byte printed or a different next pc"
+            return s
+        if printed < 0 and (load(OUT_B + s * 4) != load(REF_B + s * 4) or load(OUT_AFTER + s * 4) != load(REF_AFTER + s * 4)):
+            CP_AT = s
+            CP_WHY = "a different word written, or written somewhere else"
+            return s
+        s += 1
+    if REF_ROWS < limit:
+        let want = 2
+        if REF_STOPPED: want = 1
+        if OUT_END != want:
+            CP_AT = REF_ROWS
+            CP_WHY = "ended differently (STOP or END)"
+            return s
+    return s

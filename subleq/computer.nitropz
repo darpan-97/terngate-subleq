@@ -1,0 +1,269 @@
+# computer.nitropz [MODEL] run FILE [a b c d e] | check | random N [SEED] -- the hand-built computer
+# (models/subleq_computer.tlm2 unless said: a transformer whose weights were set by hand, see
+# subleq/computer_build.nitropz) running SUBLEQ programs, every step it writes held to the gate machine.
+#   run FILE      a program as the playground's assembler reads it (the "prog ..." line, then a line an
+#                 instruction; a to e as given, 0 if not): the model's run printed beside the machine's
+#   check         the programs below, each right at every step and in how it ends
+#   random N      N memories drawn at random -- code that writes over itself, prints, jumps past the end,
+#                 operands past 511, operands and jumps into words the prompt does not state (0) -- each
+#                 run on the model and the machine, every step compared
+# A run must fit the model's view: the prompt (7 bytes a word of memory, and 4) and 11 bytes a step (6 a
+# printing step) together at most its CONTEXT bytes.
+import std
+import std_io
+import os
+import fs
+import model
+import engine
+import subleq_lib
+import computer_lib
+
+fn tell(text): write(1, text, slen(text))
+
+let TEXT = 0                         # the prompt and what the model writes after it
+let TEXT_N = 0
+let PROMPT_N = 0
+let WRITTEN = 0                      # where the model's bytes start in TEXT, and how many
+let WRITTEN_N = 0
+let MEM_COPY = alloc(SL_SIZE * 4)
+let FULL = 0                         # 1: the run filled the model's view before it ended
+
+# SL_MEM's program, read and then written a byte a pass until STOP or END, `limit` steps, or the view's end
+fn run_model(limit):
+    TEXT = alloc(SL_SIZE * 7 + CONTEXT + 16)       # room for a prompt of all 512 words, then the run
+    PROMPT_N = cp_prompt(TEXT)
+    if PROMPT_N >= CONTEXT: return 0
+    let pos = 0
+    while pos < PROMPT_N:
+        engine_step(load8(TEXT + pos) & 255, pos)
+        pos += 1
+    WRITTEN = TEXT + PROMPT_N
+    WRITTEN_N = 0
+    FULL = 0
+    let steps = 0
+    while pos < CONTEXT:
+        let b = engine_likeliest()
+        store8(WRITTEN + WRITTEN_N, b)
+        WRITTEN_N += 1
+        let t = b >> 4
+        if t == CP_STOP or t == CP_END: return 1
+        if t == CP_N3:
+            steps += 1
+            if steps >= limit: return 1
+        engine_step(b, pos)
+        pos += 1
+    FULL = 1
+    return 1
+
+# SL_MEM as assembled: the model's run and the machine's, compared; 1 if every step is the same
+fn judge(limit, show):
+    mem_copy(MEM_COPY, SL_MEM, SL_SIZE * 4)
+    if run_model(limit) == 0:
+        tell("  the program does not fit the model's view\n")
+        return 0
+    cp_decode(WRITTEN, WRITTEN_N)
+    mem_copy(SL_MEM, MEM_COPY, SL_SIZE * 4)
+    cp_reference(limit)
+    mem_copy(SL_MEM, MEM_COPY, SL_SIZE * 4)
+    let right = cp_compare(limit, FULL)
+    if show:
+        let s = 0
+        while s < REF_ROWS or s < OUT_ROWS:
+            let line = concat(concat("  step ", str(s + 1)), ": ")
+            if s < OUT_ROWS:
+                if load(OUT_PRINTED + s * 4) >= 0: line = concat(concat(line, "the model prints "), str(load(OUT_PRINTED + s * 4)))
+                else: line = concat(concat(concat(concat(line, "the model writes "), str(load(OUT_AFTER + s * 4))), " at "), str(load(OUT_B + s * 4)))
+                line = concat(concat(line, ", next "), str(load(OUT_NEXT + s * 4)))
+            if s < REF_ROWS:
+                if load(REF_PRINTED + s * 4) >= 0: line = concat(concat(line, "   | the machine prints "), str(load(REF_PRINTED + s * 4)))
+                else: line = concat(concat(concat(concat(line, "   | the machine writes "), str(load(REF_AFTER + s * 4))), " at "), str(load(REF_B + s * 4)))
+                line = concat(concat(line, ", next "), str(load(REF_NEXT + s * 4)))
+            tell(concat(line, "\n"))
+            s += 1
+        let ended = "neither"
+        if OUT_END == 1: ended = "STOP"
+        if OUT_END == 2: ended = "END"
+        tell(concat(concat("  the model ended with ", ended), "\n"))
+    if CP_WHY == 0 and (right == REF_ROWS or CP_FULL): return 1
+    tell(concat(concat(concat(concat("  WRONG at step ", str(CP_AT + 1)), ": "), CP_WHY), "\n"))
+    return 0
+
+fn set_inputs(a, b, c, d, e):
+    store(SL_INPUTS, a)
+    store(SL_INPUTS + 4, b)
+    store(SL_INPUTS + 8, c)
+    store(SL_INPUTS + 12, d)
+    store(SL_INPUTS + 16, e)
+
+fn raw_memory(words, n, ops, cells): # a memory given word by word (no assembler): code words, cells
+    mem_fill(SL_MEM, 0, SL_SIZE * 4)
+    let i = 0
+    while i < n:
+        store(SL_MEM + i * 4, load(words + i * 4) & 65535)
+        i += 1
+    SL_OPS = ops
+    SL_CELLS = cells
+
+let CHECKED = 0
+let CHECKED_RIGHT = 0
+
+fn check_one(name, ok):
+    CHECKED += 1
+    if ok:
+        CHECKED_RIGHT += 1
+        if CP_FULL:
+            tell(concat(concat(concat(concat("right  ", name), ": every one of the "), str(OUT_ROWS)), " steps written, then the view was full\n"))
+            return 0
+        tell(concat(concat(concat(concat("right  ", name), ": "), str(REF_ROWS)), " steps"))
+        if REF_ROWS < 400:
+            if REF_STOPPED: tell(", then STOP")
+            else: tell(", then END")
+        tell("\n")
+    else: tell(concat(concat("WRONG  ", name), "\n"))
+
+fn check_program(name, text, a, b, c, d, e):
+    set_inputs(a, b, c, d, e)
+    if sl_assemble(text) == 0:
+        tell(concat(concat("WRONG  ", name), ": does not assemble\n"))
+        CHECKED += 1
+        return 0
+    check_one(name, judge(400, 0))
+
+fn check_raw(name, words, n, ops, cells):
+    raw_memory(words, n, ops, cells)
+    check_one(name, judge(400, 0))
+
+fn check_all():
+    check_program("sum a+b", "prog r=a+b:\n    l0: a z\n    z r\n    z z\n    l1: b z\n    z r\n    z z\n    z z -1\n", 7, 5, 0, 0, 0)
+    check_program("sum c-d-e+b", "prog r=c-d-e+b:\n    l0: c z\n    z r\n    z z\n    l1: d r\n    z z\n    z z\n    l2: e r\n    z z\n    z z\n    l3: b z\n    z r\n    z z\n    z z -1\n", 11, 0 - 300, 1000, 4, 17)
+    check_program("product c*d", "prog r=c*d:\n    l1: z d l9\n    one d\n    l0: c z\n    z r\n    z z l1\n    l9: z z -1\n", 0, 0, 123, 6, 0)
+    check_program("quotient e/b", "prog r=e/b:\n    l0: one z\n    z e\n    z z\n    l1: b e l9\n    one z\n    z r\n    z z l1\n    l9: z z -1\n", 0, 5, 0, 0, 13)
+    check_program("print hello", "prog print hello:\n    'h out\n    'e out\n    'l out\n    'l out\n    'o out\n    z z -1\n", 0, 0, 0, 0, 0)
+    check_program("wrap and negatives", "prog r=a-b:\n    l0: a z\n    z r\n    z z\n    b r\n    z z -1\n", 0 - 32768, 32767, 0, 0, 0)
+    check_raw("jump to 600: END", [0, 0, 600], 3, 1, 0)
+    check_raw("operand past 511: END", [700, 3, 6, 0], 4, 1, 1)
+    check_raw("code that rewrites a jump, then runs it", [12, 8, 3, 13, 13, 6, 13, 13, 9, 13, 13, 9, 32777, 0], 14, 4, 2)
+    check_raw("words the prompt does not state read as 0", [40, 3, 3, 7, 0, 0], 6, 2, 0)
+    check_raw("a word written that was never stated", [5, 50, 3, 50, 5, 32768], 6, 2, 0)
+    check_program("quotient 200/1: 800 steps, more than the view holds", "prog r=e/b:\n    l0: one z\n    z e\n    z z\n    l1: b e l9\n    one z\n    z r\n    z z l1\n    l9: z z -1\n", 0, 1, 0, 0, 200)
+    tell(concat(concat(concat(concat(str(CHECKED_RIGHT), " of "), str(CHECKED)), " right"), "\n"))
+    return CHECKED_RIGHT == CHECKED
+
+# a memory drawn at random: 12 to 51 words, the first ones code
+fn draw(n): return sl_draw() % n
+
+fn random_memory():
+    mem_fill(SL_MEM, 0, SL_SIZE * 4)
+    let n = 12 + draw(40)
+    let code = 3 * (2 + draw(n / 3 - 1))
+    let i = 0
+    while i < n:
+        let r = draw(100)
+        let v = 0
+        if i < code:
+            let f = i % 3
+            if f == 0:
+                if r < 3: v = 512 + draw(1000)
+                elif r < 15: v = n + draw(40)                  # a word the prompt does not state
+                else: v = draw(n)
+            elif f == 1:
+                if r < 8: v = 65535
+                elif r < 10: v = 512 + draw(1000)
+                elif r < 20: v = n + draw(40)
+                else: v = draw(n)
+            else:
+                if r < 5: v = 32768 + draw(32768)
+                elif r < 8: v = 510 + draw(32000)
+                elif r < 14: v = n + draw(40)                  # code past what is stated: 0 0 0
+                else: v = 3 * draw(code / 3 + 1)
+        else:
+            if r < 30: v = draw(10)
+            elif r < 50: v = 65535 - draw(10)
+            else: v = draw(65536)
+        store(SL_MEM + i * 4, v)
+        i += 1
+    SL_OPS = code / 3
+    SL_CELLS = n - code
+
+fn random_runs(count, seed):
+    SL_SEED = seed
+    let right = 0
+    let steps = 0
+    let k = 0
+    while k < count:
+        random_memory()
+        let ok = judge(120, 0)
+        steps += REF_ROWS
+        if ok: right += 1
+        else: tell(concat(concat("  that was memory ", str(k + 1)), "\n"))
+        k += 1
+    tell(concat(concat(concat(concat(concat(concat(str(right), " of "), str(count)), " random memories right, "), str(steps)), " steps"), "\n"))
+    return right == count
+
+fn read_number(text):
+    let v = 0
+    let neg = 0
+    let i = 0
+    if load8(text) == 45:
+        neg = 1
+        i = 1
+    while load8(text + i) >= 48 and load8(text + i) <= 57:
+        v = v * 10 + load8(text + i) - 48
+        i += 1
+    if neg: return 0 - v
+    return v
+
+let ARG = alloc(4096)
+
+fn arg(i):                           # argument i (after the program's name) as a new string, or 0
+    if os_arg(i, ARG, 4096) <= 0: return 0
+    return concat(ARG, "")
+
+fn usage():
+    tell("computer [MODEL] run FILE [a b c d e] | check | random N [SEED]\n")
+    return 2
+
+fn main():
+    let at = 0
+    let path = "models/subleq_computer.tlm2"
+    let first = arg(0)
+    if first == 0: return usage()
+    if slen(first) > 5 and str_cmp(first + slen(first) - 5, ".tlm2") == 0:
+        path = first
+        at = 1
+    let what = arg(at)
+    if what == 0: return usage()
+    if engine_load(path) == 0:
+        tell(concat(concat("computer: not a model: ", path), "\n"))
+        return 2
+    if str_cmp(what, "check") == 0:
+        if check_all(): return 0
+        return 1
+    if str_cmp(what, "random") == 0:
+        let count = 10
+        let seed = 1
+        if arg(at + 1) != 0: count = read_number(arg(at + 1))
+        if arg(at + 2) != 0: seed = read_number(arg(at + 2))
+        if random_runs(count, seed): return 0
+        return 1
+    if str_cmp(what, "run") == 0 and arg(at + 1) != 0:
+        let text = fs_read_file(arg(at + 1))
+        if text == 0:
+            tell("computer: cannot read the program\n")
+            return 2
+        let k = 0
+        while k < 5:
+            let x = 0
+            if arg(at + 2 + k) != 0: x = read_number(arg(at + 2 + k))
+            store(SL_INPUTS + k * 4, x)
+            k += 1
+        if sl_assemble(text) == 0:
+            tell("computer: the program does not assemble\n")
+            return 2
+        if judge(400, 1):
+            tell("every step the same as the machine's\n")
+            return 0
+        return 1
+    return usage()
+
+exit(main())

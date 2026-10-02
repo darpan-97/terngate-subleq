@@ -1,0 +1,7 @@
+prog r=c*d:
+    l1: z d l9
+    one d
+    l0: c z
+    z r
+    z z l1
+    l9: z z -1

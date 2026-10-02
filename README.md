@@ -3,7 +3,9 @@
 A tiny transformer that writes programs for a computer with one instruction, SUBLEQ, and that computer,
 built from logic gates another tiny transformer wrote. Each has 34,976 parameters, reads and writes a byte
 at a time, and has its layer weights each -1, 0 or +1; nitropz programs train and run them, on a CPU.
-Arithmetic longer than one step is compiled into steps the model writes.
+Arithmetic longer than one step is compiled into steps the model writes. And that computer once more as
+a third transformer, run by the same engine, whose weights were set by hand instead of learned: given a
+program's memory as bytes, it writes the run, every step the same as the gate machine's.
 
 ```
 $ out/subleq_write live "prog r=d*b:"
@@ -65,6 +67,10 @@ out/subleq_write                             # the model on tasks kept back from
 out/subleq_compile "r = (a + b) * c - 3"     # an expression compiled into steps the model writes
 out/subleq_compile measure 1000              # 1,000 drawn expressions compiled and judged
 out/subleq_machine                           # the gate model writes five gates; the computer is built from them
+out/subleq_computer run subleq/programs/product.txt 0 0 7 3   # the hand-built transformer runs a program
+out/subleq_computer check                    # its programs, every step held to the gate machine
+out/subleq_computer random 20                # 20 memories drawn at random, likewise
+out/subleq_computer_build out/computer.tlm2  # makes the hand-built transformer (models/subleq_computer.tlm2)
 bash check.sh                                # all of it checked, the playground's JavaScript too (with node)
 ```
 
@@ -83,7 +89,8 @@ runs a step at a time. From a clone, `docs/subleq.html` opens in a browser as it
 
 - [The computer, and the model that programs it](docs/subleq.md): how the computer is built from the
   gate model's gates, what the model is shown, how many programs it writes right, how it was taught,
-  the compiler, and how the model teaches itself
+  the compiler, [the computer as a hand-built transformer](docs/subleq.md#the-computer-as-a-transformer),
+  and how the model teaches itself
 - [The SUBLEQ playground](https://darpan-97.github.io/terngate-subleq/subleq.html) (`docs/subleq.html`):
   the models run by `docs/subleq_engine.js`, a JavaScript port of the nitropz engine that gives every
   chance it gives, bit for bit, and the compiler by `docs/subleq_compiler.js` (`check.sh` holds both to
@@ -97,16 +104,19 @@ runs a step at a time. From a clone, `docs/subleq.html` opens in a browser as it
 | `subleq/machine.nitropz` | the gate model writing the five gates as you watch, and the computer built from them checked against a plain one |
 | `subleq/write.nitropz` | the model writing programs: its test, `check`, `live` and `export` |
 | `subleq/compile.nitropz` | the compiler: an expression broken into steps the model has been taught, each written by it, joined, run and judged; `measure` |
+| `subleq/computer_build.nitropz` | the computer as a transformer, every weight set by hand: writes `models/subleq_computer.tlm2` |
+| `subleq/computer.nitropz`, `subleq/computer_lib.nitropz` | that transformer running programs (`run`, `check`, `random`), every step held to the gate machine; the bytes it reads and writes; `subleq/programs/` holds two to try |
+| `subleq/computer_check.js` | the JavaScript making of it (`docs/subleq_computer.js`) held to the nitropz one, byte for byte, and a run in the playground's engine to the nitropz engine, bit for bit |
 | `subleq/corpus.nitropz` | the tasks and programs the model learns from |
 | `subleq/teach.sh` | how the model was taught: four stages from the gate model's checkpoint, a few minutes each |
 | `subleq/explore.nitropz`, `subleq/self_teach.sh` | the model trying programs of its own, and teaching itself from the ones the computer judges right |
 | `subleq/page_check.js` | the playground's JavaScript held to the nitropz programs: every chance bit for bit, the gates, the programs and every step, the compiler |
 | `core/` | the transformer: forward and back (`model`), training (`train`, `optimize`), packing (`pack`), the engine that runs a packed model (`engine`), choosing each byte (`sample`), every chance as its bits (`chances`) |
 | `lib/` | float maths, and the gate judge: a gate written as nitropz, run on every row of its truth table |
-| `models/` | `35k_subleq.tlm2`, the model, and its checkpoint `35k_subleq.ckpt`; `35k_gates.tlm2`, the gate model, and its checkpoint `35k_gates.ckpt`, which teaching starts from |
+| `models/` | `35k_subleq.tlm2`, the model, and its checkpoint `35k_subleq.ckpt`; `35k_gates.tlm2`, the gate model, and its checkpoint `35k_gates.ckpt`, which teaching starts from; `subleq_computer.tlm2`, the hand-built computer |
 | `images/` | `subleq_write` and `subleq_machine` compiled to images, to run with nothing to build |
 | `nitropz/` | nitropz, built: the VM, the compiler, and the part of its library these programs use ([what is in it](nitropz/README.md)) |
-| `docs/` | the page above; the playground (`subleq.html`), its engine (`subleq_engine.js`) and compiler (`subleq_compiler.js`), and the two models as scripts (`program_model.js`, `gate_model.js`) |
+| `docs/` | the page above; the playground (`subleq.html`), its engine (`subleq_engine.js`) and compiler (`subleq_compiler.js`), and the two models as scripts (`program_model.js`, `gate_model.js`); `subleq_computer.js`, the hand-built computer made in JavaScript |
 
 `build.sh`, `check.sh`, `par.sh` (training on several cores), `SHA256SUMS` and `LICENSE` are at the top.
 

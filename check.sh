@@ -9,6 +9,9 @@
 #   3. tasks it cannot hold are refused, never cut to fit (a*b+c, a fifth part, a ninth letter, a square);
 #   3b. the compiler (out/subleq_compile): 200 expressions drawn at random, each compiled into steps the
 #      model writes and judged on the gate machine: none wrong;
+#   3c. the hand-built computer: out/subleq_computer_build makes models/subleq_computer.tlm2 byte for
+#      byte; out/subleq_computer runs its programs and 40 memories drawn at random, every step the same
+#      as the gate machine's; and the computer built with one unit's sign flipped ("mux") goes wrong;
 #   4. the images in images/ are what the source compiles to now, byte for byte, and the one that writes
 #      programs, run by nitropz's VM, writes the same program as the executable;
 #   5. the binary files -- nitropz/bin, images, models -- are the ones SHA256SUMS lists. After changing
@@ -18,7 +21,10 @@
 #      printf 'window.PROGRAM_MODEL = "%s";\n' "$(base64 -w0 models/35k_subleq.tlm2)" (GATE_MODEL, 35k_gates);
 #   7. the playground's JavaScript gives every chance the nitropz engine gives, bit for bit (out/chances),
 #      and writes and runs what the nitropz programs do (subleq/page_check.js), when node is installed;
-#      skipped, and said so, when it is not.
+#      skipped, and said so, when it is not;
+#   7b. likewise for the computer (subleq/computer_check.js): docs/subleq_computer.js makes the same
+#      model file byte for byte, and a program run in the playground's engine gives every chance bit
+#      for bit as out/chances.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE"
@@ -49,6 +55,20 @@ counted=$(tr -d '\r' < out/check_compile.txt | grep " right, ")
 if echo "$counted" | grep -q " 0 wrong" && ! echo "$counted" | grep -q "^0 right"; then pass "the compiler, 200 expressions drawn at random: $counted"
 else fail "the compiler: $(tr -d '\r' < out/check_compile.txt | tr '\n' ' ')"; fi
 
+out/subleq_computer_build$ext out/check_computer.tlm2 > /dev/null 2>&1
+out/subleq_computer_build$ext out/check_computer_mux.tlm2 mux > /dev/null 2>&1
+if ! cmp -s out/check_computer.tlm2 models/subleq_computer.tlm2; then
+  fail "the computer: out/subleq_computer_build does not make models/subleq_computer.tlm2 byte for byte"
+elif ! out/subleq_computer$ext check > out/check_computer.txt 2>&1; then
+  fail "the computer, its programs: $(tr -d '\r' < out/check_computer.txt | grep -v '^right' | tr '\n' ' ')"
+elif ! out/subleq_computer$ext random 40 7 > out/check_computer_random.txt 2>&1; then
+  fail "the computer, memories drawn at random: $(tr -d '\r' < out/check_computer_random.txt | tr '\n' ' ')"
+elif out/subleq_computer$ext out/check_computer_mux.tlm2 random 3 > /dev/null 2>&1; then
+  fail "the computer's control: built with one unit flipped, it still came out right"
+else
+  pass "the computer: built byte for byte; its programs, $(tail -n 1 out/check_computer.txt | tr -d '\r'); $(tail -n 1 out/check_computer_random.txt | tr -d '\r'); built with one unit flipped, wrong"
+fi
+
 same=0
 for prog in write machine; do cmp -s "out/subleq_$prog.nitropzb" "images/subleq_$prog.nitropzb" && same=$((same + 1)); done
 out/subleq_write$ext live "prog r=d*b:" > out/check_live.txt 2>&1
@@ -74,6 +94,11 @@ if command -v node > /dev/null 2>&1; then
   if node subleq/page_check.js > out/check_page.txt 2>&1; then pass "the playground's JavaScript: $(tail -n 1 out/check_page.txt)"
   else fail "the playground's JavaScript: $(tr '\n' ' ' < out/check_page.txt)"; fi
 else echo "SKIP  the playground's JavaScript: no node here to run subleq/page_check.js"; fi
+
+if command -v node > /dev/null 2>&1; then
+  if node subleq/computer_check.js > out/check_computer_js.txt 2>&1; then pass "the computer in JavaScript: $(tail -n 1 out/check_computer_js.txt)"
+  else fail "the computer in JavaScript: $(tr '\n' ' ' < out/check_computer_js.txt)"; fi
+else echo "SKIP  the computer in JavaScript: no node here to run subleq/computer_check.js"; fi
 
 echo
 [ $fails -eq 0 ] && { echo "all passed"; exit 0; }

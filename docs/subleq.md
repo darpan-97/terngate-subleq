@@ -1,6 +1,6 @@
 # The computer, and the model that programs it
 
-Programs for a one-instruction computer built from the gate model's gates, and a model teaching itself. [Back to the README](../README.md). To watch it: [the SUBLEQ playground](https://darpan-97.github.io/terngate-subleq/subleq.html), where both models run in your browser: the gate model writes the five gates, the computer is built from them, and the program model writes programs for it, run a step at a time.
+Programs for a one-instruction computer built from the gate model's gates, and a model teaching itself. [Back to the README](../README.md). To watch it: [the SUBLEQ playground](https://darpan-97.github.io/terngate-subleq/subleq.html), where the models run in your browser: on the first tab the program model writes a program and the hand-built transformer runs it a byte at a time, the line it runs and the words its attention reads lit as it goes; the gate model writes the five gates, and the computer built from them runs the program model's programs a step at a time.
 
 A computer with one instruction, SUBLEQ a b c: take what is at a from what is at b, and if that leaves
 0 or less, go to c, else to the next instruction. Given memory enough, that one instruction can compute

@@ -26,8 +26,9 @@
 #      and writes and runs what the nitropz programs do (subleq/page_check.js), when node is installed;
 #      skipped, and said so, when it is not;
 #   7b. likewise for the computer (subleq/computer_check.js): docs/subleq_computer.js makes the same
-#      model file byte for byte, and a program run in the playground's engine gives every chance bit
-#      for bit as out/chances.
+#      model file byte for byte, a program run in the playground's engine gives every chance bit for bit
+#      as out/chances, and its fetch and read heads look at the latest statement of each word they need
+#      (what the playground lights; control: the computer that ignores an address bit looks elsewhere).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE"

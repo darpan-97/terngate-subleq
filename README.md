@@ -82,10 +82,12 @@ e, each after the first with a + or - (`prog r=c-d-e+b:`), a product or a quotie
 takes + - * / % and brackets over a to e and whole numbers; it multiplies and divides by counting down,
 so a number it counts must not be below 0.
 
-To watch it, open [the playground](https://darpan-97.github.io/terngate-subleq/subleq.html). Both models
-run there, in your browser: the gate model writes the five gates, the computer is built from them, and the
-program model writes a program for the task you pick or the expression you type, which the computer then
-runs a step at a time. From a clone, `docs/subleq.html` opens in a browser as it is.
+To watch it, open [the playground](https://darpan-97.github.io/terngate-subleq/subleq.html). All three
+transformers run there, in your browser. On its first tab the program model writes a program for the task
+you pick or the expression you type, and the hand-built transformer runs it, a byte at a time, lighting
+the line it runs and the words its attention reads; the other tabs show the program model's program run
+a step at a time on the computer built from the gate model's gates, and the gate model writing them. From
+a clone, `docs/subleq.html` opens in a browser as it is.
 
 ## Documentation
 

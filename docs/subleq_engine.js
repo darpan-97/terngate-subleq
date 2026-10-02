@@ -199,7 +199,9 @@
   }
 
   // ---- the engine: one byte at a time, a cache of every key and value so far ----
-  function Engine(m) {
+  // watch (optional): watch(layer, head, weights, pos) after each head's weights are worked out, for a
+  // page that shows where a head looked; it reads them and changes nothing
+  function Engine(m, watch) {
     const { VOCAB, DIM, LAYERS, BLOCK, HEADS, HEAD, HIDDEN, CONTEXT } = m;
     const kc = new Float64Array(LAYERS * CONTEXT * DIM), vc = new Float64Array(LAYERS * CONTEXT * DIM);
     const x = new Float64Array(DIM), h = new Float64Array(DIM), qry = new Float64Array(DIM);
@@ -273,6 +275,7 @@
           let sum = 0.0;
           for (let j = 0; j <= pos; j++) sum = sum + w[j];
           for (let j = 0; j <= pos; j++) w[j] = w[j] / sum;
+          if (watch) watch(l, hd, w, pos);
           for (let i = 0; i < HEAD; i++) att[qo + i] = 0.0;
           for (let j = 0; j <= pos; j++) {
             const by = w[j], vo = vBase + j * DIM + qo;

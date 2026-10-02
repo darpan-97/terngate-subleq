@@ -56,7 +56,13 @@
   .head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
   .head button { font-size: 13px; padding: 2px 8px; white-space: nowrap; }
   .head button[aria-pressed="true"] { background: var(--field); border-color: var(--soft); }
-  .box { max-height: 272px; overflow-y: auto; }
+  .box { max-height: 272px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--rule) transparent; }
+  .box:hover { scrollbar-color: var(--soft) transparent; }
+  .box::-webkit-scrollbar { width: 6px; }
+  .box::-webkit-scrollbar-track { background: transparent; }
+  .box::-webkit-scrollbar-thumb { background: var(--rule); border-radius: 3px; }
+  .box:hover::-webkit-scrollbar-thumb { background: var(--soft); }
+  .box::-webkit-scrollbar-button { display: none; }
   table { border-collapse: collapse; }
   .prog { font-family: var(--mono); font-size: 13px; }
   .prog td { height: 18px; padding: 0 14px 0 0; white-space: pre; }
@@ -92,8 +98,26 @@
   .gfoot { display: flex; align-items: baseline; gap: 14px; margin-top: 14px; }
   .gfoot .status { margin-top: 0; }
 
+  .toks { font-family: var(--mono); font-size: 13px; }
+  .toks td { height: 18px; padding: 0 12px 0 0; white-space: pre; }
+  .toks td.at { color: var(--soft); text-align: right; padding-right: 12px; }
+  .toks td.mean { font-family: var(--sans); color: var(--soft); }
+  .toks td.tag { font-family: var(--sans); font-size: 12px; color: var(--ink); }
+  .toks tr.looked td { background: var(--mark); }
+  .toks tr.bad td { color: #c5221f; }
+  .trio { display: grid; grid-template-columns: minmax(0, .62fr) minmax(0, .9fr) minmax(0, 1.42fr); gap: 26px; margin-top: 12px; }
+  #view-computer .box { max-height: 236px; }
+  #view-computer .prog, #view-computer .toks { font-size: 12px; }
+  #view-computer .prog td { padding-right: 10px; }
+  #view-computer .status { margin-top: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #view-computer .note { margin-top: 10px; }
+  #view-computer #tstatus, #view-computer #clook { white-space: normal; }
+  .cdone { margin-top: 8px; }
+  .cdone .answer { display: inline; margin: 0 10px 0 0; }
+  .cdone .verdict { display: inline; margin: 0; }
+
   @media (max-width: 880px) {
-    .main { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+    .main, .trio { grid-template-columns: minmax(0, 1fr); gap: 24px; }
     .gates { grid-template-columns: repeat(2, auto); justify-content: start; }
     .own { margin-left: 0; }
   }
@@ -105,16 +129,51 @@
     <h1>SUBLEQ playground</h1>
     <a href="https://github.com/darpan-97/terngate-subleq">Code, models and training on GitHub</a>
   </header>
-  <p class="intro">Two tiny transformers run here, in your browser, 34,976 parameters each (15 KB, layer weights −1, 0
-    or +1). The gate model writes the five logic gates this one-instruction computer is built from; the program model
-    writes its programs, and longer arithmetic is compiled into steps it writes.</p>
+  <p class="intro">Three transformers run in your browser, every layer weight −1, 0 or +1. Two are trained (34,976
+    parameters each): one writes the gates this one-instruction computer is built from, one its programs. The third
+    runs them; its 6.6 million weights are set by code.</p>
 
-  <div class="tabs" role="tablist" aria-label="The two models">
-    <button type="button" role="tab" id="tab-programs" aria-selected="true" aria-controls="view-programs">The program model</button>
+  <div class="tabs" role="tablist" aria-label="The three models">
+    <button type="button" role="tab" id="tab-computer" aria-selected="true" aria-controls="view-computer">Program model → computer model</button>
+    <button type="button" role="tab" id="tab-programs" aria-selected="false" aria-controls="view-programs">The program model</button>
     <button type="button" role="tab" id="tab-gates" aria-selected="false" aria-controls="view-gates">The gate model</button>
   </div>
 
-  <section id="view-programs" role="tabpanel" aria-labelledby="tab-programs">
+  <section id="view-computer" role="tabpanel" aria-labelledby="tab-computer">
+    <div class="tasks">
+      <span class="label">Task</span>
+      <span id="texamples" role="group" aria-label="Example tasks"></span>
+      <form class="own" id="town">
+        <label for="task">or your own</label>
+        <input id="task" autocomplete="off" spellcheck="false" placeholder="(a+b)*c-3 or print hi">
+        <button type="submit">Write and run</button>
+      </form>
+    </div>
+    <p class="refused" id="trefused" hidden></p>
+    <div class="trio">
+      <section aria-labelledby="h-tprog">
+        <div class="head"><h2 id="h-tprog">1. The program model writes</h2></div>
+        <div class="box" id="tbox"><table class="prog"><tbody id="tprog"></tbody></table></div>
+        <p class="status" id="tstatus"></p>
+      </section>
+      <section aria-labelledby="h-reads">
+        <div class="head"><h2 id="h-reads">2. The computer model reads it</h2></div>
+        <div class="box" id="creads"><table class="toks"><tbody id="creads-body"></tbody></table></div>
+        <p class="status" id="clook"></p>
+      </section>
+      <section aria-labelledby="h-writes">
+        <div class="head"><h2 id="h-writes">3. and runs it, a byte at a time</h2><button id="crun" type="button">Run again</button></div>
+        <div class="box" id="cwrites"><table class="toks"><tbody id="cwrites-body"></tbody></table></div>
+        <p class="status" id="cstatus" aria-live="polite"></p>
+        <p class="cdone"><span class="answer" id="canswer"></span><span class="verdict" id="cverdict"></span></p>
+      </section>
+    </div>
+    <p class="note">Ordinary code only turns the written lines into memory words, and checks each step against the gate machine.
+      A token is a byte: <code>v</code> value, <code>a</code> address, <code>n</code> next pc, <code>p</code> printed; lowest
+      digit first. Lit: the line being run, the words read. a = 3, b = 5, c = 7, d = 11, e = 13.</p>
+  </section>
+
+  <section id="view-programs" role="tabpanel" aria-labelledby="tab-programs" hidden>
     <div class="tasks">
       <span class="label">Task</span>
       <span id="examples" role="group" aria-label="Example tasks"></span>
@@ -177,12 +236,14 @@
       OR no digit set (18); the next instruction, pc + 3, a sum and a carry a digit (32); the jump, a choose a digit
       (16): 114 gates a step, 16 digits each.</p>
   </section>
+
 </main>
 
 <script src="program_model.js"></script>
 <script src="gate_model.js"></script>
 <script src="subleq_engine.js"></script>
 <script src="subleq_compiler.js"></script>
+<script src="subleq_computer.js"></script>
 <script>
 (function () {
   'use strict';
@@ -299,15 +360,16 @@
 
   // ---- tabs ----
   function show(which) {
-    const programs = which === 'programs';
-    $('tab-programs').setAttribute('aria-selected', programs ? 'true' : 'false');
-    $('tab-gates').setAttribute('aria-selected', programs ? 'false' : 'true');
-    $('view-programs').hidden = !programs;
-    $('view-gates').hidden = programs;
-    if (!programs && !gatesWatched) { gatesWatched = true; watchGates(); }
+    for (const t of ['programs', 'gates', 'computer']) {
+      $('tab-' + t).setAttribute('aria-selected', t === which ? 'true' : 'false');
+      $('view-' + t).hidden = t !== which;
+    }
+    if (which === 'gates' && !gatesWatched) { gatesWatched = true; watchGates(); }
+    if (which === 'computer' && cran !== cur) runComputer();
   }
   $('tab-programs').onclick = () => show('programs');
   $('tab-gates').onclick = () => show('gates');
+  $('tab-computer').onclick = () => show('computer');
   $('again').onclick = () => watchGates();
   renderGates(-1);
 
@@ -323,7 +385,7 @@
   }
 
   // lines: [kind, text] -- 'code' a line of the program, 'step' a heading, 'data' a constant
-  function renderLines(lines, now) {
+  function renderLines(lines, now, into) {   // into: the tbody (tab 1's #prog unless named)
     let ops = 0, html = '';
     for (const [kind, text] of lines) {
       if (kind === 'step') { html += '<tr class="step"><td></td><td colspan="4">' + esc(text) + '</td></tr>'; continue; }
@@ -331,9 +393,10 @@
       let at = '';
       if (text.trim() !== '' && !text.startsWith('    #')) { at = ops * 3; ops += 1; }
       const p = parts(text);
-      html += '<tr' + (at !== '' && at === now ? ' class="now"' : '') + '><td class="at">' + at + '</td><td>' +
+      html += '<tr' + (at !== '' ? ' data-pc="' + at + '"' : '') + (at !== '' && at === now ? ' class="now"' : '') + '><td class="at">' + at + '</td><td>' +
         esc(p[0]) + '</td><td>' + esc(p[1]) + '</td><td>' + esc(p[2]) + '</td><td>' + esc(p[3]) + '</td></tr>';
     }
+    if (into) { into.innerHTML = html; return; }
     $('prog').innerHTML = html;
     const row = $('prog').querySelector('tr.now');
     if (row) row.scrollIntoView({ block: 'nearest' });
@@ -363,6 +426,13 @@
   function renderProgram(now) {
     if (!cur) return;
     renderLines(cur.compiled ? compiledLines(cur.compiled, cur.written) : taskLines(cur.written[0] || ''), now);
+    renderTrio();
+  }
+
+  function renderTrio() {             // the same program in the first tab's column 1, following its last line
+    if (!cur) return;
+    renderLines(cur.compiled ? compiledLines(cur.compiled, cur.written) : taskLines(cur.written[0] || ''), -1, $('tprog'));
+    if (!cur.done && $('tprog').lastElementChild) within($('tbox'), $('tprog').lastElementChild);
   }
 
   $('reads').onclick = () => {
@@ -466,7 +536,12 @@
   }
 
   function pressed(label) {
-    [...$('examples').children].forEach(b => b.setAttribute('aria-pressed', b.textContent === label ? 'true' : 'false'));
+    [...$('examples').children, ...$('texamples').children].forEach(b => b.setAttribute('aria-pressed', b.textContent === label ? 'true' : 'false'));
+  }
+
+  function writing(html) { $('status').innerHTML = html; $('tstatus').innerHTML = html; }   // the program model's progress
+  function refuse(text) {             // a task it cannot be asked (null: none)
+    for (const id of ['refused', 'trefused']) { $(id).hidden = text === null; if (text !== null) $(id).textContent = text; }
   }
 
   function finish(question, program, compiled) {   // the program written: assemble, judge, trace
@@ -481,11 +556,15 @@
     } else cur.verdict = M ? S.judge(question, program.slice(program.indexOf('\n') + 1), 12345, M) : null;
     if (cur.asm && M && !(compiled && cur.want === null)) { const t = S.trace(cur.asm, 5000, M); cur.rows = t.rows; cur.stopped = t.stopped; }
     render();
+    if (!$('view-computer').hidden) runComputer();
   }
 
   async function write(question, label) {     // one task the model has been taught
     if (!programModel) return;
     const mine = ++job;
+    cjob += 1;
+    cran = null;
+    resetComputer('The program model is writing; the computer model runs the program once it is written.');
     stop();
     s = 0;
     pressed(label);
@@ -501,18 +580,21 @@
     const done = await paced(writer, PROGRAM_DELAY, (text, got) => {
       cur.written[0] = text;
       renderProgram(-1);
-      $('status').innerHTML = 'Writing byte ' + text.length + ': ' + byteName(got.byte) + ', its chance ' +
-        (got.chance * 100).toFixed(1) + '%, the likeliest of 256.';
+      writing('The program model, byte ' + text.length + ': ' + byteName(got.byte) + ', its chance ' +
+        (got.chance * 100).toFixed(1) + '%, the likeliest.');
     }, () => mine !== job);
     if (done === null) return;
-    $('status').textContent = 'Written: ' + done.text.length + ' bytes, each the likeliest; ' +
-      Math.max(1, Math.round(took + done.took)) + ' ms of the model’s time in this browser.';
+    writing('Written: ' + done.text.length + ' bytes, each the likeliest; ' +
+      Math.max(1, Math.round(took + done.took)) + ' ms of the model’s time in this browser.');
     finish(question, question + '\n' + done.text, null);
   }
 
   async function compile(parsed, label) {     // an expression: steps the model has been taught, each written by it
     if (!programModel) return;
     const mine = ++job;
+    cjob += 1;
+    cran = null;
+    resetComputer('The program model is writing; the computer model runs the program once it is written.');
     stop();
     s = 0;
     pressed(label);
@@ -535,16 +617,16 @@
         renderProgram(-1);
         const row = $('prog').lastElementChild;
         if (row) row.scrollIntoView({ block: 'nearest' });
-        $('status').innerHTML = 'Writing step ' + (k + 1) + ' of ' + steps.length + ', byte ' + text.length + ': ' +
-          byteName(got.byte) + ', its chance ' + (got.chance * 100).toFixed(1) + '%.';
+        writing('Writing step ' + (k + 1) + ' of ' + steps.length + ', byte ' + text.length + ': ' +
+          byteName(got.byte) + ', its chance ' + (got.chance * 100).toFixed(1) + '%.');
       }, () => mine !== job);
       if (done === null) return;
       cur.written[k] = done.text;
       took += done.took;
       bytes += done.text.length;
     }
-    $('status').textContent = 'Written: ' + steps.length + ' steps, ' + bytes + ' bytes, each the likeliest; ' +
-      Math.max(1, Math.round(took)) + ' ms of the model’s time in this browser.';
+    writing('Written: ' + steps.length + ' steps, ' + bytes + ' bytes, each the likeliest; ' +
+      Math.max(1, Math.round(took)) + ' ms of the model’s time in this browser.');
     finish(parsed.text, C.link(parsed.text, steps, cur.written, data), compiled);
     $('box').scrollTop = 0;
     render();
@@ -556,23 +638,228 @@
     if (t.endsWith(':')) t = t.slice(0, -1).trim();
     if (t.startsWith('print')) {
       const question = 'prog print ' + t.slice(5).replace(/\s+/g, '') + ':';
-      if (S.askable(question)) { $('refused').hidden = true; write(question, label); return; }
-      $('refused').hidden = false;
-      $('refused').textContent = 'It prints a word of 1 to 8 small letters (print hello).';
+      if (S.askable(question)) { refuse(null); write(question, label); return; }
+      refuse('It prints a word of 1 to 8 small letters (print hello).');
       return;
     }
     t = t.replace(/\s+/g, '');
     const question = 'prog ' + (t.startsWith('r=') ? t : 'r=' + t) + ':';
-    if (S.askable(question)) { $('refused').hidden = true; write(question, label); return; }
+    if (S.askable(question)) { refuse(null); write(question, label); return; }
     const parsed = C.parse(t);
     if (parsed.error) {
-      $('refused').hidden = false;
-      $('refused').textContent = 'Cannot compile that: ' + parsed.error + '. It takes arithmetic over a to e and whole numbers (e.g. (a+b)*c-3), or print and a word.';
+      refuse('Cannot compile that: ' + parsed.error + '. It takes arithmetic over a to e and whole numbers (e.g. (a+b)*c-3), or print and a word.');
       return;
     }
-    $('refused').hidden = true;
+    refuse(null);
     compile(parsed, label);
   }
+
+  // ---- the computer model: a transformer with every weight set by code, running the program a byte a pass ----
+  const K = window.SubleqComputer;
+  let CM = null;                     // the computer model, made the first time it is wanted
+  let cjob = 0, cran = null;         // the run going on, and the program it ran last
+  const FIELD = t => (t >= 1 && t <= 4 ? 'v' : t <= 7 ? 'a' : t <= 11 ? 'n' : t <= 13 ? 'p' : '');
+  const tok = b => { const t = b >> 4; return t === K.T.STOP ? 'STOP' : t === K.T.END ? 'END' : FIELD(t) + (b & 15).toString(16); };
+  const nib = (bytes, at, n) => { let v = 0; for (let k = 0; k < n; k++) v |= (bytes[at + k] & 15) << (4 * k); return v; };
+
+  function within(box, row) {        // scroll a box (not the page) to show a row
+    const top = row.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop;
+    if (top < box.scrollTop || top + row.offsetHeight > box.scrollTop + box.clientHeight) box.scrollTop = Math.max(0, top - box.clientHeight / 3);
+  }
+
+  function resetComputer(text) {     // the computer's columns cleared: a new program, or nothing to run
+    for (const r of $('tprog').querySelectorAll('tr.now')) r.classList.remove('now');
+    $('creads-body').innerHTML = ''; $('cwrites-body').innerHTML = '';
+    $('canswer').textContent = ''; $('cverdict').textContent = ''; $('clook').textContent = '';
+    $('cstatus').textContent = text;
+    $('crun').disabled = false;
+  }
+
+  // each kind of step, its bytes' types in order
+  const V_STEP = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], P_STEP = [12, 13, 8, 9, 10, 11];
+  const typesAre = (bytes, kinds) => bytes.length === kinds.length && bytes.every((b, i) => (b >> 4) === kinds[i]);
+
+  async function runComputer() {
+    const mine = ++cjob;
+    const run = cur;
+    if (!run || !run.done) { cran = null; resetComputer('The computer model runs the program once it is written.'); return; }
+    cran = run;
+    if (!run.asm) { resetComputer('The program the model wrote does not assemble, so there is nothing to run.'); return; }
+    resetComputer('');
+    $('crun').disabled = true;
+    const owner = () => mine === cjob;     // a newer run or a new program takes the columns over
+    const giveBack = () => { if (owner()) $('crun').disabled = false; };
+    if (!CM) {
+      $('cstatus').textContent = 'Making the computer model: setting its 6.6 million weights…';
+      await sleep(20);
+      const t0 = performance.now();
+      try { CM = S.loadModel(K.build(S, {}).net.bytes()); }
+      catch (err) { if (owner()) $('cstatus').textContent = 'The computer model was not made here: ' + err.message; giveBack(); return; }
+      if (!owner()) return;
+      $('cstatus').textContent = 'Made in ' + Math.round(performance.now() - t0) + ' ms.';
+      await sleep(20);
+      if (!owner()) return;
+    }
+    const refName = M ? 'the gate machine' : 'the reference machine';
+    const ref = S.trace(run.asm, 400, M || S.machine(S.KNOWN_GATES));
+    const prompt = K.promptFor(run.asm);
+    // what it reads: a row a statement, then pc 0
+    let html = '';
+    for (let at = 0; at + 7 <= prompt.length - 4; at += 7) {
+      const addr = nib(prompt, at + 4, 3), value = nib(prompt, at, 4);
+      html += '<tr data-at="' + (at + 6) + '" data-addr="' + addr + '"><td class="at">mem[' + addr + ']</td><td>' + prompt.slice(at, at + 7).map(tok).join(' ') +
+        '</td><td class="mean">' + fmt(S.signed(value)) + '</td><td class="tag"></td></tr>';
+    }
+    html += '<tr data-at="' + (prompt.length - 1) + '"><td class="at">pc</td><td>n0 n0 n0 n0</td><td class="mean">0</td><td class="tag"></td></tr>';
+    $('creads-body').innerHTML = html;
+    if (prompt.length >= CM.CONTEXT) { $('cstatus').textContent = 'This program is too long for the model’s view.'; giveBack(); return; }
+    const needs = prompt.length + ref.rows.reduce((n, r0) => n + (r0[7] >= 0 ? 6 : 11), 0) + 1;
+    if (needs > CM.CONTEXT || ref.rows.length >= 400)           // (the verdict's place, until there is one)
+      $('cverdict').textContent = 'This run needs ' + (ref.rows.length >= 400 ? 'more than ' : '') + needs.toLocaleString('en') +
+        ' bytes, more than the model’s view of 2,048: it will stop partway.';
+    // where heads looked: layer 3's three (the instruction's words) and layer 4's two (mem[a], mem[b]),
+    // caught at each step's deciding byte (the last of the pc before it)
+    let catching = false;
+    const looked = [];
+    let engine;
+    try {
+      engine = S.Engine(CM, (l, h, w, pos) => {
+        if (!catching || (l !== 2 && l !== 3) || (l === 2 && h > 2) || (l === 3 && h > 1)) return;
+        let best = 0;
+        for (let j = 1; j <= pos; j++) if (w[j] > w[best]) best = j;
+        looked.push([l === 2 ? 'fetch ' + 'abc'[h] : h === 0 ? 'read a' : 'read b', best]);   // the instruction's a, b, c; mem[a], mem[b]
+      });
+    } catch (err) { $('cstatus').textContent = 'The computer model could not run here: ' + err.message; giveBack(); return; }
+    const t0 = performance.now();
+    let yielded = t0;
+    for (let p = 0; p < prompt.length; p++) {
+      catching = p === prompt.length - 1;
+      engine.step(prompt[p], p);
+      if (performance.now() - yielded > 40) {     // the page stays answerable
+        $('cstatus').textContent = 'Reading byte ' + (p + 1) + ' of ' + prompt.length + '…';
+        await sleep(0);
+        yielded = performance.now();
+        if (!owner()) return;
+      }
+    }
+    // what it writes, a byte a pass
+    const written = [];               // every byte after the prompt
+    const records = [];               // each step: [its first position, its kind: 'v', 'p', or 'bad']
+    let rec = [], step = 0, pos = prompt.length, wrong = -1, ended = '', full = false;
+    const writesBody = $('cwrites-body');
+    let row = null;
+    function newRow() {
+      row = document.createElement('tr');
+      row.innerHTML = '<td class="at">' + (step + 1) + '</td><td></td><td class="mean"></td><td class="tag"></td>';
+      row.dataset.from = String(pos);
+      writesBody.appendChild(row);
+    }
+    function mark(list, k) {          // light the rows the heads looked at, for step k
+      for (const r of document.querySelectorAll('#view-computer tr.looked')) { r.classList.remove('looked'); if (r.lastChild.classList.contains('tag')) r.lastChild.textContent = ''; }
+      for (const r of $('tprog').querySelectorAll('tr.now')) r.classList.remove('now');
+      const printing = ref.rows[k] && ref.rows[k][7] >= 0;   // b is out: there is no mem[b] to read
+      const zero = [], own = [];
+      if (k >= ref.rows.length) list = [];   // past the machine's last step there is no instruction to show
+      for (const [what, p] of list) {
+        if (printing && what === 'read b') continue;
+        let r = null;
+        if (p < prompt.length - 4) r = $('creads').querySelector('tr[data-at="' + p + '"]');
+        else for (const w of writesBody.children) if (+w.dataset.from + 6 === p && w.dataset.kind === 'v') r = w;
+        if (!r) { zero.push(what); continue; }   // the default: a word nobody has written, read as 0
+        r.classList.add('looked');
+        r.lastChild.textContent = r.lastChild.textContent ? r.lastChild.textContent + ', ' + what : what;
+        if (r.parentElement === writesBody) own.push(what + ' ← step ' + r.firstChild.textContent);
+        if (what === 'fetch a') {      // the line being run: the program model's line at the address fetched
+          const line = $('tprog').querySelector('tr[data-pc="' + r.dataset.addr + '"]');
+          if (line) { line.classList.add('now'); within($('tbox'), line); }
+        }
+      }
+      const say = [];
+      if (own.length) say.push('From its own steps: ' + own.join(', ') + '.');
+      if (zero.length) say.push('Read as 0, nobody having written it: ' + zero.join(', ') + '.');
+      $('clook').textContent = say.join(' ');
+      const lit = [...$('creads').querySelectorAll('tr.looked')];   // show them all, if they fit
+      if (lit.length) {
+        const box = $('creads'), base = box.getBoundingClientRect().top - box.scrollTop;
+        const top = lit[0].getBoundingClientRect().top - base, bottom = lit[lit.length - 1].getBoundingClientRect().bottom - base;
+        if (bottom - top <= box.clientHeight) {
+          if (top < box.scrollTop || bottom > box.scrollTop + box.clientHeight) box.scrollTop = Math.max(0, top - (box.clientHeight - (bottom - top)) / 2);
+        } else within(box, lit[0]);
+      }
+    }
+    mark(looked.splice(0), 0);
+    newRow();
+    while (pos < CM.CONTEXT) {
+      const b = engine.likeliest(), chance = engine.chances[b], t = b >> 4;
+      written.push(b);
+      rec.push(b);
+      row.children[1].textContent = rec.map(tok).join(' ');
+      $('cstatus').textContent = 'Byte ' + (pos + 1).toLocaleString('en') + ': ' + tok(b) + ', its chance ' + (chance * 100).toFixed(1) + '%, the likeliest.';
+      if (t === K.T.STOP || t === K.T.END) {
+        ended = t === K.T.STOP ? 'STOP' : 'END';
+        const want = step >= ref.rows.length ? (ref.stopped ? 'STOP' : 'END') : 'a step';
+        const clean = rec.length === 1 && (b & 15) === 0;     // a stop alone, its digit 0
+        row.children[2].textContent = ended + (want === ended && clean ? '' : '   (' + refName + ': ' + want + ')');
+        if ((want !== ended || !clean) && wrong < 0) { wrong = step; row.classList.add('bad'); }
+        break;
+      }
+      if (t === K.T.N3) {             // a step written: read it back beside the machine's
+        const r0 = ref.rows[step];
+        let said = '', same = false, kind = 'bad';
+        if (typesAre(rec, V_STEP)) {
+          const v = nib(rec, 0, 4), a = nib(rec, 4, 3), n = nib(rec, 7, 4);
+          kind = 'v';
+          row.dataset.addr = String(a);
+          said = fmt(S.signed(v)) + ' at ' + a + ', next ' + fmt(S.signed(n));
+          same = !!r0 && r0[7] < 0 && (r0[2] & 65535) === a && (r0[5] & 65535) === v && (r0[6] & 65535) === n;
+        } else if (typesAre(rec, P_STEP)) {
+          const v = nib(rec, 0, 2), n = nib(rec, 2, 4);
+          kind = 'p';
+          said = 'prints ' + v + ' (“' + esc(String.fromCharCode(v)) + '”), next ' + fmt(S.signed(n));
+          same = !!r0 && r0[7] === v && (r0[6] & 65535) === n;
+        } else said = 'not a step';
+        row.dataset.kind = kind;
+        row.children[2].innerHTML = said + (same ? '' : '   (' + refName + ': ' + (r0 ? (r0[7] >= 0 ? 'prints ' + r0[7] : fmt(r0[5]) + ' at ' + (r0[2] & 65535)) + ', next ' + fmt(r0[6]) : 'no such step') + ')');
+        if (!same) { row.classList.add('bad'); if (wrong < 0) wrong = step; }
+        records.push([+row.dataset.from, kind]);
+        step += 1;
+        rec = [];
+        catching = true;
+      } else catching = false;
+      engine.step(b, pos);
+      pos += 1;
+      if (catching) { mark(looked.splice(0), step); newRow(); }
+      within($('cwrites'), row);
+      await sleep(0);
+      if (!owner()) return;
+    }
+    if (pos >= CM.CONTEXT) full = true;
+    if (rec.length === 0 && row && !ended) row.remove();     // (the view filled just as a step ended)
+    mark([], step);
+    const ms = performance.now() - t0;
+    $('cstatus').textContent = 'Read ' + prompt.length.toLocaleString('en') + ' bytes, wrote ' + written.length.toLocaleString('en') +
+      ', each the likeliest: ' + Math.round(ms / (prompt.length + written.length)) + ' ms a byte here.';
+    // the answer, from what the model wrote (its proper steps only)
+    let out = '', r = run.asm.r >= 0 ? run.asm.mem[run.asm.r] : null;
+    for (const [from, kind] of records) {
+      const bytes = written.slice(from - prompt.length);
+      if (kind === 'p') out += String.fromCharCode(nib(bytes, 0, 2));
+      else if (kind === 'v' && run.asm.r >= 0 && nib(bytes, 4, 3) === run.asm.r) r = nib(bytes, 0, 4);
+    }
+    let answer = run.kind === 2 || out ? 'It printed: <code style="font-size:16px">' + esc(out) + '</code>' :
+      r !== null ? '<code style="font-size:16px">r</code> = ' + fmt(S.signed(r)) : '';
+    if (full) answer += ' so far';
+    else if (run.compiled && run.want === null) answer += ' (with these inputs a number it counts is below 0, so not the value of ' + esc(run.compiled.text.slice(2)) + ')';
+    $('canswer').innerHTML = answer;
+    // the verdict: this page's step by step, and the library's (subleq_computer.js compare) as well
+    const lib = K.compare(S, run.asm, written, 400, full);
+    if (wrong < 0 && lib.why !== null) wrong = lib.at;
+    $('cverdict').textContent = wrong >= 0 ? 'Step ' + (wrong + 1) + ' is not ' + refName + '’s.' :
+      full ? 'Every one of its ' + step + ' steps the same as ' + refName + '’s, but its view is full: the run has not ended.' :
+      'Every step the same as ' + refName + '’s: ' + step + ' steps, then ' + ended + '.';
+    giveBack();
+  }
+  $('crun').onclick = () => runComputer();
 
   function stop() { if (timer) { clearInterval(timer); timer = null; } }
 
@@ -592,17 +879,18 @@
   };
   $('speed').onchange = () => { if (timer) { stop(); $('play').onclick(); } };
 
-  EXAMPLES.forEach(t => {
+  for (const into of ['examples', 'texamples']) EXAMPLES.forEach(t => {
     const b = document.createElement('button');
     b.type = 'button';
     b.textContent = t;
     b.onclick = () => ask(t, t);
-    $('examples').appendChild(b);
+    $(into).appendChild(b);
   });
 
   $('own').onsubmit = ev => { ev.preventDefault(); ask($('ask').value, null); };
+  $('town').onsubmit = ev => { ev.preventDefault(); ask($('task').value, null); };
 
-  ask('(a+b)*c-3', '(a+b)*c-3');
+  ask('r=d*b', 'r=d*b');
 })();
 </script>
 </body>

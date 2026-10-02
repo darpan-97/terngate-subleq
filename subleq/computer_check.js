@@ -54,6 +54,67 @@ const at = changed.length - model.DIM * 4 + 4 * 24;
 dv.setFloat32(at, dv.getFloat32(at, true) * (1 + 1.2e-7), true);
 if (bits(S.loadModel(changed)) === native) fails.push('control: a model with one gain changed gave the same bits');
 
+// 3. where the heads look (what the playground lights): at each step's deciding byte, the three fetch
+// heads (layer 3) must look at the latest statement of mem[pc], mem[pc + 1], mem[pc + 2], and the two read
+// heads (layer 4) at that of mem[a] and mem[b] -- a statement's last byte, in the prompt or written since --
+// or, for a word nobody has written, at a reading byte (an N3: the default, which reads 0). The engine with
+// the watch must give every chance bit for bit as without it.
+function looks(mdl, out) {
+  const fails = [];
+  const prompt = r.prompt, all = prompt.concat(out);
+  const looked = [];
+  let catching = false;
+  const e = S.Engine(mdl, (l, h, w, pos) => {
+    if (!catching || (l !== 2 && l !== 3) || (l === 2 && h > 2) || (l === 3 && h > 1)) return;
+    let best = 0;
+    for (let j = 1; j <= pos; j++) if (w[j] > w[best]) best = j;
+    looked.push({ pos, l, h, best, weight: w[best] });
+  });
+  const plain = S.Engine(mdl);
+  let sameBits = true;
+  for (let p = 0; p < all.length - 1; p++) {
+    catching = (all[p] >> 4) === C.T.N3;
+    e.step(all[p], p);
+    plain.step(all[p], p);
+    for (let v = 0; v < 256; v++) if (!Object.is(e.chances[v], plain.chances[v])) sameBits = false;
+  }
+  if (!sameBits) fails.push('the engine with a watch did not give every chance as without it');
+  // the latest statement of an address before position p: the position of its A2 byte, or -1
+  const statementOf = (addr, p) => {
+    let found = -1;
+    for (let q = 6; q < p; q++) if ((all[q] >> 4) === C.T.A2 && (all[q - 6] >> 4) === C.T.V0) {
+      let a = 0; for (let k = 0; k < 3; k++) a |= (all[q - 2 + k] & 15) << (4 * k);
+      if (a === addr) found = q;
+    }
+    return found;
+  };
+  const ref = S.trace(asm, 400, S.machine(S.KNOWN_GATES));
+  const deciding = [];
+  for (let p = 0; p < all.length - 1; p++) if ((all[p] >> 4) === C.T.N3) deciding.push(p);
+  let heads = 0, wrongLook = 0;
+  ref.rows.forEach((row, k) => {
+    const pos = deciding[k], at = looked.filter(x => x.pos === pos);
+    const want = [row[0], row[0] + 1, row[0] + 2, row[1], row[2] & 65535];
+    at.forEach((x, i) => {
+      const s = statementOf(want[i], pos);
+      const ok = x.weight === 1 && (s >= 0 ? x.best === s : (all[x.best] >> 4) === C.T.N3);
+      heads += 1;
+      if (!ok && wrongLook++ < 3) fails.push('step ' + (k + 1) + ', ' + ['fetch a', 'fetch b', 'fetch c', 'read a', 'read b'][i] + ': looked at ' + x.best + ' (weight ' + x.weight + '), not ' + (s >= 0 ? s : 'a reading byte'));
+    });
+    if (at.length !== 5) fails.push('step ' + (k + 1) + ': ' + at.length + ' heads caught, not 5');
+  });
+  return { fails, heads, wrong: wrongLook };
+}
+const seen = looks(model, r.out);
+fails.push(...seen.fails);
+const lookedLine = seen.heads + ' looks of the fetch and read heads, each on the latest statement of its word (or the default), weight 1';
+// control: the computer built with address bit 0 not compared when reading mem[a], mem[b] must look elsewhere
+{
+  const bad = S.loadModel(new Uint8Array(C.build(S, { fault: 'addrbit' }).net.bytes()));
+  const badRun = C.run(S, bad, asm, 400);
+  if (looks(bad, badRun.out).wrong === 0) fails.push('control: the computer that ignores an address bit was seen looking only where it should');
+}
+
 if (fails.length) { console.log(fails.join('\n')); process.exit(1); }
 console.log('docs/subleq_computer.js makes models/subleq_computer.tlm2 byte for byte; product c*d in the playground\'s engine right at all ' +
-  c.right + ' steps, and every chance at ' + text.length + ' bytes bit for bit as out/chances');
+  c.right + ' steps, and every chance at ' + text.length + ' bytes bit for bit as out/chances; ' + lookedLine);

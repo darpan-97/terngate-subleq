@@ -50,7 +50,7 @@ sh build.sh                                  # every program, made machine code,
 out/subleq_write live "prog r=c-d-e+b:"      # one program, written as you watch, then run
 out/subleq_write                             # the model on tasks kept back from all its training
 out/subleq_machine                           # the gate model writes five gates; the computer is built from them
-bash check.sh                                # the computer, the model and the images, each checked
+bash check.sh                                # the computer, the model, the images and the binary files, each checked
 ```
 
 On Windows the programs end in `.exe`. The model can be asked for a sum of 1 to 4 of the letters a to
@@ -85,4 +85,14 @@ step through it on the gate machine, every memory cell and every step explained.
 | `nitropz/` | nitropz, built: the VM, the compiler, and the part of its library these programs use ([what is in it](nitropz/README.md)) |
 | `docs/` | the page above, and the playground |
 
-`build.sh`, `check.sh` and `par.sh` (training on several cores) are at the top.
+`build.sh`, `check.sh`, `par.sh` (training on several cores), `SHA256SUMS` and `LICENSE` are at the top.
+
+## Checking the files
+
+`SHA256SUMS` lists the binary files -- nitropz's VMs and compiler, the two images, the models -- and
+`sha256sum -c SHA256SUMS` checks them; `check.sh` does too. A clone is checked by git as well: every
+file is held to its commit, so the commit hash (`git rev-parse HEAD`) names exactly what you have.
+
+## License
+
+MIT: [LICENSE](LICENSE). nitropz, in `nitropz/`, is MIT licensed too: [nitropz/LICENSE](nitropz/LICENSE).

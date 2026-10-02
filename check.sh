@@ -7,7 +7,9 @@
 #      gate machine and judged on 6 sets of inputs, must all be right: 150 sums, 4 products, 60 words;
 #   3. tasks it cannot hold are refused, never cut to fit (a*b+c, a fifth part, a ninth letter);
 #   4. the images in images/ are what the source compiles to now, byte for byte, and the one that writes
-#      programs, run by nitropz's VM, writes the same program as the executable.
+#      programs, run by nitropz's VM, writes the same program as the executable;
+#   5. the binary files -- nitropz/bin, images, models -- are the ones SHA256SUMS lists. After changing
+#      one on purpose: sha256sum -b nitropz/bin/* images/* models/* > SHA256SUMS
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE"
@@ -41,6 +43,10 @@ if [ $same -eq 2 ] && grep -q "right on 6 sets of inputs" out/check_live.txt && 
   pass "the images: both what the source compiles to, byte for byte; run by the VM, the same program as the executable"
 elif [ $same -ne 2 ]; then fail "the images: $same of 2 are what the source compiles to (after sh build.sh: cp out/subleq_write.nitropzb out/subleq_machine.nitropzb images/)"
 else fail "the images: run by the VM, not the same program as the executable (out/check_live.txt, out/check_live_vm.txt)"; fi
+
+if sha256sum -c --quiet SHA256SUMS > out/check_sums.txt 2>&1; then
+  pass "the binary files: all $(grep -c . SHA256SUMS) as SHA256SUMS lists them"
+else fail "the binary files, not as SHA256SUMS lists them: $(tr -d '\r' < out/check_sums.txt | tr '\n' ' ')"; fi
 
 echo
 [ $fails -eq 0 ] && { echo "all passed"; exit 0; }

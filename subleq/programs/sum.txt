@@ -1,0 +1,14 @@
+prog r=c-d-e+b:
+    l0: c z
+    z r
+    z z
+    l1: d r
+    z z
+    z z
+    l2: e r
+    z z
+    z z
+    l3: b z
+    z r
+    z z
+    z z -1

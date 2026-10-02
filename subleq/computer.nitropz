@@ -84,8 +84,35 @@ fn judge(limit, show):
         if OUT_END == 1: ended = "STOP"
         if OUT_END == 2: ended = "END"
         tell(concat(concat("  the model ended with ", ended), "\n"))
+        answer()
     if CP_WHY == 0 and (right == REF_ROWS or CP_FULL): return 1
     tell(concat(concat(concat(concat("  WRONG at step ", str(CP_AT + 1)), ": "), CP_WHY), "\n"))
+    return 0
+
+fn signed(v):
+    if v >= 32768: return v - 65536
+    return v
+
+# the answer, read from what the MODEL wrote (beside the machine's): what it printed, and r's last value
+fn answer():
+    let printed = ""
+    let s = 0
+    while s < OUT_ROWS:
+        if load(OUT_PRINTED + s * 4) >= 0: printed = concat(printed, sl_char(load(OUT_PRINTED + s * 4)))
+        s += 1
+    if slen(printed) > 0: tell(concat(concat("  the model printed: ", printed), "\n"))
+    if SL_R < 0: return 0
+    let mine = load(MEM_COPY + SL_R * 4)
+    let theirs = mine
+    s = 0
+    while s < OUT_ROWS:
+        if load(OUT_PRINTED + s * 4) < 0 and load(OUT_B + s * 4) == SL_R: mine = load(OUT_AFTER + s * 4)
+        s += 1
+    s = 0
+    while s < REF_ROWS:
+        if load(REF_PRINTED + s * 4) < 0 and load(REF_B + s * 4) == SL_R: theirs = load(REF_AFTER + s * 4)
+        s += 1
+    tell(concat(concat(concat(concat("  r = ", str(signed(mine))), " (the machine: "), str(signed(theirs))), ")\n"))
     return 0
 
 fn set_inputs(a, b, c, d, e):

@@ -105,7 +105,7 @@ runs a step at a time. From a clone, `docs/subleq.html` opens in a browser as it
 | `subleq/write.nitropz` | the model writing programs: its test, `check`, `live` and `export` |
 | `subleq/compile.nitropz` | the compiler: an expression broken into steps the model has been taught, each written by it, joined, run and judged; `measure` |
 | `subleq/computer_build.nitropz` | the computer as a transformer, every weight set by hand: writes `models/subleq_computer.tlm2` |
-| `subleq/computer.nitropz`, `subleq/computer_lib.nitropz` | that transformer running programs (`run`, `check`, `random`), every step held to the gate machine; the bytes it reads and writes; `subleq/programs/` holds two to try |
+| `subleq/computer.nitropz`, `subleq/computer_lib.nitropz` | that transformer running programs (`run`, `check`, `random`), every step held to the gate machine; the bytes it reads and writes; `subleq/programs/` holds five to try |
 | `subleq/computer_check.js` | the JavaScript making of it (`docs/subleq_computer.js`) held to the nitropz one, byte for byte, and a run in the playground's engine to the nitropz engine, bit for bit |
 | `subleq/corpus.nitropz` | the tasks and programs the model learns from |
 | `subleq/teach.sh` | how the model was taught: four stages from the gate model's checkpoint, a few minutes each |

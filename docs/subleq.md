@@ -151,10 +151,13 @@ it writes the run itself, a byte a pass. `out/subleq_computer run subleq/program
   step 16: the model writes 0 at 20, next 15   | the machine writes 0 at 20, next 15
   step 17: the model writes 0 at 18, next 65535   | the machine writes 0 at 18, next 65535
   the model ended with STOP
+  r = 21 (the machine: 21)
 every step the same as the machine's
 ```
 
-The left side is what the model wrote, read back; the right is the gate machine. A byte is a type and a
+The left side is what the model wrote, read back; the right is the gate machine. `subleq/programs/`
+holds five programs to try (a product, a quotient, a sum, a word, a countdown), and any program the
+playground's assembler reads runs as well. A byte is a type and a
 nibble (16 * type + nibble). The prompt states each word of memory that is not 0 -- its value's four
 nibbles, then its address's three -- and then pc 0. Each step the model writes the word it changes and
 where (11 bytes with the next pc), or the byte it prints (6), and at the end STOP, or END where the

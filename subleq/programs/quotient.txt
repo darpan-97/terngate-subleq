@@ -1,0 +1,9 @@
+prog r=e/b:
+    l0: one z
+    z e
+    z z
+    l1: b e l9
+    one z
+    z r
+    z z l1
+    l9: z z -1

@@ -1,0 +1,8 @@
+prog print a countdown:
+    l0: n out
+    one n
+    one k l9
+    z z l0
+    l9: z z -1
+    = n 53
+    = k 5

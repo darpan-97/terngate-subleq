@@ -157,7 +157,12 @@ every step the same as the machine's
 
 The left side is what the model wrote, read back; the right is the gate machine. `subleq/programs/`
 holds five programs to try (a product, a quotient, a sum, a word, a countdown), and any program the
-playground's assembler reads runs as well. A byte is a type and a
+playground's assembler reads runs as well -- including what the program model writes: `run` takes what
+`out/subleq_write live` or `out/subleq_compile` printed, so one model writes a program and the other
+runs it, neither of them ordinary code. Of 20 so written -- sums, products to 20 x 1,000, 200 / 7, three
+words, four expressions compiled into the model's steps -- 19 ran to their end, every step the same as
+the gate machine's; `r = a % b + 100 / (c + 1)` with c = 4 needs 148 steps, and filled the view after 85,
+all of them right (with c = 49 it fits, and ends right). A byte is a type and a
 nibble (16 * type + nibble). The prompt states each word of memory that is not 0 -- its value's four
 nibbles, then its address's three -- and then pc 0. Each step the model writes the word it changes and
 where (11 bytes with the next pc), or the byte it prints (6), and at the end STOP, or END where the

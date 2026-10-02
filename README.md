@@ -68,6 +68,8 @@ out/subleq_compile "r = (a + b) * c - 3"     # an expression compiled into steps
 out/subleq_compile measure 1000              # 1,000 drawn expressions compiled and judged
 out/subleq_machine                           # the gate model writes five gates; the computer is built from them
 out/subleq_computer run subleq/programs/product.txt 0 0 7 3   # the hand-built transformer runs a program
+out/subleq_write live "prog r=a*e:" > out/written.txt        # the program model writes one ...
+out/subleq_computer run out/written.txt 12 0 0 0 9           # ... and the hand-built one runs it
 out/subleq_computer check                    # its programs, every step held to the gate machine
 out/subleq_computer random 20                # 20 memories drawn at random, likewise
 out/subleq_computer_build out/computer.tlm2  # makes the hand-built transformer (models/subleq_computer.tlm2)

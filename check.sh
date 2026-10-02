@@ -12,6 +12,9 @@
 #   3c. the hand-built computer: out/subleq_computer_build makes models/subleq_computer.tlm2 byte for
 #      byte; out/subleq_computer runs its programs and 40 memories drawn at random, every step the same
 #      as the gate machine's; and the computer built with one unit's sign flipped ("mux") goes wrong;
+#   3d. the two together: programs the program model writes (a sum, a product, a quotient, a word, and
+#      an expression compiled into its steps), each run by the hand-built computer to its end, every
+#      step the same as the gate machine's; and on 3c's computer with one unit flipped, wrong;
 #   4. the images in images/ are what the source compiles to now, byte for byte, and the one that writes
 #      programs, run by nitropz's VM, writes the same program as the executable;
 #   5. the binary files -- nitropz/bin, images, models -- are the ones SHA256SUMS lists. After changing
@@ -68,6 +71,18 @@ elif out/subleq_computer$ext out/check_computer_mux.tlm2 random 3 > /dev/null 2>
 else
   pass "the computer: built byte for byte; its programs, $(tail -n 1 out/check_computer.txt | tr -d '\r'); $(tail -n 1 out/check_computer_random.txt | tr -d '\r'); built with one unit flipped, wrong"
 fi
+
+together=0
+for t in "live|prog r=c-d-e+b:|4 11 -300 1000 9" "live|prog r=a*e:|12 0 0 0 9" "live|prog r=a/d:|200 0 0 7" "live|prog print hello:|" "compile|r = (a + b) * c - 3|3 5 7"; do
+  how=${t%%|*}; rest=${t#*|}; task=${rest%%|*}; inputs=${rest#*|}
+  if [ "$how" = live ]; then out/subleq_write$ext live "$task" > out/check_together.txt 2>&1
+  else out/subleq_compile$ext "$task" > out/check_together.txt 2>&1; fi
+  out/subleq_computer$ext run out/check_together.txt $inputs 2>&1 | tr -d '\r' | grep -q "^every step the same as the machine's" && together=$((together + 1))
+done
+if [ $together -ne 5 ]; then fail "the two together: $together of 5 programs the program model wrote ran right on the hand-built computer"
+elif out/subleq_computer$ext out/check_computer_mux.tlm2 run out/check_together.txt 3 5 7 2>&1 | tr -d '\r' | grep -q "^every step the same as the machine's"; then
+  fail "the two together's control: the compiled program came out right on the computer built with one unit flipped"
+else pass "the two together: 5 of 5 programs the program model wrote, run by the hand-built computer to their end, every step the same as the gate machine's; on the computer with one unit flipped, wrong"; fi
 
 same=0
 for prog in write machine; do cmp -s "out/subleq_$prog.nitropzb" "images/subleq_$prog.nitropzb" && same=$((same + 1)); done

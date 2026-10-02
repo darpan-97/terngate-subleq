@@ -1,0 +1,100 @@
+module std
+
+# std -- the core of the standard library: byte reads, string length, and unsigned arithmetic over
+# the signed 32- and 64-bit registers. Importable via `import std`; shared helpers live here once
+# instead of being copied into every program.
+
+# byte read, zero-extended: load8 sign-extends a signed i8, so restore the 0..255 value.
+#
+# A MACRO, not a fn, and that is a performance decision. This is the most-called thing in any
+# byte-processing program, and as a function every use cost a real call: prologue, its own
+# materialisation of the heap base, a compare and a branch, to perform one byte load. Expanded
+# inline it is a load and an and.
+#
+# `& 255` replaces the `if v < 0: v + 256` fixup -- identical for every input, since the low 8 bits
+# of a sign-extended byte ARE the unsigned value -- and being branch-free is also what makes the
+# body a single expression, hence macro-expandable at all.
+macro u8(p): load8(p) & 255
+
+# length of a NUL-terminated byte string
+pub fn slen(s):
+    let i = 0
+    while u8(s + i) != 0:
+        i = i + 1
+    return i
+
+# little-endian 32-bit read from a byte buffer (two's-complement wrap recovers negatives)
+pub fn rd32(p):
+    return u8(p) + u8(p + 1) * 256 + u8(p + 2) * 65536 + u8(p + 3) * 16777216
+
+# --- unsigned 32-bit arithmetic over the signed i32 bank (no unsigned opcodes needed) ---
+# unsigned >= : map unsigned order to signed by flipping the sign bit, then compare signed. (1<<31 is
+# the i32 sign bit = INT_MIN; a literal 0x80000000 would lex as i64.) Returns 1/0.
+# u_ge / u_lt / u_le / u_gt are compiler builtins (two XORs and a signed compare): conditions only
+
+# unsigned 32-bit division (bit-by-bit long division; n/d treated as unsigned). d==0 -> 0 (avoids trap).
+pub fn udiv32(n, d):
+    if d == 0:
+        return 0
+    let q = 0
+    let r = 0
+    let i = 31
+    while i >= 0:
+        r = (r << 1) | ((n >> i) & 1)
+        if u_ge(r, d):
+            r = r - d
+            q = q | (1 << i)
+        i = i - 1
+    return q
+
+# unsigned 32-bit remainder (same long division, yields the remainder).
+pub fn umod32(n, d):
+    if d == 0:
+        return 0
+    let r = 0
+    let i = 31
+    while i >= 0:
+        r = (r << 1) | ((n >> i) & 1)
+        if u_ge(r, d):
+            r = r - d
+        i = i - 1
+    return r
+
+# unsigned 64-bit >= : flip the sign bit on both, then a signed compare orders them as unsigned.
+pub fn u_ge64(a: i64, b: i64):
+    let fa = a ^ (i64(1) << i64(63))
+    let fb = b ^ (i64(1) << i64(63))
+    if fa >= fb:
+        return 1
+    return 0
+
+# unsigned 64-bit division (bit-by-bit long division; n/d treated as unsigned). An i64 DIV is SIGNED, so
+# a high-bit dividend (e.g. size_t MAX_SIZET) divides as -1 -> 0; this gives the true unsigned quotient.
+# d==0 -> 0 (avoids trap). (n>>i)&1 extracts a bit: the arithmetic >> sign-fills but &1 keeps only the LSB.
+pub fn udiv64(n: i64, d: i64) -> i64:
+    if d == i64(0):
+        return i64(0)
+    let q = i64(0)
+    let r = i64(0)
+    let i = 63
+    while i >= 0:
+        r = (r << i64(1)) | ((n >> i64(i)) & i64(1))
+        if u_ge64(r, d) == 1:
+            r = r - d
+            q = q | (i64(1) << i64(i))
+        i = i - 1
+    return q
+
+# unsigned 64-bit remainder (same long division, yields the remainder). Correct for ANY divisor (unlike
+# the floored-modulo trick which is exact only for power-of-two divisors).
+pub fn umod64(n: i64, d: i64) -> i64:
+    if d == i64(0):
+        return i64(0)
+    let r = i64(0)
+    let i = 63
+    while i >= 0:
+        r = (r << i64(1)) | ((n >> i64(i)) & i64(1))
+        if u_ge64(r, d) == 1:
+            r = r - d
+        i = i - 1
+    return r

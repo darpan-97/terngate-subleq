@@ -1,0 +1,386 @@
+module std_io
+
+import std
+import std_fmt
+
+# Buffered + formatted I/O over the host builtins (read/write/open/close). IO tier. The
+# unbuffered print_* go straight to fd 1; the bufw_* writer batches into a buffer and flushes
+# on full / on demand (one write() per buffer-full instead of per byte); readline pulls a line
+# off an fd. Allocation is explicit (the print_* convenience fns alloc a small scratch buffer).
+
+# --- unbuffered convenience writers (fd 1 = stdout) ---
+
+# write the NUL-terminated string s to stdout; returns the byte count
+pub fn print_str(s):
+    let n = slen(s)
+    write(1, s, n)
+    return n
+
+# C puts(): write the string + a trailing newline; returns a nonneg count.
+pub fn puts(s):
+    let n = slen(s)
+    write(1, s, n)
+    write(1, "\n", 1)
+    return (n + 1)
+
+# write v as decimal ASCII to stdout; returns the byte count
+pub fn print_int(v):
+    let buf = alloc(16)
+    let n = itoa(buf, v)
+    write(1, buf, n)
+    return n
+
+# decimal v padded to `width` (zero=1 -> '0' fill, else space). For printf %Nd / %0Nd.
+# printf %[-+ 0][width]d: width-padded signed decimal. Matches the standard padded-decimal layout so the
+# LITERAL-printf unroll path puts the sign goes BEFORE zero-fill ("-0042" not
+# "00-42"); '-' left-justifies; '+'/' ' force a sign on non-negatives.
+pub fn print_int_w(v, width, zero, minus, plus, space, prec):
+    let buf = alloc(16)
+    let av = v
+    let sign = 0
+    if v < 0:
+        sign = 45
+        av = 0 - v
+    if v >= 0 and plus == 1:
+        sign = 43
+    if v >= 0 and plus == 0 and space == 1:
+        sign = 32
+    let n = itoa(buf, av)
+    # %.Nd precision = MINIMUM digit count: zero-pad the NUMBER to prec digits. When prec is given the
+    # '0' flag is ignored (C rule), so the field pads with spaces.
+    let zpad = 0
+    if prec >= 0:
+        zero = 0
+        if n < prec:
+            zpad = prec - n
+    let total = n + zpad
+    if sign != 0:
+        total = total + 1
+    let pad = width - total
+    if minus == 0 and zero == 0:
+        while pad > 0:
+            print_char(32)
+            pad = pad - 1
+    if sign != 0:
+        print_char(sign)
+    if minus == 0 and zero == 1:
+        while pad > 0:
+            print_char(48)
+            pad = pad - 1
+    while zpad > 0:
+        print_char(48)
+        zpad = zpad - 1
+    write(1, buf, n)
+    if minus == 1:
+        while pad > 0:
+            print_char(32)
+            pad = pad - 1
+    return total
+
+# v as unsigned 32-bit hex, padded to `width` (zero=1 -> '0' fill), upper=1 -> A-F. For printf %x/%X/%08x.
+# Nibbles via (v >> shift) & 15: the &15 masks the sign-extended high bits, so arithmetic >> is fine.
+pub fn print_hex(v, width, zero, upper):
+    let buf = alloc(16)
+    let cnt = 0
+    let started = 0
+    let shift = 28
+    while shift >= 0:
+        let nib = (v >> shift) & 15
+        if nib != 0:
+            started = 1
+        if started == 1:
+            store8(buf + cnt, nib)
+            cnt = cnt + 1
+        shift = shift - 4
+    if cnt == 0:
+        store8(buf, 0)
+        cnt = 1
+    let pad = width - cnt
+    while pad > 0:
+        if zero == 1:
+            print_char(48)
+        if zero == 0:
+            print_char(32)
+        pad = pad - 1
+    let k = 0
+    while k < cnt:
+        let nib = load8(buf + k)
+        let c = 48 + nib
+        if nib > 9:
+            c = 87 + nib
+            if upper == 1:
+                c = 55 + nib
+        print_char(c)
+        k = k + 1
+    return 0
+
+# 64-bit hex (printf %llx/%lx of an i64 arg). Mirrors print_hex but walks 16 nibbles from bit 60.
+# The &15 mask drops the sign bits an arithmetic >> drags in for a negative v (same as print_hex).
+pub fn print_hex64(v: i64, width, zero, upper):
+    let buf = alloc(20)
+    let cnt = 0
+    let started = 0
+    let shift = 60
+    while shift >= 0:
+        let nib = i32((v >> i64(shift)) & i64(15))
+        if nib != 0:
+            started = 1
+        if started == 1:
+            store8(buf + cnt, nib)
+            cnt = cnt + 1
+        shift = shift - 4
+    if cnt == 0:
+        store8(buf, 0)
+        cnt = 1
+    let pad = width - cnt
+    while pad > 0:
+        if zero == 1:
+            print_char(48)
+        if zero == 0:
+            print_char(32)
+        pad = pad - 1
+    let k = 0
+    while k < cnt:
+        let nib = load8(buf + k)
+        let c = 48 + nib
+        if nib > 9:
+            c = 87 + nib
+            if upper == 1:
+                c = 55 + nib
+        print_char(c)
+        k = k + 1
+    return 0
+
+# printf %o: octal. i32 path zero-extends to u64 so an unsigned high-bit value renders right.
+pub fn print_oct(v, width, zero):
+    return print_oct64(i64(v) & i64(4294967295), width, zero)
+
+pub fn print_oct64(v: i64, width, zero):
+    let buf = alloc(24)
+    let cnt = 0
+    let started = 0
+    let shift = 63
+    while shift >= 0:
+        let oct = i32((v >> i64(shift)) & i64(7))
+        if oct != 0:
+            started = 1
+        if started == 1:
+            store8(buf + cnt, oct)
+            cnt = cnt + 1
+        shift = shift - 3
+    if cnt == 0:
+        store8(buf, 0)
+        cnt = 1
+    let pad = width - cnt
+    while pad > 0:
+        if zero == 1:
+            print_char(48)
+        if zero == 0:
+            print_char(32)
+        pad = pad - 1
+    let k = 0
+    while k < cnt:
+        print_char(48 + load8(buf + k))
+        k = k + 1
+    return 0
+
+# printf %p: "(nil)" for null, else "0x" + lowercase hex (no padding).
+pub fn print_ptr(v):
+    if v == 0:
+        write(1, "(nil)", 5)
+        return 0
+    write(1, "0x", 2)
+    print_hex(v, 0, 0, 0)
+    return 0
+
+# printf %Ns / %-Ns: pad a string to `width` (minus=1 -> left-justify).
+pub fn print_str_w(s, width, minus):
+    let n = slen(s)
+    let pad = width - n
+    if minus == 0:
+        while pad > 0:
+            print_char(32)
+            pad = pad - 1
+    write(1, s, n)
+    if minus == 1:
+        while pad > 0:
+            print_char(32)
+            pad = pad - 1
+    return 0
+
+# print an unsigned 64-bit value (the %llu/%lu path). v holds the u64 bit pattern; a
+# non-negative i64 prints via signed str(), but a value >= 2^63 reads as negative in
+# signed i64, so decompose it into two 32-bit limbs (non-negative) and long-divide the
+# base-2^32 number by 10 to get decimal digits (least-significant first), then emit them.
+pub fn print_u64(v: i64):
+    if v >= i64(0):
+        print_str(str(v))
+        return 0
+    let lo = v & i64(4294967295)
+    let hi = (v >> i64(32)) & i64(4294967295)
+    let buf = alloc(24)
+    let n = 0
+    while n < 20:
+        let qh = hi / i64(10)
+        let r = hi - qh * i64(10)
+        let acc = r * i64(4294967296) + lo
+        let ql = acc / i64(10)
+        let r2 = acc - ql * i64(10)
+        store8(buf + n, i32(r2))
+        hi = qh
+        lo = ql
+        n = n + 1
+    let msd = 19
+    while msd > 0 and load8(buf + msd) == 0:
+        msd = msd - 1
+    while msd >= 0:
+        print_char(48 + load8(buf + msd))
+        msd = msd - 1
+    return 0
+
+# write the f64 v to stdout using C printf conversion `conv` (102 f, 101 e, 69 E,
+# 103 g, 71 G) at the given precision (negative = default 6). returns the byte count.
+pub fn print_f64(v: f64, conv, prec):
+    let buf = alloc(64)
+    let n = fmt_f64(buf, v, conv, prec)
+    write(1, buf, n)
+    return n
+
+# write the single byte c to stdout
+pub fn print_char(c):
+    let buf = alloc(1)
+    store8(buf, c)
+    write(1, buf, 1)
+    return 1
+
+# write a newline to stdout
+pub fn print_nl():
+    let buf = alloc(1)
+    store8(buf, 10)
+    write(1, buf, 1)
+    return 1
+
+# write the first min(n, slen(s)) bytes of the NUL-string s (C's `%.Ns`); returns the byte count
+pub fn print_strn(s, n):
+    let m = slen(s)
+    if n < m:
+        m = n
+    write(1, s, m)
+    return m
+
+# runtime printf to stdout: the format is walked at run time (used by transpiled C whose format is a
+# runtime pointer, e.g. c4's PRTF opcode). Handles %d/%i/%u (decimal), %s (NUL-string), %c (byte), %% ;
+# width/precision are skipped. Fixed 5 value args (a0..a4) -- the varargs ceiling of the callers.
+pub fn vprintf(fmt, a0, a1, a2, a3, a4):
+    let i = 0
+    let ai = 0
+    while load8(fmt + i) != 0:
+        let ch = load8(fmt + i)
+        if ch == 37:
+            i = i + 1
+            let cv = load8(fmt + i)
+            # skip C length modifiers (l/h/z/j/t/L) before the conversion char, e.g. %ld/%zu/%Lf --
+            # this shim packs every arg as i32-width, so the modifier only affects which conversion
+            # letter to match, not arg width. Without this, %ld read cv='l', matched no case, and the
+            # trailing 'd' fell through to the literal-char branch (printed a stray 'd'). Mirrors
+            # the runtime's vfprintf, which has the identical skip loop.
+            while cv == 108 or cv == 104 or cv == 122 or cv == 106 or cv == 116 or cv == 76:
+                i = i + 1
+                cv = load8(fmt + i)
+            let arg = 0
+            if ai == 0:
+                arg = a0
+            if ai == 1:
+                arg = a1
+            if ai == 2:
+                arg = a2
+            if ai == 3:
+                arg = a3
+            if ai == 4:
+                arg = a4
+            if cv == 115:
+                print_str(arg)
+                ai = ai + 1
+            if cv == 100:
+                print_int(arg)
+                ai = ai + 1
+            if cv == 105:
+                print_int(arg)
+                ai = ai + 1
+            if cv == 117:
+                print_int(arg)
+                ai = ai + 1
+            if cv == 99:
+                print_char(arg)
+                ai = ai + 1
+            if cv == 37:
+                print_char(37)
+        else:
+            print_char(ch)
+        i = i + 1
+    return 0
+
+# --- buffered writer: handle [fd @0][cap @4][len @8][buf @12] ---
+
+pub fn bufw_new(fd, cap):
+    let w = alloc(16)
+    let c = cap
+    if c < 1:
+        c = 1
+    store(w, fd)
+    store(w + 4, c)
+    store(w + 8, 0)
+    store(w + 12, alloc(c))
+    return w
+
+# flush the pending bytes to the fd (one write()); returns 0
+pub fn bufw_flush(w):
+    let len = load(w + 8)
+    if len > 0:
+        write(load(w), load(w + 12), len)
+        store(w + 8, 0)
+    return 0
+
+# append one byte, flushing first if the buffer is full
+pub fn bufw_putc(w, b):
+    let len = load(w + 8)
+    let cap = load(w + 4)
+    if len >= cap:
+        bufw_flush(w)
+        len = 0
+    store8(load(w + 12) + len, b)
+    store(w + 8, len + 1)
+    return 0
+
+# append a NUL-terminated string
+pub fn bufw_puts(w, s):
+    let i = 0
+    while u8(s + i) != 0:
+        bufw_putc(w, u8(s + i))
+        i = i + 1
+    return 0
+
+# --- reader ---
+
+# read one line from fd into buf (up to cap-1 bytes); the trailing '\n' is consumed but not
+# stored; NUL-terminates buf; returns the line length (0 at EOF with no bytes)
+pub fn readline(fd, buf, cap):
+    let i = 0
+    let go = 1
+    let tmp = alloc(1)
+    while go > 0:
+        if i >= cap - 1:
+            go = 0
+        else:
+            let r = read(fd, tmp, 1)
+            if r <= 0:
+                go = 0
+            else:
+                let c = u8(tmp)
+                if c == 10:
+                    go = 0
+                else:
+                    store8(buf + i, c)
+                    i = i + 1
+    store8(buf + i, 0)
+    return i

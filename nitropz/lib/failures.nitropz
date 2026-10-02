@@ -1,0 +1,23 @@
+module failures
+
+# failures -- what the machine says when a program fails, in the same words from the VM
+# (lib/vm.nitropz) and from the runtime native/ puts in every executable (native/runtime.nitropz): the
+# words are written here, once. A failure says "the program stopped at instruction N: " and one of
+# these, and the program ends with status 1.
+
+let T_PC = "it ran past the end of its code"
+let T_DIV = "it divided by zero"
+let T_OVER = "it divided the lowest number by -1, and the answer does not fit"
+let T_OP = "its code has an operation this machine does not know"
+let T_FRAME = "its calls went too deep, or it returned with no call to return to"
+let T_MEM = "it read or wrote outside its memory"
+let T_THROW = "it threw a value, and nothing caught it"
+let T_C_CALL = "it called a C function, and there is no C here"
+let T_TRY = "it had more than 256 try blocks open at once"
+let S_STOPPED = "the program stopped at instruction "
+let S_COLON = ": "
+let S_NL = "\n"
+let S_FULL = "the program's memory is full -- alloc("
+let S_BYTES = " bytes) failed\n"
+let S_ASKED = "it asked for host call "
+let S_NOT_HERE = ", which this machine does not have"

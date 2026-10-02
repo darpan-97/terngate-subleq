@@ -1,11 +1,13 @@
 #!/bin/sh
-# check.sh -- the machine and the model, each held to account (after sh build.sh):
+# check.sh -- the machine, the model and the images, each held to account (after sh build.sh):
 #   1. the machine (out/subleq_machine): the gate model writes the five gates, each judged on its rows;
 #      programs run on the gate machine and on a plain one and must agree step for step; and a copy with
 #      one row of the carry gate wrong must come out different (it exits 1 if any of that fails);
 #   2. the model (out/subleq_write): programs for tasks kept back from all its training, each run on the
 #      gate machine and judged on 6 sets of inputs, must all be right: 150 sums, 4 products, 60 words;
-#   3. tasks it cannot hold are refused, never cut to fit (a*b+c, a fifth part, a ninth letter).
+#   3. tasks it cannot hold are refused, never cut to fit (a*b+c, a fifth part, a ninth letter);
+#   4. the images in images/ are what the source compiles to now, byte for byte, and the one that writes
+#      programs, run by nitropz's VM, writes the same program as the executable.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE"
@@ -30,6 +32,15 @@ for t in "prog r=a*b+c:" "prog r=a+b+c+d+e:" "prog print terngates:"; do
   out/subleq_write$ext live "$t" 2>&1 | grep -q "not a task it can be asked" && refused=$((refused + 1))
 done
 if [ $refused -eq 3 ]; then pass "tasks it cannot hold, refused: 3 of 3"; else fail "tasks it cannot hold, refused: $refused of 3"; fi
+
+same=0
+for prog in write machine; do cmp -s "out/subleq_$prog.nitropzb" "images/subleq_$prog.nitropzb" && same=$((same + 1)); done
+out/subleq_write$ext live "prog r=d*b:" > out/check_live.txt 2>&1
+sh nitropz/nitropz run images/subleq_write.nitropzb live "prog r=d*b:" > out/check_live_vm.txt 2>&1
+if [ $same -eq 2 ] && grep -q "right on 6 sets of inputs" out/check_live.txt && cmp -s out/check_live.txt out/check_live_vm.txt; then
+  pass "the images: both what the source compiles to, byte for byte; run by the VM, the same program as the executable"
+elif [ $same -ne 2 ]; then fail "the images: $same of 2 are what the source compiles to (after sh build.sh: cp out/subleq_write.nitropzb out/subleq_machine.nitropzb images/)"
+else fail "the images: run by the VM, not the same program as the executable (out/check_live.txt, out/check_live_vm.txt)"; fi
 
 echo
 [ $fails -eq 0 ] && { echo "all passed"; exit 0; }

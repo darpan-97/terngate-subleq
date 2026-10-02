@@ -1,0 +1,58 @@
+#!/bin/sh
+# nitropz -- compile and run nitropz programs with this compiler, on the VM in bin/.
+#
+#   ./nitropz build prog.nitropz [out.nitropzb]  compile it (to prog.nitropzb unless named)
+#   ./nitropz run prog.nitropz [args...]         compile it, then run it
+#   ./nitropz run prog.nitropzb [args...]        run an image already compiled
+#   ./nitropz vm prog.nitropzb [args...]         the VM itself (the same as run, for an image)
+#   ./nitropz native prog.nitropz [out]          compile it to an executable of its own, no VM --
+#                                                for Windows x64 if out ends in .exe, else Linux x64
+set -u
+HERE=$(cd "$(dirname "$0")" && pwd)
+export NITROPZ_LIB="${NITROPZ_LIB:-$HERE/lib:$HERE/base}"       # (the library, and the base a compiler is
+                                                             #  built from: base/)
+os=$(uname -s | tr 'A-Z' 'a-z'); arch=$(uname -m)
+case "$arch" in x86_64|amd64) arch=x64 ;; aarch64|arm64) arch=arm64 ;; esac
+case "$os" in mingw*|msys*|cygwin*) VM="$HERE/bin/nitropzvm-windows-$arch.exe" ;; *) VM="$HERE/bin/nitropzvm-$os-$arch" ;; esac
+if [ ! -f "$VM" ]; then
+  echo "nitropz: bin/ has no VM for $os-$arch (it has Linux and Windows, x64)" >&2; exit 2
+fi
+
+build() {                          # build SRC OUT: 0 when the image is written; else the compiler
+  rm -f "$2"                       # has said why
+  "$VM" "$HERE/bin/nitropzc.nitropzb" "$1" "$2" || return 1
+  [ -s "$2" ]
+}
+
+case "${1:-}" in
+  build)
+    [ $# -ge 2 ] || { echo "usage: nitropz build prog.nitropz [out.nitropzb]" >&2; exit 2; }
+    build "$2" "${3:-${2%.nitropz}.nitropzb}" ;;
+  run)
+    [ $# -ge 2 ] || { echo "usage: nitropz run prog.nitropz [args...]" >&2; exit 2; }
+    prog=$2; shift 2
+    case "$prog" in
+      *.nitropz)
+        img="${TMPDIR:-/tmp}/nitropz-$$.nitropzb"
+        build "$prog" "$img" || exit 1
+        "$VM" "$img" "$@"; rc=$?
+        rm -f "$img"; exit $rc ;;
+      *) exec "$VM" "$prog" "$@" ;;
+    esac ;;
+  vm)
+    shift; exec "$VM" "$@" ;;
+  native)                          # the image made an executable (bin/native.nitropzb, with
+    [ $# -ge 2 ] || { echo "usage: nitropz native prog.nitropz [out]" >&2; exit 2; }     # its runtime):
+    out="${3:-${2%.nitropz}}"                                          # for this system unless named
+    case "$os" in mingw*|msys*|cygwin*) [ $# -ge 3 ] || out="$out.exe" ;; esac
+    img="${TMPDIR:-/tmp}/nitropz-$$.nitropzb"
+    build "$2" "$img" || exit 1
+    rm -f "$out"
+    "$VM" "$HERE/bin/native.nitropzb" "$img" "$HERE/bin/runtime.nitropzb" "$HERE/bin/runtime.map" "$out"; rc=$?
+    rm -f "$img"
+    [ -s "$out" ] || exit 1
+    chmod +x "$out"
+    exit $rc ;;
+  *)
+    sed -n '4,9p' "$0" | sed 's/^#   //' >&2; exit 2 ;;
+esac

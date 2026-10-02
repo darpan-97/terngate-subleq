@@ -1,0 +1,171 @@
+module opcodes
+
+# opcodes -- the VM's instruction set, one number an operation: the image format's. The compiler
+# writes these numbers (base/image.nitropz), the VM runs them (lib/vm.nitropz), native/ makes
+# machine code of them (native/operations.nitropz) -- all three read them here, and nothing else
+# writes one. lib/bytecode_ops.nitropz holds the same names and numbers as two lists, for a program
+# that decodes an image by name; test.sh checks the two say the same. A const is put in place where
+# it is used: a name costs nothing, and compiles to the bytes of its number.
+
+# control and moves
+const HALT = 0
+const LOAD_IMM_I32 = 1
+const MOV = 2
+const FMOV = 3
+const ADD_IMM_I32 = 4
+
+# arithmetic and comparisons: 32-bit and float
+const ADD_I32 = 16
+const SUB_I32 = 17
+const MUL_I32 = 18
+const DIV_I32 = 19
+const FADD_F64 = 20
+const FSUB_F64 = 21
+const FMUL_F64 = 22
+const FDIV_F64 = 23
+const I2F_F64 = 24
+const AND_I32 = 25
+const OR_I32 = 26
+const XOR_I32 = 27
+const SHL_I32 = 28
+const SHR_I32 = 29
+const MOD_I32 = 30
+const F2I_I32 = 31
+const CMP_LT_I32 = 32
+const CMP_EQ_I32 = 33
+const FCMP_LT_F64 = 34
+const FCMP_EQ_F64 = 35
+
+# jumps, try and throw
+const JMP = 48
+const JNZ = 49
+const JZ = 50
+const TRY = 51
+const ENDTRY = 52
+const THROW = 53
+const GETTHROWN = 54
+
+# calls
+const CALL = 64
+const RET = 65
+
+# memory
+const MEM_LOAD8 = 80
+const MEM_LOAD16 = 81
+const MEM_LOAD32 = 82
+const MEM_LOAD_F32 = 83
+const MEM_LOAD_F64 = 84
+const MEM_LOAD_I64 = 85
+const MEM_STORE_I64 = 86
+const MEM_STORE8 = 88
+const MEM_STORE16 = 89
+const MEM_STORE32 = 90
+const MEM_STORE_F32 = 91
+const MEM_STORE_F64 = 92
+const ALLOC = 93
+const HEAP_RESET = 94
+const FREE = 95
+
+# frame slots
+const LD_LOCAL = 96
+const ST_LOCAL = 97
+const LD_PARAM = 98
+const ST_PARAM = 99
+const LD_LOCAL_F64 = 100
+const ST_LOCAL_F64 = 101
+const LD_PARAM_F64 = 102
+const ST_PARAM_F64 = 103
+
+# dynamic values, and a call through a value
+const DYN_INT = 104
+const DYN_ADD = 105
+const DYN_PRINT = 106
+const CALL_INDIRECT = 107
+
+# globals
+const LD_GLOBAL = 108
+const ST_GLOBAL = 109
+
+# the host
+const HOST_WRITE = 112
+const HOST_READ = 113
+const HOST_OPEN = 114
+const HOST_CLOSE = 115
+const HOST_CALL = 116
+
+# C, and jumps kept (setjmp, longjmp)
+const CLOAD = 117
+const CCALL = 118
+const SETJMP = 119
+const LONGJMP = 120
+
+# a comparison and its jump, one instruction
+const CMP_EQ_I32_JZ = 121
+const CMP_LT_I32_JZ = 122
+
+# 64-bit
+const LOAD_IMM_I64 = 128
+const ADD_I64 = 129
+const SHL_I64 = 130
+const PRINT_I64 = 131
+const SUB_I64 = 132
+const MUL_I64 = 133
+const AND_I64 = 134
+const OR_I64 = 135
+const XOR_I64 = 136
+const SHR_I64 = 137
+const DIV_I64 = 138
+const MOD_I64 = 139
+const LD_LOCAL_I64 = 140
+const ST_LOCAL_I64 = 141
+const LD_PARAM_I64 = 142
+const ST_PARAM_I64 = 143
+const LOAD_IMM_I64_HI = 144
+const I2I64 = 145
+const I642I = 146
+const CMP_LT_I64 = 147
+const CMP_EQ_I64 = 148
+
+# memory blocks and strings
+const MEM_COPY = 149
+const MEM_FILL = 150
+const STR_CMP = 151
+
+# types of any width: a value kept to its bits (the immediate: how many, plus 256 when its sign is
+# spread above them), unsigned division that stops the program on 0 as any other division does, an
+# unsigned 32-bit comparison, conversions between 64-bit whole numbers and floats (a float cut toward
+# zero; past the range, the end it passed; not a number, 0), and an unsigned 64-bit number printed
+const EXTEND_I32 = 152
+const EXTEND_I64 = 153
+const UDIV_I32 = 154
+const UMOD_I32 = 155
+const UDIV_I64 = 156
+const UMOD_I64 = 157
+const CMP_LT_U32 = 158
+const I642F_F64 = 159
+const F2I_I64 = 160
+const PRINT_U64 = 161
+
+# floats in memory, r[c] of them at once: DOT_F64 makes f[a] the sum of the products of the floats
+# at r[a] and at r[b], added in eight lanes (lib/vm.nitropz says in which order); ADD_SCALED_F64 adds
+# f[a] times each float at r[b] to the one at r[a], one after another (field a names two registers,
+# r[a] and f[a]: four operands in three fields); EXP_F64 makes each float at r[a] e to the power of the
+# one at r[b] (lib/vm.nitropz's vm_exp says how)
+const DOT_F64 = 162
+const ADD_SCALED_F64 = 163
+const EXP_F64 = 164
+
+# printing and formatting
+const PRINT_I32 = 240
+const PRINT_F64 = 241
+const PRINT_STR = 242
+const FMT_I32 = 243
+const CONCAT_STR = 244
+
+# unsigned and narrow (DIV_U_I64 and MOD_U_I64 answer 0 for a division by 0: nitropz's udiv64, umod64)
+const SHR_U_I32 = 245
+const SHR_U_I64 = 246
+const CMP_LT_U64 = 247
+const DIV_U_I64 = 248
+const MOD_U_I64 = 249
+const F2F32 = 250

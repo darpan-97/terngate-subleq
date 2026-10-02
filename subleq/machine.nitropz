@@ -361,7 +361,7 @@ fn main():
         tell("run from this repository's folder: no models/35k_gates.tlm2\n")
         return 2
     if judge_start() == 0:
-        tell("no nitropz compiler, to run the gates the model writes: put nitropz beside this folder (../nitropz), or name it with NITROPZ=\n")
+        tell("no nitropz compiler to run the gates the model writes: run this from the repository's folder, which holds nitropz/bin/nitropzc.nitropzb (or name another nitropz with NITROPZ=)\n")
         return 2
     judge_form(1)
     tell("the processor's five gates, asked of the model by their truth tables:\n\n")

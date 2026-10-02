@@ -1,0 +1,108 @@
+module eval
+
+# eval -- code a program holds, run in the same process by this repository's own compiler and
+# machine: a program's text, or an expression's tree (lib/ast) printed back as text (lib/ast_print),
+# compiled by bin/nitropzc.nitropzb and run by lib/vm. The compiler is itself an image the machine
+# runs, so each compile starts afresh, and neither the compiler nor the program it makes touches the
+# program that asked: each has memory of its own, and no file but those it opens.
+#
+#   eval_text(text)      the program `text` compiled and run: the status it ended with -- 1, and
+#                        eval_failed() 1, when the compiler refused it or it failed
+#   eval_value(tree)     the value of an expression tree, a whole number: `exit(expression)`
+#                        compiled and run (eval_failed() says whether it was)
+#   eval_output()        what the last one printed, a text, and eval_output_length() how long
+#   eval_errors()        why the compiler refused the last one, or how it failed; "" when it ran
+#
+# The compiler is found beside the library: bin/nitropzc.nitropzb, next to the first folder
+# NITROPZ_LIB names (the nitropz launcher sets it), and read the first time -- or it is the image
+# eval_set_compiler names. A program's imports are found as the compiler finds them: in the folder
+# the process runs in, then in the folders NITROPZ_LIB names.
+
+import std
+import std_mem
+import os
+import fs
+import vm
+import ast
+import ast_print
+
+let EVAL_COMPILER = 0              # the compiler, loaded the first time
+let EVAL_DASHES = ["-", "-"]       # its arguments: the program from its input, the image to its
+                                   #   output
+let EVAL_WHY = ""                  # eval_errors()
+let EVAL_NOTHING = ""
+let EVAL_NO_COMPILER = "eval: no compiler: bin/nitropzc.nitropzb beside the first folder NITROPZ_LIB names\n"
+let EVAL_NO_IMAGE = "eval: the compiler wrote no image\n"
+let eval_ran = 0                   # did the last one get as far as running?
+
+pub fn eval_text(text):
+    eval_ran = 0
+    EVAL_WHY = EVAL_NO_COMPILER
+    if compiler_ready() == 0: return 1
+    if vm_run(EVAL_COMPILER, EVAL_DASHES, text) != 0:
+        EVAL_WHY = vm_output()                       # (the compiler says why on its output --
+        if vm_failed(): EVAL_WHY = vm_errors()       #   unless it failed itself)
+        return 1
+    let program = vm_load(vm_output(), vm_output_length())
+    EVAL_WHY = EVAL_NO_IMAGE
+    if program == 0: return 1
+    let status = vm_run(program, 0, 0)
+    vm_unload(program)
+    eval_ran = 1
+    EVAL_WHY = vm_errors()
+    return status
+
+pub fn eval_value(tree):
+    let text = alloc(65536)
+    mem_copy(text, "exit(", 5)
+    let n = ast_print(tree, text + 5)
+    store8(text + 5 + n, 41)                         # ")"
+    store8(text + 6 + n, 10)
+    store8(text + 7 + n, 0)
+    let value = eval_text(text)
+    dealloc(text, 65536)
+    return value
+
+pub fn eval_failed():              # was the last one refused, or stopped by the machine?
+    if eval_ran == 0: return 1
+    return vm_failed()
+
+pub fn eval_output():
+    if eval_ran == 0: return EVAL_NOTHING
+    return vm_output()
+
+pub fn eval_output_length():
+    if eval_ran == 0: return 0
+    return vm_output_length()
+
+pub fn eval_errors(): return EVAL_WHY
+
+# the compiler to use, an image at `path` -- another language's, say: 1 when it is one
+pub fn eval_set_compiler(path):
+    EVAL_COMPILER = 0
+    return load_compiler(path)
+
+fn compiler_ready():               # 1 when the compiler is loaded, or now is
+    if EVAL_COMPILER: return 1
+    let path = compiler_path()
+    if path == 0: return 0
+    return load_compiler(path)
+
+fn load_compiler(path):
+    let size = fs_size(path)
+    let image = fs_read_file(path)
+    if image == 0: return 0
+    EVAL_COMPILER = vm_load(image, size)
+    free(image)
+    if EVAL_COMPILER: return 1
+    return 0
+
+fn compiler_path():                # bin/nitropzc.nitropzb beside the first folder NITROPZ_LIB names, or 0
+    let folders = alloc(4096)
+    if os_env("NITROPZ_LIB", folders, 4096) <= 0: return 0
+    let end = 0
+    while load8(folders + end) != 0 and load8(folders + end) != 59:      # a ; ends it, and a : but
+        if load8(folders + end) == 58 and end != 1: break                #   a drive's, as in C:\
+        end += 1
+    store8(folders + end, 0)
+    return concat(folders, "/../bin/nitropzc.nitropzb")

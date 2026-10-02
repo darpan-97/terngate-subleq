@@ -1,0 +1,52 @@
+module os
+
+import host_calls
+
+# os -- the operating system, for nitropz programs: the VM's host calls by name, so a program says
+# os_run("git status") instead of raw hostcall(63, ...). Strings/buffers are heap offsets (alloc +
+# the string builtins). Running a command is off in this repository's VM: os_run and os_capture
+# answer -1.
+
+# run a shell command; return its exit code (-1 if exec is disabled)
+pub fn os_run(cmd):
+    return hostcall(ASK_RUN, cmd)
+
+# run a command and capture its stdout into out (max bytes, NUL-terminated); return bytes (-1 if disabled)
+pub fn os_capture(cmd, out, max):
+    return hostcall(ASK_CAPTURE, cmd, out, max)
+
+# read environment variable `name` into out (max); return length, or -1 if unset
+pub fn os_env(name, out, max):
+    return hostcall(ASK_ENVIRONMENT, name, out, max)
+
+# number of arguments after the program (nitropz run prog.nitropz A B C -> 3)
+pub fn os_argc():
+    return hostcall(ASK_ARGUMENT_COUNT)
+
+# read script arg i (0-based) into out (max); return length, or -1
+pub fn os_arg(i, out, max):
+    return hostcall(ASK_ARGUMENT, i, out, max)
+
+# read up to max bytes of stdin into out (NUL-terminated); return bytes (0 = EOF)
+pub fn os_input(out, max):
+    return hostcall(ASK_INPUT, out, max)
+
+# current time, unix seconds
+pub fn os_now():
+    return hostcall(ASK_SECONDS)
+
+# sleep for ms milliseconds
+pub fn os_sleep(ms):
+    return hostcall(ASK_SLEEP, ms)
+
+# A non-negative pseudo-random i32: PCG32's numbers (pcg-random.org), each shifted right once.
+#
+# ⚠️ THE SAME IN EVERY RUN, AND ON EVERY SYSTEM. The generator starts where its own example starts
+# it (42, 54), so the first two values are 1353580891 and 1034156548, every time, everywhere. That
+# is deliberate -- a program that runs the same every time can be checked by running it twice -- but
+# "pseudo-random" does not say it loudly enough, and it is exactly the wrong kind of surprise.
+#
+# NEVER USE IT FOR KEY MATERIAL: every "random" key made from it is the same publicly-known bytes.
+# Key generation needs the platform's secure random source.
+pub fn os_rand():
+    return hostcall(ASK_RANDOM)

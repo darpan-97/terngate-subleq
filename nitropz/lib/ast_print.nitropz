@@ -1,0 +1,705 @@
+module ast_print
+
+import ast
+
+# The PRINTER over the COMPLETE canonical vocabulary -- the inverse of reading source into
+# lib/ast. Emits real nitropz source: 4-space indentation, statements end in '\n', expressions
+# parenthesised per the language's precedence table:
+#   1 or | 2 and | 3 '|' | 4 '^' | 5 '&' | 6 cmp+in | 7 << >> | 8 + - | 9 * / %
+#   10 unary | 11 postfix/leaf
+# Style canonicalisations (the printer IS the formatter): `x = x OP e` prints as
+# `x OP= e`; an else-block of exactly one SIF prints as `elif`; hex/binary INT
+# spelling is preserved via the base slot. STR/FSTR/FLOAT bodies are verbatim.
+# DOMAIN library, pure builtins -- no std_ imports.
+
+pub fn ast_prec(n):
+    if ast_is_binop(n) == 0:
+        return 99                     # PAREN included: it prints its own parens
+    let op = node_a(n)
+    if op == 211:
+        return 1
+    if op == 210:
+        return 2
+    if op == 124:
+        return 3
+    if op == 94:
+        return 4
+    if op == 38:
+        return 5
+    if op == 223:
+        return 6
+    if op >= 200 and op <= 203:
+        return 6
+    if op == 60 or op == 62:
+        return 6
+    if op == 220 or op == 221 or op == 222:
+        return 7
+    if op == 42 or op == 47 or op == 37:
+        return 9
+    return 8
+
+fn emit_ch(buf, off, ch):
+    store8(buf + off, ch)
+    return off + 1
+
+fn emit_uint(buf, off, v):
+    if v >= 10:
+        let o1 = emit_uint(buf, off, v / 10)
+        return emit_ch(buf, o1, 48 + v - (v / 10) * 10)
+    return emit_ch(buf, off, 48 + v)
+
+fn emit_hexdig(buf, off, d):
+    if d < 10:
+        return emit_ch(buf, off, 48 + d)
+    return emit_ch(buf, off, 87 + d)          # a-f
+
+fn emit_uhex(buf, off, v):
+    if v >= 16:
+        let o1 = emit_uhex(buf, off, v / 16)
+        return emit_hexdig(buf, o1, v - (v / 16) * 16)
+    return emit_hexdig(buf, off, v)
+
+fn emit_ubin(buf, off, v):
+    if v >= 2:
+        let o1 = emit_ubin(buf, off, v / 2)
+        return emit_ch(buf, o1, 48 + v - (v / 2) * 2)
+    return emit_ch(buf, off, 48 + v)
+
+fn emit_name(buf, off, name):
+    let i = 0
+    let o = off
+    while load8(name + i) != 0:
+        o = emit_ch(buf, o, load8(name + i))
+        i = i + 1
+    return o
+
+fn emit_str2(buf, off, a, b):
+    let o = emit_ch(buf, off, a)
+    return emit_ch(buf, o, b)
+
+fn emit_op(buf, off, op):
+    if op == 200:
+        return emit_str2(buf, off, 61, 61)
+    if op == 201:
+        return emit_str2(buf, off, 33, 61)
+    if op == 202:
+        return emit_str2(buf, off, 60, 61)
+    if op == 203:
+        return emit_str2(buf, off, 62, 61)
+    if op == 220:
+        return emit_str2(buf, off, 60, 60)
+    if op == 221:
+        return emit_str2(buf, off, 62, 62)
+    if op == 222:
+        let o3 = emit_str2(buf, off, 62, 62)
+        return emit_ch(buf, o3, 62)
+    if op == 210:
+        let o = emit_ch(buf, off, 97)
+        o = emit_ch(buf, o, 110)
+        return emit_ch(buf, o, 100)
+    if op == 211:
+        return emit_str2(buf, off, 111, 114)
+    if op == 223:
+        return emit_str2(buf, off, 105, 110)   # in
+    return emit_ch(buf, off, op)
+
+fn emit_int_node(buf, off, node):
+    if node_c(node) != 0:                      # verbatim source text: byte-faithful
+        return emit_name(buf, off, node_c(node))
+    let v = node_a(node)
+    let base = node_b(node)
+    let o = off
+    if v < 0:
+        o = emit_ch(buf, o, 45)
+        v = 0 - v
+    if base == 16:
+        o = emit_str2(buf, o, 48, 120)     # 0x
+        return emit_uhex(buf, o, v)
+    if base == 2:
+        o = emit_str2(buf, o, 48, 98)      # 0b
+        return emit_ubin(buf, o, v)
+    return emit_uint(buf, o, v)
+
+# does this child need parens under parent precedence pp (position: 0 left, 1 right)?
+fn needs_parens(child, pp, right):
+    if ast_is_binop(child) == 0:
+        if node_kind(child) == 42:             # a nested assignment-expr always parenthesises
+            return 1
+        return 0
+    if right == 1:
+        if ast_prec(child) <= pp:
+            return 1
+        return 0
+    if ast_prec(child) < pp:
+        return 1
+    return 0
+
+fn pr_args(buf, off, args):
+    let o = off
+    let a = args
+    while a != 0:
+        o = pr2(buf, o, node_a(a))
+        if node_b(a) != 0:
+            o = emit_str2(buf, o, 44, 32)
+        a = node_b(a)
+    return o
+
+fn pr2(buf, off, node):
+    let k = node_kind(node)
+    if k == 50:                                 # explicit ( ... ) from the source
+        let o = emit_ch(buf, off, 40)
+        o = pr2(buf, o, node_a(node))
+        return emit_ch(buf, o, 41)
+    if k == 1:
+        return emit_int_node(buf, off, node)
+    if k == 3:
+        return emit_name(buf, off, node_a(node))
+    if k == 5:                                  # "raw"
+        let o = emit_ch(buf, off, 34)
+        o = emit_name(buf, o, node_a(node))
+        return emit_ch(buf, o, 34)
+    if k == 6:                                  # float: verbatim text
+        return emit_name(buf, off, node_a(node))
+    if k == 7:
+        if node_a(node) == 1:
+            let o = emit_str2(buf, off, 116, 114)   # true
+            return emit_str2(buf, o, 117, 101)
+        let o = emit_str2(buf, off, 102, 97)        # false
+        o = emit_str2(buf, o, 108, 115)
+        return emit_ch(buf, o, 101)
+    if k == 24:                                 # f"raw"
+        let o = emit_str2(buf, off, 102, 34)
+        o = emit_name(buf, o, node_a(node))
+        return emit_ch(buf, o, 34)
+    if k == 8:                                  # unary: not / - / ~
+        let op = node_a(node)
+        let o = off
+        if op == 1:
+            o = emit_str2(buf, o, 110, 111)
+            o = emit_str2(buf, o, 116, 32)
+        else:
+            o = emit_ch(buf, o, op)
+        let e = node_b(node)
+        if ast_is_binop(e) == 1 or node_kind(e) == 42:
+            o = emit_ch(buf, o, 40)
+            o = pr2(buf, o, e)
+            return emit_ch(buf, o, 41)
+        return pr2(buf, o, e)
+    if k == 4:
+        let o = emit_name(buf, off, node_a(node))
+        o = emit_ch(buf, o, 40)
+        o = pr_args(buf, o, node_b(node))
+        return emit_ch(buf, o, 41)
+    if k == 43:                                 # (callee)(args) -- callee is a node
+        let ce = node_a(node)
+        let o = off
+        if node_kind(ce) == 3 or node_kind(ce) == 9 or node_kind(ce) == 20 or node_kind(ce) == 4 or node_kind(ce) == 43 or node_kind(ce) == 50:
+            o = pr2(buf, o, ce)             # postfix chains need no parens
+        else:
+            o = emit_ch(buf, o, 40)
+            o = pr2(buf, o, ce)
+            o = emit_ch(buf, o, 41)
+        o = emit_ch(buf, o, 40)
+        o = pr_args(buf, o, node_b(node))
+        return emit_ch(buf, o, 41)
+    if k == 9:                                  # base[index]
+        let b = node_a(node)
+        let o = off
+        if ast_is_binop(b) == 1 or node_kind(b) == 8 or node_kind(b) == 42:
+            o = emit_ch(buf, o, 40)
+            o = pr2(buf, o, b)
+            o = emit_ch(buf, o, 41)
+        else:
+            o = pr2(buf, o, b)
+        o = emit_ch(buf, o, 91)
+        o = pr2(buf, o, node_b(node))
+        return emit_ch(buf, o, 93)
+    if k == 20:                                 # base.name
+        let b = node_a(node)
+        let o = off
+        if ast_is_binop(b) == 1 or node_kind(b) == 8 or node_kind(b) == 42:
+            o = emit_ch(buf, o, 40)
+            o = pr2(buf, o, b)
+            o = emit_ch(buf, o, 41)
+        else:
+            o = pr2(buf, o, b)
+        o = emit_ch(buf, o, 46)
+        return emit_name(buf, o, node_b(node))
+    if k == 21:                                 # [e, ...]
+        let o = emit_ch(buf, off, 91)
+        o = pr_args(buf, o, node_a(node))
+        return emit_ch(buf, o, 93)
+    if k == 22:                                 # {k: v, ...}
+        let o = emit_ch(buf, off, 123)
+        let p9 = node_a(node)
+        while p9 != 0:
+            let pr9 = node_a(p9)
+            o = pr2(buf, o, node_a(pr9))
+            o = emit_str2(buf, o, 58, 32)
+            o = pr2(buf, o, node_b(pr9))
+            if node_b(p9) != 0:
+                o = emit_str2(buf, o, 44, 32)
+            p9 = node_b(p9)
+        return emit_ch(buf, o, 125)
+    if k == 25:                                 # [expr for name in iter (if filt)]
+        let meta = node_c(node)
+        let o = emit_ch(buf, off, 91)
+        o = pr2(buf, o, node_a(node))
+        o = emit_ch(buf, o, 32)
+        o = emit_str2(buf, o, 102, 111)
+        o = emit_str2(buf, o, 114, 32)
+        o = emit_name(buf, o, node_a(meta))
+        o = emit_ch(buf, o, 32)
+        o = emit_str2(buf, o, 105, 110)
+        o = emit_ch(buf, o, 32)
+        o = pr2(buf, o, node_b(node))
+        if node_b(meta) != 0:
+            o = emit_ch(buf, o, 32)
+            o = emit_str2(buf, o, 105, 102)
+            o = emit_ch(buf, o, 32)
+            o = pr2(buf, o, node_b(meta))
+        return emit_ch(buf, o, 93)
+    if k == 42:                                 # name = value (expression form)
+        let o = emit_name(buf, off, node_a(node))
+        o = emit_str2(buf, o, 32, 61)
+        o = emit_ch(buf, o, 32)
+        return pr2(buf, o, node_b(node))
+    if k == 47:                                 # lo..hi (spacing as written)
+        let o = pr2(buf, off, node_a(node))
+        if node_c(node) == 1:
+            o = emit_ch(buf, o, 32)
+        o = emit_str2(buf, o, 46, 46)
+        if node_c(node) == 1:
+            o = emit_ch(buf, o, 32)
+        return pr2(buf, o, node_b(node))
+    # BINOP
+    let op = node_a(node)
+    let l = node_b(node)
+    let r = node_c(node)
+    let pp = ast_prec(node)
+    let o = off
+    if needs_parens(l, pp, 0) == 1:
+        o = emit_ch(buf, o, 40)
+        o = pr2(buf, o, l)
+        o = emit_ch(buf, o, 41)
+    else:
+        o = pr2(buf, o, l)
+    o = emit_ch(buf, o, 32)
+    o = emit_op(buf, o, op)
+    o = emit_ch(buf, o, 32)
+    if needs_parens(r, pp, 1) == 1:
+        o = emit_ch(buf, o, 40)
+        o = pr2(buf, o, r)
+        o = emit_ch(buf, o, 41)
+    else:
+        o = pr2(buf, o, r)
+    return o
+
+fn emit_indent(buf, off, depth):
+    let o = off
+    let i = 0
+    while i < depth * 4:
+        o = emit_ch(buf, o, 32)
+        i = i + 1
+    return o
+
+# emit an ASCII keyword given up to 8 char codes (0 = stop)
+fn emit_kw(buf, off, k1, k2, k3, k4, k5, k6, k7, k8):
+    let o = off
+    if k1 != 0:
+        o = emit_ch(buf, o, k1)
+    if k2 != 0:
+        o = emit_ch(buf, o, k2)
+    if k3 != 0:
+        o = emit_ch(buf, o, k3)
+    if k4 != 0:
+        o = emit_ch(buf, o, k4)
+    if k5 != 0:
+        o = emit_ch(buf, o, k5)
+    if k6 != 0:
+        o = emit_ch(buf, o, k6)
+    if k7 != 0:
+        o = emit_ch(buf, o, k7)
+    if k8 != 0:
+        o = emit_ch(buf, o, k8)
+    return o
+
+fn is_elif_chain(blk):
+    if blk == 0:
+        return 0
+    if node_kind(blk) == 54:                     # written as `else:` -- keep that shape
+        return 0
+    if node_kind(blk) != 18:
+        return 0
+    if node_b(blk) != 0:
+        return 0
+    if node_kind(node_a(blk)) == 12:
+        return 1
+    return 0
+
+fn name_eq2(p, q):
+    let i = 0
+    while 1 == 1:
+        if load8(p + i) != load8(q + i):
+            return 0
+        if load8(p + i) == 0:
+            return 1
+        i = i + 1
+    return 0
+
+fn pr_if(buf, off, node, depth, lead_elif):
+    let o = off
+    if lead_elif == 1:
+        o = emit_kw(buf, o, 101, 108, 105, 102, 32, 0, 0, 0)
+    else:
+        o = emit_kw(buf, o, 105, 102, 32, 0, 0, 0, 0, 0)
+    o = pr2(buf, o, node_a(node))
+    o = emit_ch(buf, o, 58)
+    o = pr_hdr_end(buf, o, node_b(node), depth + 1)
+    let els = node_c(node)
+    if els == 0:
+        return o
+    if node_kind(els) == 55:                     # comments between the block and elif/else
+        o = pr_block(buf, o, node_b(els), depth)
+        els = node_a(els)
+        if els == 0:
+            return o
+    if is_elif_chain(els) == 1:
+        # an elif with an origin of its own -- a `#@` line above it in the source -- gets that line
+        # back above the keyword; one that shares the if's origin prints nothing, as before
+        if origin_same(node_origin(node_a(els)), node_origin(node)) == 0:
+            o = pr_origin(buf, o, node_a(els), depth)
+        o = emit_indent(buf, o, depth)
+        return pr_if(buf, o, node_a(els), depth, 1)
+    o = emit_indent(buf, o, depth)
+    o = emit_kw(buf, o, 101, 108, 115, 101, 58, 0, 0, 0)
+    return pr_hdr_end(buf, o, els, depth + 1)
+
+fn pr_params(buf, off, params):
+    let o = off
+    let a = params
+    while a != 0:
+        let pnode = node_a(a)
+        o = emit_name(buf, o, node_a(pnode))
+        if node_kind(pnode) == 45:               # typed param: name: type
+            o = emit_str2(buf, o, 58, 32)
+            o = emit_name(buf, o, node_b(pnode))
+        if node_b(a) != 0:
+            o = emit_str2(buf, o, 44, 32)
+        a = node_b(a)
+    return o
+
+# `x = x OP e` -> `x OP= e` (the printer IS the modernizer for compound assigns)
+fn compound_op_of(node):
+    let v = node_b(node)
+    if node_kind(v) != 2:
+        return 0
+    let op = node_a(v)
+    if op == 43 or op == 45 or op == 42 or op == 47 or op == 37 or op == 38 or op == 124 or op == 94:
+        let l = node_b(v)
+        if node_kind(l) == 3:
+            if name_eq2(node_a(l), node_a(node)) == 1:
+                return op
+    return 0
+
+# ORIGIN DIRECTIVES (lib/ast): before a statement whose origin is not the one the last directive
+# named, print `#@ lang file:line:col` (`#@ :line:col` when the file is the same, `#@ -` when the
+# statement is nitropz again), at the statement's depth -- the same rule a translator writes by, so
+# what the reader took in comes out again and the polished file is a fixpoint.
+let AP_OV = alloc(4)                              # the directive origin in force in the output, or 0
+
+fn pr_origin(buf, off, node, depth):
+    let o = node_origin(node)
+    let cur = load(AP_OV)
+    if o == 0 or origin_lang(o) == 0:
+        if cur == 0:
+            return off
+        store(AP_OV, 0)
+        let e = emit_indent(buf, off, depth)
+        e = emit_ch(buf, e, 35)
+        e = emit_ch(buf, e, 64)
+        e = emit_ch(buf, e, 32)
+        e = emit_ch(buf, e, 45)
+        return emit_ch(buf, e, 10)
+    if cur != 0 and origin_same(o, cur) == 1:
+        return off
+    let e = emit_indent(buf, off, depth)
+    e = emit_ch(buf, e, 35)
+    e = emit_ch(buf, e, 64)
+    e = emit_ch(buf, e, 32)
+    # ⚠️ A TOP-LEVEL DIRECTIVE IS ALWAYS WRITTEN IN FULL. The short form means "the file the last
+    # directive named", so it depends on text that may not survive: a tool that deletes whole
+    # functions from a generated module can leave a short form behind that then resolves against
+    # a marker in a deleted function -- silently naming the wrong file. Inside a body the short
+    # form is safe: a body is only ever deleted together with its head.
+    let short = 0
+    if depth > 0 and cur != 0 and ast_name_eq(origin_lang(o), origin_lang(cur)) == 1:
+        if ast_name_eq(origin_file(o), origin_file(cur)) == 1:
+            short = 1
+    if short == 0:
+        e = emit_name(buf, e, origin_lang(o))
+        e = emit_ch(buf, e, 32)
+        e = emit_name(buf, e, origin_file(o))
+    e = emit_ch(buf, e, 58)
+    e = emit_uint(buf, e, origin_line(o))
+    e = emit_ch(buf, e, 58)
+    e = emit_uint(buf, e, origin_col(o))
+    store(AP_OV, o)
+    return emit_ch(buf, e, 10)
+
+fn pr_stmt(buf, off0, node, depth):
+    let off = pr_origin(buf, off0, node, depth)
+    let k = node_kind(node)
+    if k == 52:                                   # trailing comment: <stmt><gap># text
+        let e = pr_stmt(buf, off, node_a(node), depth)
+        let o = e - 1                             # overwrite the statement's newline
+        let g = 0
+        while g < node_c(node):
+            o = emit_ch(buf, o, 32)
+            g = g + 1
+        o = emit_name(buf, o, node_b(node))
+        return emit_ch(buf, o, 10)
+    let o = emit_indent(buf, off, depth)
+    if k == 10 or k == 46:
+        let flags = node_c(node)
+        let tname = 0
+        if k == 46:
+            let meta = node_c(node)
+            flags = node_a(meta)
+            tname = node_b(meta)
+        if flags == 1:
+            o = emit_kw(buf, o, 99, 111, 110, 115, 116, 32, 0, 0)   # const
+        elif flags == 2:
+            o = emit_kw(buf, o, 103, 108, 111, 98, 97, 108, 32, 0)  # global
+        elif flags == 4:
+            o = emit_kw(buf, o, 116, 114, 121, 32, 0, 0, 0, 0)      # try
+        else:
+            o = emit_kw(buf, o, 108, 101, 116, 32, 0, 0, 0, 0)      # let
+        o = emit_name(buf, o, node_a(node))
+        if tname != 0:
+            o = emit_str2(buf, o, 58, 32)
+            o = emit_name(buf, o, tname)
+        o = emit_kw(buf, o, 32, 61, 32, 0, 0, 0, 0, 0)
+        o = pr2(buf, o, node_b(node))
+        return emit_ch(buf, o, 10)
+    if k == 11:
+        let cop = node_c(node)                    # compound form ONLY when written that way
+        if cop != 0:
+            o = emit_name(buf, o, node_a(node))
+            o = emit_ch(buf, o, 32)
+            o = emit_ch(buf, o, cop)
+            o = emit_str2(buf, o, 61, 32)
+            o = pr2(buf, o, node_c(node_b(node)))
+            return emit_ch(buf, o, 10)
+        o = emit_name(buf, o, node_a(node))
+        o = emit_kw(buf, o, 32, 61, 32, 0, 0, 0, 0, 0)
+        o = pr2(buf, o, node_b(node))
+        return emit_ch(buf, o, 10)
+    if k == 12:
+        return pr_if(buf, o, node, depth, 0)
+    if k == 13:
+        o = emit_kw(buf, o, 119, 104, 105, 108, 101, 32, 0, 0)
+        o = pr2(buf, o, node_a(node))
+        o = emit_ch(buf, o, 58)
+        return pr_hdr_end(buf, o, node_b(node), depth + 1)
+    if k == 14:
+        o = emit_kw(buf, o, 114, 101, 116, 117, 114, 110, 0, 0)
+        if node_a(node) != 0:
+            o = emit_ch(buf, o, 32)
+            o = pr2(buf, o, node_a(node))
+        return emit_ch(buf, o, 10)
+    if k == 15:
+        return emit_kw(buf, o, 98, 114, 101, 97, 107, 10, 0, 0)
+    if k == 16:
+        o = emit_kw(buf, o, 99, 111, 110, 116, 105, 110, 117, 101)
+        return emit_ch(buf, o, 10)
+    if k == 19:
+        let head = node_a(node)
+        let receiver = 0
+        if node_kind(head) == 57:                    # a method: its receiver before its name
+            receiver = node_a(head)
+            head = node_b(head)
+        let flags = node_c(head)
+        if flags == 1 or flags == 9:
+            o = emit_kw(buf, o, 112, 117, 98, 32, 0, 0, 0, 0)        # pub
+        if flags == 2:
+            o = emit_kw(buf, o, 101, 120, 116, 101, 114, 110, 32, 0) # extern
+        if flags == 4 or flags == 20:
+            o = emit_kw(buf, o, 109, 97, 99, 114, 111, 32, 0, 0)     # macro
+        if flags == 8 or flags == 9:
+            o = emit_kw(buf, o, 100, 101, 102, 32, 0, 0, 0, 0)       # def
+        elif flags != 4:
+            o = emit_kw(buf, o, 102, 110, 32, 0, 0, 0, 0, 0)         # fn (after macro: a code macro)
+        if receiver != 0:
+            o = emit_ch(buf, o, 40)
+            o = pr_params(buf, o, ast_seq(receiver, 0))
+            o = emit_str2(buf, o, 41, 32)                          # ") "
+        o = emit_name(buf, o, node_a(head))
+        o = emit_ch(buf, o, 40)
+        o = pr_params(buf, o, node_b(node))
+        o = emit_ch(buf, o, 41)
+        if node_b(head) != 0:
+            o = emit_kw(buf, o, 32, 45, 62, 32, 0, 0, 0, 0)          # " -> "
+            o = emit_name(buf, o, node_b(head))
+        if node_c(node) == 0:                                            # extern decl: no body
+            return emit_ch(buf, o, 10)
+        o = emit_ch(buf, o, 58)
+        return pr_hdr_end(buf, o, node_c(node), depth + 1)
+    if k == 26:
+        o = pr2(buf, o, node_a(node))
+        o = emit_ch(buf, o, 91)
+        o = pr2(buf, o, node_b(node))
+        o = emit_ch(buf, o, 93)
+        o = emit_kw(buf, o, 32, 61, 32, 0, 0, 0, 0, 0)
+        o = pr2(buf, o, node_c(node))
+        return emit_ch(buf, o, 10)
+    if k == 27:
+        o = pr2(buf, o, node_a(node))
+        o = emit_ch(buf, o, 46)
+        o = emit_name(buf, o, node_b(node))
+        o = emit_kw(buf, o, 32, 61, 32, 0, 0, 0, 0, 0)
+        o = pr2(buf, o, node_c(node))
+        return emit_ch(buf, o, 10)
+    if k == 28:
+        o = emit_kw(buf, o, 102, 111, 114, 32, 0, 0, 0, 0)           # for
+        o = emit_name(buf, o, node_a(node))
+        o = emit_kw(buf, o, 32, 105, 110, 32, 0, 0, 0, 0)            # " in "
+        o = pr2(buf, o, node_b(node))
+        o = emit_ch(buf, o, 58)
+        return pr_hdr_end(buf, o, node_c(node), depth + 1)
+    if k == 29:
+        o = emit_kw(buf, o, 109, 111, 100, 117, 108, 101, 32, 0)     # module
+        o = emit_name(buf, o, node_a(node))
+        return emit_ch(buf, o, 10)
+    if k == 30:
+        o = emit_kw(buf, o, 105, 109, 112, 111, 114, 116, 32, 0)     # import
+        o = emit_name(buf, o, node_a(node))
+        return emit_ch(buf, o, 10)
+    if k == 33:
+        o = emit_name(buf, o, node_a(node))
+        return emit_str2(buf, o, 58, 10)
+    if k == 34:
+        o = emit_kw(buf, o, 103, 111, 116, 111, 32, 0, 0, 0)         # goto
+        o = emit_name(buf, o, node_a(node))
+        return emit_ch(buf, o, 10)
+    if k == 35:
+        o = emit_kw(buf, o, 116, 114, 121, 58, 0, 0, 0, 0)          # try:
+        return pr_hdr_end(buf, o, node_a(node), depth + 1)
+    if k == 36:
+        o = emit_kw(buf, o, 116, 104, 114, 111, 119, 32, 0, 0)       # throw
+        o = pr2(buf, o, node_a(node))
+        return emit_ch(buf, o, 10)
+    if k == 37:
+        o = emit_kw(buf, o, 101, 110, 117, 109, 32, 0, 0, 0)         # enum
+        o = emit_name(buf, o, node_a(node))
+        o = emit_str2(buf, o, 58, 10)
+        let v9 = node_b(node)
+        while v9 != 0:
+            let vd = node_a(v9)
+            o = emit_indent(buf, o, depth + 1)
+            o = emit_name(buf, o, node_a(vd))
+            if node_b(vd) != 0:
+                o = emit_ch(buf, o, 40)
+                o = pr_params(buf, o, node_b(vd))
+                o = emit_ch(buf, o, 41)
+            o = emit_ch(buf, o, 10)
+            v9 = node_b(v9)
+        return o
+    if k == 39:
+        o = emit_kw(buf, o, 109, 97, 116, 99, 104, 32, 0, 0)         # match
+        o = pr2(buf, o, node_a(node))
+        o = emit_str2(buf, o, 58, 10)
+        let c9 = node_b(node)
+        while c9 != 0:
+            let cs = node_a(c9)
+            o = emit_indent(buf, o, depth + 1)
+            o = emit_kw(buf, o, 99, 97, 115, 101, 32, 0, 0, 0)       # case
+            o = emit_name(buf, o, node_a(cs))
+            if node_b(cs) != 0:
+                o = emit_ch(buf, o, 40)
+                o = pr_params(buf, o, node_b(cs))
+                o = emit_ch(buf, o, 41)
+            o = emit_ch(buf, o, 58)
+            o = pr_hdr_end(buf, o, node_c(cs), depth + 2)
+            c9 = node_b(c9)
+        return o
+    if k == 41:
+        o = emit_kw(buf, o, 115, 116, 114, 117, 99, 116, 32, 0)      # struct
+        o = emit_name(buf, o, node_a(node))
+        o = emit_str2(buf, o, 58, 10)
+        let f9 = node_b(node)
+        while f9 != 0:
+            let fd = node_a(f9)
+            o = emit_indent(buf, o, depth + 1)
+            o = emit_name(buf, o, node_a(fd))
+            if node_kind(fd) == 45:
+                o = emit_str2(buf, o, 58, 32)
+                o = emit_name(buf, o, node_b(fd))
+            o = emit_ch(buf, o, 10)
+            f9 = node_b(f9)
+        return o
+    if k == 48:                                                       # comment line (at its
+        let extra = node_b(node) - depth * 4                          #  own column, if deeper
+        while extra > 0:                                              #  than its block's)
+            o = emit_ch(buf, o, 32)
+            extra = extra - 1
+        o = emit_name(buf, o, node_a(node))
+        return emit_ch(buf, o, 10)
+    if k == 56:                                                       # NAME(args): <block>
+        o = pr2(buf, o, node_a(node))
+        o = emit_ch(buf, o, 58)
+        return pr_hdr_end(buf, o, node_b(node), depth + 1)
+    if k == 49:                                                       # blank line (width kept)
+        o = emit_indent(buf, off, 0)
+        let g = 0
+        while g < node_a(node):
+            o = emit_ch(buf, o, 32)
+            g = g + 1
+        return emit_ch(buf, o, 10)
+    # k == 17 expression statement
+    o = pr2(buf, o, node_a(node))
+    return emit_ch(buf, o, 10)
+
+# after a header's ':' -- an INLINE suite stays on the line; otherwise newline + block
+fn pr_hdr_end(buf, off, blk, depth):
+    if node_kind(blk) == 54:
+        return pr_hdr_end(buf, off, node_a(blk), depth)
+    if node_kind(blk) == 53:                     # header carries a trailing comment
+        let o = off
+        let g = 0
+        while g < node_c(blk):
+            o = emit_ch(buf, o, 32)
+            g = g + 1
+        o = emit_name(buf, o, node_b(blk))
+        return pr_hdr_end(buf, o, node_a(blk), depth)
+    if node_kind(blk) == 51:
+        let o = emit_ch(buf, off, 32)
+        return pr_stmt(buf, o, node_a(node_a(blk)), 0)
+    let o = emit_ch(buf, off, 10)
+    return pr_block(buf, o, blk, depth)
+
+fn pr_block(buf, off, blk, depth):
+    let o = off
+    let s = blk
+    if node_kind(blk) == 54:
+        s = node_a(blk)
+    while s != 0:
+        o = pr_stmt(buf, o, node_a(s), depth)
+        s = node_b(s)
+    return o
+
+pub fn ast_print_stmt(node, buf):
+    let n = 0
+    store(AP_OV, 0)
+    if node_kind(node) == 18:
+        n = pr_block(buf, 0, node, 0)
+    else:
+        n = pr_stmt(buf, 0, node, 0)
+    store8(buf + n, 0)
+    return n
+
+# expression-only entry (the INT/BINOP subset lib/homoiconic prints)
+pub fn ast_print(node, buf):
+    let n = pr2(buf, 0, node)
+    store8(buf + n, 0)
+    return n

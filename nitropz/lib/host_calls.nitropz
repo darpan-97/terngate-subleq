@@ -1,0 +1,38 @@
+module host_calls
+
+# host_calls -- what a program may ask of the system: the number a HOST_CALL instruction carries,
+# hostcall(ASK_ENVIRONMENT, ...). The library asks by these names (lib/os.nitropz, lib/fs.nitropz); the
+# VM (lib/vm.nitropz, host) and the runtime native/ puts in every executable (native/runtime.nitropz)
+# answer by them -- each number written here, once. tests/host_calls asks by the numbers
+# themselves, so a name that moved would be found there. A const costs nothing: it compiles to the
+# bytes of its number.
+
+const ASK_LIST_FOLDER = 40           # fs_list: a folder's names
+const ASK_FILE_SIZE = 41             # fs_size: a file's bytes (a folder's: 0)
+const ASK_EXISTS = 42                # fs_exists
+const ASK_MAKE_FOLDER = 43           # fs_mkdir
+const ASK_IS_FOLDER = 44             # fs_isdir
+const ASK_MILLISECONDS = 49          # milliseconds since the program started
+const ASK_ARGUMENT_COUNT = 51        # os_argc: the program's arguments, how many
+const ASK_ARGUMENT = 52              # os_arg: one of them
+const ASK_CAPTURE = 53               # os_capture: a command's output -- not here: -1
+const ASK_INPUT = 54                 # os_input: the program's input
+const ASK_SECONDS = 55               # os_now: seconds since 1970
+const ASK_SLEEP = 56                 # os_sleep: milliseconds
+const ASK_RANDOM = 57                # os_rand
+const ASK_ENVIRONMENT = 58           # os_env: a variable of the environment
+const ASK_SEEK = 59                  # fs_seek: an open file's place
+const ASK_TELL = 60                  # fs_tell
+const ASK_FORMAT_FLOAT = 61          # a float's text, to a precision
+const ASK_EVAL = 62                  # code made at run time -- not here, the program stops: lib/eval
+                                     #   runs it in the program itself
+const ASK_RUN = 63                   # os_run: a command -- not here: -1
+const ASK_C_CALL = 65                # a 64-bit C call -- not here: -1
+const ASK_IS_TERMINAL = 73           # does a file go to a terminal
+const ASK_REMOVE_FILE = 95           # fs_unlink -- not here: -1
+const ASK_REMOVE_FOLDER = 96         # fs_rmdir -- not here: -1
+const ASK_CHANGE_FOLDER = 97         # fs_chdir -- not here: -1
+const ASK_CURRENT_FOLDER = 98        # fs_getcwd -- not here: -1
+const ASK_RENAME = 99                # fs_rename -- not here: -1
+const ASK_RUN_IMAGE = 110            # an image the program holds, run inside it (lib/vm, the VM;
+                                     #   natively not here: -1)

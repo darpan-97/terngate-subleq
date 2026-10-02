@@ -1,3 +1,6 @@
 * text=auto eol=lf
+*.cmd text eol=crlf
 *.tlm2 binary
 *.ckpt binary
+*.nitropzb binary
+nitropz/bin/nitropzvm-* binary

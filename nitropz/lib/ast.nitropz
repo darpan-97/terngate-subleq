@@ -1,0 +1,615 @@
+module ast
+
+# AST node construction + access. A node is a fixed 20-byte record on the bump allocator:
+# [kind @0][a @4][b @8][c @12][origin @16] (children/operands are node pointers, name pointers,
+# or small ints; origin is the provenance record below). DOMAIN library (compiler-internal),
+# separate from the std_* stdlib. Pure builtins (alloc/load/store/load8/store8) -- no imports.
+#
+# --- THE CANONICAL CODE-AS-DATA VOCABULARY (complete coverage) ---
+# EXPRESSIONS
+#   1  INT     a=value; b=base (0 decimal, 16 hex, 2 binary); c=VERBATIM source text
+#               or 0. Text wins when printing: the reader's i32 accumulator cannot
+#               hold 4294967295 (the real lexer uses strtoll), so a big literal is
+#               reproduced from its text, never re-formatted from a wrapped value.
+#   2  BINOP   a=op; b=left; c=right
+#      op codes: ASCII 43 + | 45 - | 42 * | 47 / | 37 %% | 38 & | 124 pipe | 94 ^ | 60 < | 62 >
+#      200 == | 201 != | 202 <= | 203 >= | 210 and | 211 or | 220 << | 221 >> | 222 >>> | 223 in
+#   3  VAR     a=name
+#   4  CALL    a=name; b=args SEQ (callee is a bare name -- the common form)
+#   5  STR     a=raw source bytes BETWEEN the quotes, verbatim (escapes unprocessed)
+#   6  FLOAT   a=verbatim source text of the literal ("1.5e3")
+#   7  BOOL    a=0/1
+#   8  UNARY   a=op (45 '-', 126 '~', 1 = not); b=operand
+#   9  INDEX   a=base; b=index
+#  20  FIELD   a=base; b=name
+#  21  LIST    a=elements SEQ (or 0)
+#  22  DICT    a=pairs SEQ of PAIR (or 0)
+#  23  PAIR    a=key; b=value
+#  24  FSTR    a=raw body between the quotes, verbatim (holes unparsed)
+#  25  COMP    a=expr; b=iter; c=COMPMETA
+#  42  EASSIGN a=name; b=value (assignment-as-expression)
+#  43  CALLX   a=callee NODE; b=args SEQ (postfix call on a non-name expression)
+#  44  COMPMETA a=loop var name; b=filter expr (or 0)
+#  47  RANGE   a=lo; b=hi; c=1 when written spaced (`lo .. hi`)
+# STATEMENTS
+#  10  SLET    a=name; b=value; c=flags (0 plain, 1 const, 2 global, 4 try)
+#  46  SLETT   a=name; b=value; c=LETMETA  (type-annotated let)
+#  32  LETMETA a=flags; b=type name
+#  11  SASSIGN a=name; b=value; c=compound op byte or 0 -- `x += e` is recorded as
+#               c=43 with b = the expanded BINOP, so the printer reproduces the form
+#               the author wrote. Rewriting one form into the other is the MODERNIZER's
+#               job, never the faithful printer's.
+#  12  SIF     a=cond; b=then block; c=else block or 0 (else of exactly one SIF = elif)
+#  13  SWHILE  a=cond; b=body
+#  14  SRETURN a=value or 0
+#  15  SBREAK | 16 SCONTINUE
+#  17  SEXPR   a=expr
+#  18  SEQ     a=stmt; b=next or 0        (blocks, Lisp-cons style)
+#  19  SFN     a=FNHEAD; b=params SEQ of VAR/TYPEDPARAM; c=body block
+#  31  FNHEAD  a=name; b=return type name or 0; c=flags (1 pub, 2 extern, 4 macro, 8 `def`, 16 a
+#              function -- `macro fn`, a code macro, is 20)
+#  45  TYPEDPARAM a=name; b=type name
+#  57  MHEAD   a=the receiver (VAR or TYPEDPARAM); b=FNHEAD -- a method's head, its receiver
+#              written before its name: `fn (p: Point) sum()`
+#  26  SISTORE a=base; b=index; c=value    (base[index] = value)
+#  27  SFSTORE a=base; b=name; c=value     (base.name = value)
+#  28  SFOR    a=name; b=iter (RANGE or any expr); c=body
+#  29  SMODULE a=name | 30 SIMPORT a=name
+#  33  SLABEL  a=name | 34 SGOTO a=name
+#  35  STRY    a=body | 36 STHROW a=expr
+#  37  SENUM   a=name; b=variants SEQ of VARIANTDEF
+#  38  VARIANTDEF a=name; b=fields SEQ of VAR (or 0)
+#  39  SMATCH  a=scrutinee; b=cases SEQ of SCASE
+#  40  SCASE   a=variant name; b=binds SEQ of VAR (or 0); c=body
+#  41  SSTRUCT a=name; b=fields SEQ of VAR/TYPEDPARAM
+#  48  SCOMMENT a=raw text incl the '#' (a standalone comment line; trailing comments
+#               are hoisted above their line by the reader's pre-pass -- canonical placement)
+#  49  SBLANK   a=width (one blank line; runs collapse to one; a whitespace-only
+#               line keeps its width so byte-identity survives)
+#  51  INLINE   a=block -- the body was written as an INLINE suite (`fn f(): return 1`).
+#               Transparent to ast_eq (layout, not semantics); printed inline again.
+#  52  TRAILC   a=stmt; b=comment text; c=gap spaces -- a trailing comment on a
+#               non-block statement, kept in place with its original alignment.
+#  53  HDRC     a=body block; b=comment text; c=gap -- a trailing comment on a BLOCK
+#               HEADER (`if c:  # why`), carried by the body so it prints on the header.
+#  54  ELSEBLK  a=block -- this else-arm was written as `else:` (with a nested if),
+#               not as `elif`. Layout only; keeps the author's chosen shape.
+#  55  ELSEPRE  a=else-arm; b=comment/blank SEQ that sits BETWEEN the then-block and
+#               the `elif`/`else` keyword (a comment explaining the branch). Layout only.
+#  56  SBLOCKCALL a=call expr; b=block -- a block-argument macro call (`repeat(n):` +
+#               an indented suite), the user-defined control-flow form.
+#  50  PAREN    a=inner -- an EXPLICIT parenthesis group from the source. Kept so
+#               printing is byte-faithful (a human's clarity parens survive it);
+#               TRANSPARENT to ast_eq, since grouping carries no semantics.
+
+# ── ORIGIN: where each node came from ────────────────────────────────────────────────────────
+# Every node's fifth slot names where it came from: 0 (UNSTAMPED -- never a state a tool may
+# leave a tree in), or an origin record
+#     [lang @0][file @4][line @8][col @12][off @16]
+# lang/file are name bytes; lang 0 means nitropz itself (the file being read), where line/col stay
+# 0 and off is the statement's byte offset in that text. A non-zero lang is the language the
+# person wrote: a translator from that language writes `#@ c file:line:col` before each statement
+# it lowers, and the reader turns that into a record shared by every node of the statements it
+# covers.
+# mknode stamps the CURRENT origin: the reader sets it per statement; a rewriting pass sets it
+# to the origin of the statement it rewrites, so a folded, structured or renamed node keeps the
+# origin of the statement the source named. Equality, hashing and interning never look at it:
+# origin is position, not meaning. ast_count_unstamped counts the nodes left without one.
+let AST_ORIGIN_CUR = alloc(4)
+let AST_UNSTAMPED = alloc(4)
+let AST_NODES = alloc(4)
+let AST_UNSTAMPED_KIND = alloc(4)
+
+pub fn mknode(kind, a, b, c):
+    let n = alloc(20)
+    store(n, kind)
+    store(n + 4, a)
+    store(n + 8, b)
+    store(n + 12, c)
+    store(n + 16, load(AST_ORIGIN_CUR))
+    return n
+
+pub fn node_origin(n):
+    return load(n + 16)
+
+pub fn node_set_origin(n, o):
+    store(n + 16, o)
+    return 0
+
+pub fn ast_origin_new(lang, file, line, col, off):
+    let o = alloc(20)
+    store(o, lang)
+    store(o + 4, file)
+    store(o + 8, line)
+    store(o + 12, col)
+    store(o + 16, off)
+    return o
+
+pub fn origin_lang(o):
+    return load(o)
+
+pub fn origin_file(o):
+    return load(o + 4)
+
+pub fn origin_line(o):
+    return load(o + 8)
+
+pub fn origin_col(o):
+    return load(o + 12)
+
+pub fn origin_off(o):
+    return load(o + 16)
+
+# Give a nitropz origin the file and line its byte offset stands for. Only what spliced the program
+# the printers read (one buffer, from many files) knows that map, and it calls this once per origin
+# record -- the records are shared per statement, so the tree is resolved in one walk.
+pub fn origin_set_place(o, file, line):
+    store(o + 4, file)
+    store(o + 8, line)
+    return 0
+
+pub fn ast_origin():
+    return load(AST_ORIGIN_CUR)
+
+pub fn ast_origin_set(o):
+    store(AST_ORIGIN_CUR, o)
+    return 0
+
+# two origins name the same place: by value, so a directive read twice compares equal
+pub fn origin_same(p, q):
+    if p == q:
+        return 1
+    if p == 0 or q == 0:
+        return 0
+    if origin_line(p) != origin_line(q):
+        return 0
+    if origin_col(p) != origin_col(q) or origin_off(p) != origin_off(q):
+        return 0
+    if ast_name_eq(origin_lang(p), origin_lang(q)) == 0:
+        return 0
+    return ast_name_eq(origin_file(p), origin_file(q))
+
+# ── the audit: how many nodes of a tree carry no origin ──────────────────────────────────────
+# A generic walk over the slot-class table (the same one equality uses, so a node kind that
+# equality can see, the audit can see). SEQ chains walk iteratively, one cell per statement.
+fn ast_audit_walk(n):
+    let p = n
+    while p != 0:
+        store(AST_NODES, load(AST_NODES) + 1)
+        if node_origin(p) == 0:
+            if load(AST_UNSTAMPED) == 0:
+                store(AST_UNSTAMPED_KIND, node_kind(p))
+            store(AST_UNSTAMPED, load(AST_UNSTAMPED) + 1)
+        let k = node_kind(p)
+        if k == 18:
+            ast_audit_walk(node_a(p))
+            p = node_b(p)
+        else:
+            let sc = ast_slotclass(k)
+            if sc / 16 == 2:
+                ast_audit_walk(node_a(p))
+            if (sc / 4) - (sc / 16) * 4 == 2:
+                ast_audit_walk(node_b(p))
+            if sc - (sc / 4) * 4 == 2:
+                ast_audit_walk(node_c(p))
+            p = 0
+    return 0
+
+pub fn ast_count_unstamped(prog):
+    store(AST_UNSTAMPED, 0)
+    store(AST_NODES, 0)
+    store(AST_UNSTAMPED_KIND, -1)
+    ast_audit_walk(prog)
+    return load(AST_UNSTAMPED)
+
+pub fn ast_count_nodes():
+    return load(AST_NODES)
+
+pub fn ast_unstamped_kind():
+    return load(AST_UNSTAMPED_KIND)
+
+pub fn node_kind(n):
+    return load(n)
+
+pub fn node_a(n):
+    return load(n + 4)
+
+pub fn node_b(n):
+    return load(n + 8)
+
+pub fn node_c(n):
+    return load(n + 12)
+
+pub fn node_set_a(n, v):
+    store(n + 4, v)
+    return 0
+
+pub fn node_set_b(n, v):
+    store(n + 8, v)
+    return 0
+
+pub fn node_set_c(n, v):
+    store(n + 12, v)
+    return 0
+
+# --- constructors -----------------------------------------------------------------
+pub fn ast_int(v):
+    return mknode(1, v, 0, 0)
+
+pub fn ast_int_base(v, base):
+    return mknode(1, v, base, 0)
+
+pub fn ast_int_text(v, base, text):
+    return mknode(1, v, base, text)
+
+pub fn ast_binop(op, l, r):
+    return mknode(2, op, l, r)
+
+pub fn ast_var(name):
+    return mknode(3, name, 0, 0)
+
+pub fn ast_call(name, args):
+    return mknode(4, name, args, 0)
+
+pub fn ast_str(raw):
+    return mknode(5, raw, 0, 0)
+
+pub fn ast_float(raw):
+    return mknode(6, raw, 0, 0)
+
+pub fn ast_bool(v):
+    return mknode(7, v, 0, 0)
+
+pub fn ast_unary(op, e):
+    return mknode(8, op, e, 0)
+
+pub fn ast_index(base, idx):
+    return mknode(9, base, idx, 0)
+
+pub fn ast_field(base, name):
+    return mknode(20, base, name, 0)
+
+pub fn ast_list(elems):
+    return mknode(21, elems, 0, 0)
+
+pub fn ast_dict(pairs):
+    return mknode(22, pairs, 0, 0)
+
+pub fn ast_pair(k, v):
+    return mknode(23, k, v, 0)
+
+pub fn ast_fstr(raw):
+    return mknode(24, raw, 0, 0)
+
+pub fn ast_comp(e, iter, name, filt):
+    return mknode(25, e, iter, mknode(44, name, filt, 0))
+
+pub fn ast_eassign(name, v):
+    return mknode(42, name, v, 0)
+
+pub fn ast_callx(callee, args):
+    return mknode(43, callee, args, 0)
+
+pub fn ast_range(lo, hi):
+    return mknode(47, lo, hi, 0)
+
+pub fn ast_range_sp(lo, hi, spaced):
+    return mknode(47, lo, hi, spaced)
+
+pub fn ast_slet(name, value):
+    return mknode(10, name, value, 0)
+
+pub fn ast_sconst(name, value):
+    return mknode(10, name, value, 1)
+
+pub fn ast_sglobal(name, value):
+    return mknode(10, name, value, 2)
+
+pub fn ast_stry_let(name, value):
+    return mknode(10, name, value, 4)
+
+pub fn ast_slett(name, value, flags, tname):
+    return mknode(46, name, value, mknode(32, flags, tname, 0))
+
+pub fn ast_sassign(name, value):
+    return mknode(11, name, value, 0)
+
+pub fn ast_sassign_op(name, value, op):
+    return mknode(11, name, value, op)
+
+pub fn ast_sif(cond, then_blk, else_blk):
+    return mknode(12, cond, then_blk, else_blk)
+
+pub fn ast_swhile(cond, body):
+    return mknode(13, cond, body, 0)
+
+pub fn ast_sreturn(value):
+    return mknode(14, value, 0, 0)
+
+pub fn ast_sbreak():
+    return mknode(15, 0, 0, 0)
+
+pub fn ast_scontinue():
+    return mknode(16, 0, 0, 0)
+
+pub fn ast_sexpr(e):
+    return mknode(17, e, 0, 0)
+
+pub fn ast_seq(stmt, next):
+    return mknode(18, stmt, next, 0)
+
+pub fn ast_fnhead(name, rtype, flags):
+    return mknode(31, name, rtype, flags)
+
+pub fn ast_sfn(name, params, body):
+    return mknode(19, mknode(31, name, 0, 0), params, body)
+
+pub fn ast_sfn_full(head, params, body):
+    return mknode(19, head, params, body)
+
+pub fn ast_typedparam(name, tname):
+    return mknode(45, name, tname, 0)
+
+pub fn ast_methodhead(receiver, head):
+    return mknode(57, receiver, head, 0)
+
+pub fn ast_sistore(base, idx, value):
+    return mknode(26, base, idx, value)
+
+pub fn ast_sfstore(base, name, value):
+    return mknode(27, base, name, value)
+
+pub fn ast_sfor(name, iter, body):
+    return mknode(28, name, iter, body)
+
+pub fn ast_smodule(name):
+    return mknode(29, name, 0, 0)
+
+pub fn ast_simport(name):
+    return mknode(30, name, 0, 0)
+
+pub fn ast_slabel(name):
+    return mknode(33, name, 0, 0)
+
+pub fn ast_sgoto(name):
+    return mknode(34, name, 0, 0)
+
+pub fn ast_stry(body):
+    return mknode(35, body, 0, 0)
+
+pub fn ast_sthrow(e):
+    return mknode(36, e, 0, 0)
+
+pub fn ast_senum(name, variants):
+    return mknode(37, name, variants, 0)
+
+pub fn ast_variantdef(name, fields):
+    return mknode(38, name, fields, 0)
+
+pub fn ast_smatch(scrut, cases):
+    return mknode(39, scrut, cases, 0)
+
+pub fn ast_scase(vname, binds, body):
+    return mknode(40, vname, binds, body)
+
+pub fn ast_sstruct(name, fields):
+    return mknode(41, name, fields, 0)
+
+pub fn ast_paren(inner):
+    return mknode(50, inner, 0, 0)
+
+pub fn ast_inline(blk):
+    return mknode(51, blk, 0, 0)
+
+pub fn ast_trailc(stmt, text, gap):
+    return mknode(52, stmt, text, gap)
+
+pub fn ast_hdrc(blk, text, gap):
+    return mknode(53, blk, text, gap)
+
+pub fn ast_elseblk(blk):
+    return mknode(54, blk, 0, 0)
+
+pub fn ast_elsepre(arm, pre):
+    return mknode(55, arm, pre, 0)
+
+pub fn ast_sblockcall(call, blk):
+    return mknode(56, call, blk, 0)
+
+pub fn ast_scomment(text):
+    return mknode(48, text, 0, 0)
+
+pub fn ast_scomment_at(text, column):  # a comment line written deeper than its block: its column
+    return mknode(48, text, column, 0)
+
+pub fn ast_sblank():
+    return mknode(49, 0, 0, 0)
+
+pub fn ast_sblank_w(width):
+    return mknode(49, width, 0, 0)
+
+# --- predicates kept from the expression era --------------------------------------
+# is n a statement -- or a block of them, a thing a program's lines are -- and not a value?
+pub fn ast_is_statement(n):
+    let k = node_kind(n)
+    if (k >= 10 and k <= 19) or (k >= 26 and k <= 30) or (k >= 33 and k <= 41):
+        return 1
+    if k == 46 or k == 48 or k == 49 or (k >= 52 and k <= 56):
+        return 1
+    return 0
+
+pub fn ast_is_int(n):
+    if node_kind(n) == 1:
+        return 1
+    return 0
+
+pub fn ast_is_binop(n):
+    if node_kind(n) == 2:
+        return 1
+    return 0
+
+# --- structural equality ----------------------------------------------------------
+# ONE slot-class table drives generic equality: for kind k, each of a/b/c is
+# I (int), N (name bytes), S (string bytes -- same compare as N), or P (node ptr,
+# 0 allowed). Encoded as three digits base-4: 0=unused/int, 1=name, 2=node.
+#   digit value: slotclass(k) = a*16 + b*4 + c
+# ⚠️ PUBLIC because a hash over trees must hash each slot the SAME way ast_eq compares it.
+# Two copies of this table would drift, and the drift would be invisible: hashing would
+# silently disagree with equality.
+pub fn ast_slotclass(k):
+    if k == 1:
+        return 0                            # INT: a,b ints
+    if k == 2:
+        return 8 + 2                        # BINOP: a int, b node, c node -> 0*16+2*4+2
+    if k == 3:
+        return 16                           # VAR: a name -> 1*16
+    if k == 4:
+        return 16 + 8                       # CALL: a name, b node
+    if k == 5 or k == 6 or k == 24:
+        return 16                           # STR/FLOAT/FSTR: a raw bytes (compare as name)
+    if k == 7:
+        return 0                            # BOOL: a int
+    if k == 8:
+        return 8                            # UNARY: a int, b node
+    if k == 9 or k == 23:
+        return 32 + 8                       # INDEX/PAIR: a node, b node
+    if k == 47:
+        return 32 + 8                       # RANGE: a node, b node (c = layout only)
+    if k == 20:
+        return 32 + 4                       # FIELD: a node, b name
+    if k == 21 or k == 22 or k == 35:
+        return 32                           # LIST/DICT/STRY: a node
+    if k == 25:
+        return 32 + 8 + 2                   # COMP: a node, b node, c node
+    if k == 42:
+        return 16 + 8                       # EASSIGN: a name, b node
+    if k == 43:
+        return 32 + 8                       # CALLX: a node, b node
+    if k == 44:
+        return 16 + 8                       # COMPMETA: a name, b node
+    if k == 10:
+        return 16 + 8                       # SLET: a name, b node, c int flags
+    if k == 46:
+        return 16 + 8 + 2                   # SLETT: a name, b node, c node (LETMETA)
+    if k == 32:
+        return 4                            # LETMETA: a int, b name
+    if k == 11:
+        return 16 + 8                       # SASSIGN
+    if k == 12 or k == 13:
+        return 32 + 8 + 2                   # SIF (c may be 0) / SWHILE (c 0)
+    if k == 14 or k == 17 or k == 36:
+        return 32                           # SRETURN/SEXPR/STHROW: a node-or-0
+    if k == 15 or k == 16:
+        return 0
+    if k == 18:
+        return 32 + 8                       # SEQ: a node, b node-or-0
+    if k == 19:
+        return 32 + 8 + 2                   # SFN: head node, params node, body node
+    if k == 31:
+        return 16 + 4                       # FNHEAD: a name, b name-or-0, c int flags
+    if k == 45:
+        return 16 + 4                       # TYPEDPARAM: a name, b name
+    if k == 57:
+        return 32 + 8                       # MHEAD: a node (the receiver), b node (the head)
+    if k == 26:
+        return 32 + 8 + 2                   # SISTORE
+    if k == 27:
+        return 32 + 4 + 2                   # SFSTORE: a node, b name, c node
+    if k == 28:
+        return 16 + 8 + 2                   # SFOR: a name, b node, c node
+    if k == 29 or k == 30 or k == 33 or k == 34:
+        return 16                           # SMODULE/SIMPORT/SLABEL/SGOTO: a name
+    if k == 37:
+        return 16 + 8                       # SENUM: a name, b node
+    if k == 38:
+        return 16 + 8                       # VARIANTDEF: a name, b fields SEQ-or-0
+    if k == 39:
+        return 32 + 8                       # SMATCH: a node, b node
+    if k == 40:
+        return 16 + 8 + 2                   # SCASE: a name, b node-or-0, c node
+    if k == 41:
+        return 16 + 8                       # SSTRUCT: a name, b node
+    if k == 50 or k == 51 or k == 54:
+        return 32                           # PAREN / INLINE / ELSEBLK: a node
+    if k == 55 or k == 56:
+        return 32 + 8                       # ELSEPRE / SBLOCKCALL: a node, b node
+    if k == 52 or k == 53:
+        return 32 + 4                       # TRAILC / HDRC: a node, b text, c int gap
+    if k == 48:
+        return 16                           # SCOMMENT: a text bytes
+    if k == 49:
+        return 0                            # SBLANK
+    return 0
+
+# ⚠️ PUBLIC for the same reason as ast_slotclass: a hash over trees must hash names with the
+# SAME byte semantics this compares them by, or equal trees would hash differently.
+pub fn ast_name_eq(p, q):
+    if p == 0 and q == 0:
+        return 1
+    if p == 0 or q == 0:
+        return 0
+    let i = 0
+    while 1 == 1:
+        let cp = load8(p + i)   # load8 = the pure BUILTIN byte read (u8 here, with no
+        let cq = load8(q + i)   # import std, would be the truncating CAST -- silent bug)
+        if cp != cq:
+            return 0
+        if cp == 0:
+            return 1
+        i = i + 1
+    return 0
+
+fn slot_eq(cls, x, y):
+    if cls == 0:
+        if x == y:
+            return 1
+        return 0
+    if cls == 1:
+        return ast_name_eq(x, y)
+    return ast_eq(x, y)
+
+# PAREN / INLINE / TRAILC are LAYOUT, not semantics: peel them for comparison so a
+# synthesized tree equals the same code read from a formatted file.
+pub fn ast_unparen(n):
+    let r = n
+    while r != 0 and (node_kind(r) == 50 or node_kind(r) == 51 or node_kind(r) == 52 or node_kind(r) == 53 or node_kind(r) == 54 or node_kind(r) == 55):
+        r = node_a(r)
+    return r
+
+pub fn ast_eq(x0, y0):
+    let x = ast_unparen(x0)          # grouping is not semantics: PAREN is transparent
+    let y = ast_unparen(y0)
+    if x == 0 and y == 0:
+        return 1
+    if x == 0 or y == 0:
+        return 0
+    let k = node_kind(x)
+    if k != node_kind(y):
+        return 0
+    if k == 1:                       # INT: identical TEXT implies identical value; when
+        if node_c(x) != 0 and node_c(y) != 0:   # either side is synthesized (no text),
+            return ast_name_eq(node_c(x), node_c(y))   # fall back to value+base
+        if node_a(x) == node_a(y) and node_b(x) == node_b(y):
+            return 1
+        return 0
+    if k == 18:                      # SEQ: walk the cons-chain ITERATIVELY -- recursing
+        let p = x                    # per statement costs a frame per line of source
+        let q = y
+        while p != 0 and q != 0:
+            if ast_eq(node_a(p), node_a(q)) == 0:
+                return 0
+            p = node_b(p)
+            q = node_b(q)
+            if p != 0 and node_kind(p) != 18:
+                return ast_eq(p, q)
+            if q != 0 and node_kind(q) != 18:
+                return ast_eq(p, q)
+        if p == 0 and q == 0:
+            return 1
+        return 0
+    let sc = ast_slotclass(k)
+    if slot_eq(sc / 16, node_a(x), node_a(y)) == 0:
+        return 0
+    if slot_eq((sc / 4) - (sc / 16) * 4, node_b(x), node_b(y)) == 0:
+        return 0
+    return slot_eq(sc - (sc / 4) * 4, node_c(x), node_c(y))

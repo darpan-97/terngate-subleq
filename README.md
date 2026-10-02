@@ -32,15 +32,25 @@ the next line.
 
 ## Getting started
 
-It needs nitropz beside this folder, at `../nitropz` (or named by `NITROPZ=`). The trained models are
-in `models/`, so nothing needs training first:
+It runs on Windows and Linux, on x64. nitropz, the compiler and VM it is written for, comes with it, in
+`nitropz/`. Run everything from this folder. To try it with nothing to build, run the programs' images
+on nitropz's VM (on Windows, in Git Bash):
 
 ```
-sh build.sh                                  # the programs, made machine code, in out/
-out/subleq_write live "prog print hello:"    # one program, written as you watch, then run
+sh nitropz/nitropz run images/subleq_write.nitropzb live "prog print hello:"
+sh nitropz/nitropz run images/subleq_machine.nitropzb
+```
+
+In cmd or PowerShell: `nitropz\nitropz.cmd run images\subleq_write.nitropzb live "prog print hello:"`.
+
+For the test, the checks and teaching, build the programs as machine code, which takes a few seconds:
+
+```
+sh build.sh                                  # every program, made machine code, in out/
+out/subleq_write live "prog r=c-d-e+b:"      # one program, written as you watch, then run
 out/subleq_write                             # the model on tasks kept back from all its training
 out/subleq_machine                           # the gate model writes five gates; the computer is built from them
-bash check.sh                                # the computer and the model, each checked
+bash check.sh                                # the computer, the model and the images, each checked
 ```
 
 On Windows the programs end in `.exe`. The model can be asked for a sum of 1 to 4 of the letters a to
@@ -71,6 +81,8 @@ step through it on the gate machine, every memory cell and every step explained.
 | `core/` | the language model: forward and back (`model`), training (`train`, `optimize`), packing (`pack`), the engine that runs a packed model (`engine`), choosing each byte (`sample`) |
 | `lib/` | float maths, and the gate judge: a gate written as nitropz, run on every row of its truth table |
 | `models/` | `35k_subleq.tlm2`, the model; `35k_gates.tlm2`, the gate model; `35k_gates.ckpt`, the gate model's checkpoint, which teaching starts from |
+| `images/` | `subleq_write` and `subleq_machine` compiled to images, to run with nothing to build |
+| `nitropz/` | nitropz, built: the VM, the compiler, and the part of its library these programs use ([what is in it](nitropz/README.md)) |
 | `docs/` | the page above, and the playground |
 
 `build.sh`, `check.sh` and `par.sh` (training on several cores) are at the top.

@@ -1,4 +1,7 @@
 out/
 data/
 *.nitropzb
+!images/*.nitropzb
+!nitropz/bin/*.nitropzb
 *.exe
+!nitropz/bin/*.exe

@@ -1,0 +1,100 @@
+module fs
+
+import std_mem
+import host_calls
+
+# fs -- the filesystem, for nitropz programs: the VM's host calls for paths and folders, by name.
+# (Reading/writing file CONTENTS uses the core open/read/write/close builtins directly; most
+# of these helpers cover the path/directory operations those builtins don't -- fs_seek/fs_tell
+# are the exception: real file positioning has no dedicated core builtin syntax the way
+# open/read/write/close do, so it rides the same hostcall(id,...) escape hatch as everything
+# else here.)
+
+# list a directory: writes '\n'-separated entry names into out (max bytes), in byte order, as many
+# as fit; returns the count (-1 on error)
+pub fn fs_list(path, out, max):
+    return hostcall(ASK_LIST_FOLDER, path, out, max)
+
+# size of a file in bytes (a directory's: 0), or -1 if it doesn't exist / can't be stat'd
+pub fn fs_size(path):
+    return hostcall(ASK_FILE_SIZE, path)
+
+# 1 if the path exists, else 0
+pub fn fs_exists(path):
+    return hostcall(ASK_EXISTS, path)
+
+# create a directory; 0 on success, -1 on failure (incl. already-exists)
+pub fn fs_mkdir(path):
+    return hostcall(ASK_MAKE_FOLDER, path)
+
+# 1 if the path is a directory, else 0
+pub fn fs_isdir(path):
+    return hostcall(ASK_IS_FOLDER, path)
+
+# remove a FILE (a directory is refused): 0 ok / -1. This one and the next four are not in this
+# repository's VM or its native executables: there they answer -1.
+pub fn fs_unlink(path):
+    return hostcall(ASK_REMOVE_FILE, path)
+
+# remove an EMPTY directory: 0 ok / -1
+pub fn fs_rmdir(path):
+    return hostcall(ASK_REMOVE_FOLDER, path)
+
+# change the working directory -- every relative path after this resolves from there: 0 ok / -1
+pub fn fs_chdir(path):
+    return hostcall(ASK_CHANGE_FOLDER, path)
+
+# the working directory, written NUL-terminated into out (max bytes): its length, or -1
+pub fn fs_getcwd(out, max):
+    return hostcall(ASK_CURRENT_FOLDER, out, max)
+
+# rename (move) a file or directory: 0 ok / -1
+pub fn fs_rename(from, to):
+    return hostcall(ASK_RENAME, from, to)
+
+# seek an OPEN file (fd from the core open() builtin) to a new position. whence: 0=SEEK_SET,
+# 1=SEEK_CUR, 2=SEEK_END. Returns the new absolute offset on success (matching real lseek's
+# convention), or -1 (bad fd / seek failed).
+pub fn fs_seek(fd, off, whence):
+    return hostcall(ASK_SEEK, fd, off, whence)
+
+# current position of an OPEN file (fd from the core open() builtin), or -1 (bad fd).
+pub fn fs_tell(fd):
+    return hostcall(ASK_TELL, fd)
+
+# read an ENTIRE file into a freshly-malloc'd, NUL-terminated buffer. Returns the buffer address (a cstr
+# -- use slen() for text length, or fs_size(path) for the exact byte count on binary), or 0 on error.
+# Caller frees it with free() (std_mem). Loops until EOF, so short reads are handled.
+pub fn fs_read_file(path):
+    let sz = fs_size(path)
+    if sz < 0:
+        return 0
+    let buf = malloc(i64(sz + 1))
+    if buf == 0:
+        return 0
+    let fd = open(path, 0)
+    if fd < 0:
+        free(buf)
+        return 0
+    let got = 0
+    let done = 0
+    while done == 0:
+        let r = read(fd, buf + got, sz - got)
+        if r <= 0:
+            done = 1
+        else:
+            got = got + r
+            if got >= sz:
+                done = 1
+    close(fd)
+    store8(buf + got, 0)
+    return buf
+
+# write `len` bytes from `data` to `path` (creating/truncating it). Returns bytes written, or -1.
+pub fn fs_write_file(path, data, len):
+    let fd = open(path, 1)
+    if fd < 0:
+        return -1
+    let w = write(fd, data, len)
+    close(fd)
+    return w

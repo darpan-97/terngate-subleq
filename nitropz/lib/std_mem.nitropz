@@ -1,0 +1,279 @@
+module std_mem
+
+import std
+
+# Byte-granular memory operations on the flat heap (everything is an offset). CORE tier:
+# every fn works on caller-supplied buffers and never allocates. The memcpy/memeq/memset
+# on the flat heap, plus 16-bit reads/writes that extend
+# std's u8/rd32. Reassignment uses the `let x = x + 1` idiom (same as std.slen).
+
+# copy n bytes forward from s to d (UB on overlap when d>s -- use memmove); returns d
+pub fn memcpy(d, s, n):
+    # ONE MEM_COPY op instead of ~7 interpreted ops per byte. mem_copy is overlap-safe
+    # (memmove semantics), so memcpy and memmove share it.
+    return mem_copy(d, s, n)
+
+# copy n bytes with overlap handled: forward when d<=s, backward when d>s; returns d
+pub fn memmove(d, s, n):
+    # mem_copy is already overlap-safe (memmove semantics in every engine)
+    return mem_copy(d, s, n)
+
+# set n bytes at p to the low byte of v; returns p
+pub fn memset(p, v, n):
+    return mem_fill(p, v, n)
+
+# 1 if the n bytes at a equal the n bytes at b, else 0. Spelled mem_eq, not memeq: every
+# other operation in this file separates its words, and `eq` is the word Rust spells for
+# the same question.
+pub fn mem_eq(a, b, n):
+    let i = 0
+    while i < n:
+        if u8(a + i) != u8(b + i):
+            return 0
+        i = i + 1
+    return 1
+
+# C memcmp: <0 / 0 / >0 by the first differing byte (unsigned) in the first n bytes
+pub fn memcmp(a, b, n):
+    let i = 0
+    while i < n:
+        let ca = u8(a + i)
+        let cb = u8(b + i)
+        if ca != cb:
+            return ca - cb
+        i = i + 1
+    return 0
+
+# little-endian unsigned 16-bit read
+pub fn u16(p):
+    return u8(p) + u8(p + 1) * 256
+
+# write n little-endian bytes of v. Correct for NEGATIVE v (the 2's-complement bit pattern):
+# (v/256)%256 would truncate toward zero and corrupt the high bytes of a negative value, so we
+# peel the normalised low byte each step and shift via the EXACT (x - b)/256. Private.
+fn wbytes(p, v, n):
+    let x = v
+    let i = 0
+    while i < n:
+        let b = x % 256
+        if b < 0:
+            b = b + 256
+        store8(p + i, b)
+        x = (x - b) / 256
+        i = i + 1
+    return 0
+
+# little-endian 16-bit write (low byte first); returns 0
+pub fn wr16(p, v):
+    wbytes(p, v, 2)
+    return 0
+
+# little-endian 32-bit write (pairs with std.rd32, incl. negative values); returns 0
+pub fn wr32(p, v):
+    wbytes(p, v, 4)
+    return 0
+
+# C <stdlib.h> allocation (alloc is the zeroed bump builtin)
+pub fn malloc(n: i64):
+    return alloc(i32(n))
+pub fn calloc(n: i64, sz: i64):
+    return alloc(i32(n * sz))
+pub fn free(p):
+    return 0
+
+# realloc: bump-allocate fresh + copy n bytes (no size header; copying past the old region is harmless
+# in the contiguous zeroed heap -- the caller only uses [0,n)). Adequate for grow-and-reuse patterns.
+pub fn realloc(p, n: i64):
+    if p == 0:
+        return alloc(i32(n))
+    let q = alloc(i32(n))
+    memcpy(q, p, i32(n))
+    return q
+
+# --- REAL allocator (free-list) ------------------------------------------------------------------
+# A WORKING free()/realloc() so long-running malloc/free-heavy code (e.g. a large compiler)
+# reclaims memory instead of leaking the bump heap. STATELESS: a lazily-created 32-bin table is
+# rooted in a caller-supplied main-module cell `fl` (imported libs can't hold mutable state -- the
+# program keeps `let __mem_freelist = alloc(8)` and threads it, the same pattern as strtok's
+# __strtok_save).
+# Block layout: [size:i32 @ base][user bytes @ base+8]; a FREE block stores its next-ptr at the user
+# ptr (the size header at base survives, so reuse and realloc know the capacity). size-class bins keep
+# allocation bounded while block splitting prevents QBE-sized arena traffic from fragmenting 2 GiB.
+fn __rt_mem_class(sz):
+    let cls = 3
+    let cap = 8
+    while cap < sz and cls < 31:
+        cap = cap * 2
+        cls = cls + 1
+    return cls
+
+fn __rt_mem_bins(fl):
+    let bins = load(fl)
+    if bins == 0:
+        bins = alloc(128)
+        if bins < 0:
+            return 0
+        memset(bins, 0, 128)
+        store(fl, bins)
+    return bins
+
+pub fn __rt_malloc(n, fl):
+    let sz = (((n + 7) / 8) * 8)
+    if sz < 8:
+        sz = 8
+    let bins = __rt_mem_bins(fl)
+    if bins == 0:
+        return 0
+    let cls = __rt_mem_class(sz)
+    let scan = cls
+    while scan < 32:
+        let head = bins + scan * 4
+        let prev = head
+        let cur = load(head)
+        while cur != 0:
+            let bsz = load(cur - 8)
+            if bsz >= sz:
+                let next = load(cur)
+                store(prev, next)
+                let remain = bsz - sz - 8
+                if remain >= 8:
+                    let rbase = cur + sz
+                    let ruser = rbase + 8
+                    store(rbase, remain)
+                    let rcls = __rt_mem_class(remain)
+                    let rhead = bins + rcls * 4
+                    store(ruser, load(rhead))
+                    store(rhead, ruser)
+                    store(cur - 8, sz)
+                return cur
+            prev = cur
+            cur = load(cur)
+        scan = scan + 1
+    let base = alloc(sz + 8)
+    if base < 0:
+        return 0
+    store(base, sz)
+    return base + 8
+
+# EXACT-FIT variant for VLA rebinds (used with its own cell, __vla_freelist). C stack semantics: a
+# re-executed same-size VLA declaration must land at the SAME address (tinycc's tests2 79 and 122
+# check it). First-fit (bsz >= sz) would hand a smaller request a larger recycled block and break
+# that stability; exact-fit gives each size class one stable block. Frees go through __rt_free on
+# the same cell.
+pub fn __rt_vla_malloc(n, fl):
+    let sz = (((n + 7) / 8) * 8)
+    if sz < 8:
+        sz = 8
+    let bins = __rt_mem_bins(fl)
+    if bins == 0:
+        return 0
+    let head = bins + __rt_mem_class(sz) * 4
+    let prev = head
+    let cur = load(head)
+    while cur != 0:
+        let bsz = load(cur - 8)
+        if bsz == sz:
+            store(prev, load(cur))
+            return cur
+        prev = cur
+        cur = load(cur)
+    let base = alloc(sz + 8)
+    if base < 0:
+        return 0
+    store(base, sz)
+    return base + 8
+
+pub fn __rt_free(p, fl):
+    if p == 0:
+        return 0
+    let bins = __rt_mem_bins(fl)
+    if bins == 0:
+        return 0
+    let head = bins + __rt_mem_class(load(p - 8)) * 4
+    store(p, load(head))
+    store(head, p)
+    return 0
+
+pub fn __rt_realloc(p, n, fl):
+    if p == 0:
+        return __rt_malloc(n, fl)
+    let oldsz = load(p - 8)
+    let want = (((n + 7) / 8) * 8)
+    if want <= oldsz:
+        return p
+    let np = __rt_malloc(n, fl)
+    if np == 0:
+        return 0
+    memcpy(np, p, oldsz)
+    __rt_free(p, fl)
+    return np
+
+pub fn __rt_calloc(n, sz, fl):
+    let total = (n * sz)
+    let p = __rt_malloc(total, fl)
+    if p == 0:
+        return 0
+    memset(p, 0, total)
+    return p
+
+# memchr: scan the first n bytes of s for byte c; return the address or 0 (libc surface)
+pub fn memchr(s, c, n: i64):
+    let i = 0
+    while i < i32(n):
+        if u8(s + i) == c:
+            return s + i
+        i = i + 1
+    return 0
+
+# ── alloca: MARK AND RELEASE, which is what a stack allocator actually is ────────────────────────
+# alloca(n) as a raw bump alloc() with NO free leaks the block at every call, and a program that
+# calls alloca once per function call leaks without end. Chaining the blocks and freeing the chain
+# at return is correct, but it puts a free-list allocation AND a chain walk on the hottest path,
+# several times slower.
+#
+# alloca is stack memory, so treat it as a stack: one arena with a bump pointer. A function records
+# the pointer on entry and restores it on return, releasing everything it allocated in ONE store --
+# no per-block bookkeeping at all. That is correct for several allocas in one function and for
+# alloca inside a loop, because both are released by the same restore.
+#
+# State cell layout: [base:4][top:4]. The arena is created on first use, never freed (it is reused
+# by every call for the life of the program, which is the point).
+# ⚠️ The arena SIZE is negotiated, not fixed. A fixed 64MB arena cannot be created inside a 64MB
+# guest heap, and the failure is total: alloca returns 0 and the program dies immediately. Try
+# descending sizes and keep the first that fits, so a small-heap program still gets a working alloca
+# and a large-heap one still gets room for deep recursion. Cap stored alongside base/top so the
+# bounds check knows what was actually obtained: [base:4][top:4][cap:4].
+pub fn __rt_alloca_init(st):
+    # Start at 16MB, not 64: asking for 64MB first makes the VM say the heap is full on every
+    # small-heap run even though the negotiation then succeeds -- a scary message for a non-event.
+    let want = 16777216
+    while want >= 65536:
+        let b = alloc(want)
+        if b >= 0:
+            store(st, b)
+            store((st + 4), 0)
+            store((st + 8), want)
+            return b
+        want = want / 4
+    return 0
+
+pub fn __rt_alloca(n, st):
+    let base = load(st)
+    if base == 0:
+        base = __rt_alloca_init(st)
+        if base == 0:
+            return 0
+    let top = load((st + 4))
+    let need = (((n + 7) / 8) * 8)
+    if (top + need) > load((st + 8)):
+        return 0                       # out of alloca space: C returns NULL on stack overflow too
+    store((st + 4), (top + need))
+    return (load(st) + top)
+
+# The mark is just the bump pointer. Entry saves it; return restores it.
+pub fn __rt_alloca_mark(st):
+    return load(st + 4)
+
+pub fn __rt_alloca_release(st, mark):
+    store(st + 4, mark)
+    return 0

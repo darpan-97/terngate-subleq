@@ -1,0 +1,475 @@
+module std_fmt
+
+import std
+
+# Integer <-> string conversion. CORE tier, NON-ALLOCATING: itoa writes ASCII into a
+# CALLER-supplied buffer and returns the length (Go AppendInt / Zig bufPrint discipline) --
+# never allocates per call. A non-allocating itoa. Bases 2..16;
+# digits 0-9 then a-f. Sign handled for the value (a leading '-').
+
+# digit value of ascii c in the given base, or -1 if not a valid digit. Private.
+fn digit_val(c, base):
+    let d = -1
+    if c >= 48 and c <= 57:
+        d = c - 48
+    if c >= 97 and c <= 102:
+        d = c - 87
+    if c >= 65 and c <= 70:
+        d = c - 55
+    if d >= base:
+        d = -1
+    return d
+
+# write v in `base` into buf (no NUL); returns the number of bytes written
+pub fn itoa_base(buf, v, base):
+    if v == 0:
+        store8(buf, 48)
+        return 1
+    let neg = 0
+    let n = v
+    if v < 0:
+        neg = 1
+    let start = 0
+    if neg > 0:
+        store8(buf, 45)
+        start = 1
+    # extract digits from n WITHOUT negating it first (0 - INT_MIN overflows back to INT_MIN): for a
+    # negative n, n % base is negative (C truncates toward zero) -> negate just the digit. INT_MIN-safe.
+    let i = start
+    while n != 0:
+        let r = n % base
+        if r < 0:
+            r = 0 - r
+        let c = 48 + r
+        if r > 9:
+            c = 87 + r
+        store8(buf + i, c)
+        n = n / base
+        i = i + 1
+    # digits were emitted least-significant first; reverse them in place
+    let lo = start
+    let hi = i - 1
+    while lo < hi:
+        let a = u8(buf + lo)
+        let b = u8(buf + hi)
+        store8(buf + lo, b)
+        store8(buf + hi, a)
+        lo = lo + 1
+        hi = hi - 1
+    return i
+
+# write v in base 10 into buf (no NUL); returns the length
+pub fn itoa(buf, v):
+    return itoa_base(buf, v, 10)
+
+# parse a NUL-terminated string in `base` (optional leading '-'); stops at the first
+# non-digit; returns the i32 value
+pub fn parse_int(s, base):
+    let i = 0
+    let neg = 0
+    if u8(s) == 45:
+        neg = 1
+        i = 1
+    let acc = 0
+    let go = 1
+    while go > 0:
+        let c = u8(s + i)
+        let d = digit_val(c, base)
+        if d < 0:
+            go = 0
+        else:
+            acc = acc * base + d
+            i = i + 1
+    if neg > 0:
+        return 0 - acc
+    return acc
+
+# parse a NUL-terminated base-10 string; returns the i32 value
+pub fn atoi(s):
+    # C atoi == (int)strtol(s,NULL,10): skip leading whitespace first.
+    let i = 0
+    while u8(s + i) == 32 or (u8(s + i) >= 9 and u8(s + i) <= 13):
+        i = i + 1
+    return parse_int(s + i, 10)
+
+# ---------------------------------------------------------------------------
+# Floating-point -> decimal ASCII (a dtoa). NON-ALLOCATING:
+# every fmt_* writes into a caller buffer and returns the byte count, mirroring
+# itoa's discipline. Reuses itoa for the integer/exponent parts and only adds
+# the f64 scaling/rounding. Writes %f (fixed), %e/%E (scientific) and %g/%G
+# (whichever of the two is shorter), 6 digits by default, every digit exact.
+# The conversion is passed as its ASCII code (102='f' 101='e' 69='E' 103='g'
+# 71='G').
+
+# 10^p as an i32, for small non-negative p.
+fn pow10i(p):
+    let r = 1
+    let i = 0
+    while i < p:
+        r = r * 10
+        i = i + 1
+    return r
+
+# write `prec` fractional digits of the integer `fd` (0..10^prec-1), zero-padded
+# on the LEFT to exactly `prec` columns, into buf; returns prec.
+fn write_frac(buf, fd, prec):
+    # render fd then left-pad with zeros to `prec` columns -- non-allocating (count digits, then
+    # write zero padding + fd's digits right-to-left directly into buf; no scratch alloc).
+    let n = 1
+    let t = fd
+    while t >= 10:
+        t = t / 10
+        n = n + 1
+    let pad = prec - n
+    let i = 0
+    while i < pad:
+        store8(buf + i, 48)
+        i = i + 1
+    let k = n - 1
+    let v = fd
+    while k >= 0:
+        store8(buf + pad + k, 48 + (v % 10))
+        v = v / 10
+        k = k - 1
+    return prec
+
+# strip trailing zeros (and a trailing '.') from the buffer of length len up to
+# the first 'e'/'E' (the exponent, if any, is kept). returns the new length.
+fn strip_zeros(buf, len):
+    # find the exponent marker, if present
+    let epos = len
+    let i = 0
+    while i < len:
+        let c = u8(buf + i)
+        if c == 101:
+            epos = i
+        if c == 69:
+            epos = i
+        i = i + 1
+    # is there a '.' before epos?
+    let dot = -1
+    let j = 0
+    while j < epos:
+        if u8(buf + j) == 46:
+            dot = j
+        j = j + 1
+    if dot < 0:
+        return len
+    # trim trailing zeros in [dot+1, epos)
+    let end = epos
+    while end > dot + 1 and u8(buf + end - 1) == 48:
+        end = end - 1
+    if end == dot + 1:
+        end = dot
+    # shift the exponent tail (if any) left to close the gap
+    let gap = epos - end
+    if gap > 0:
+        let s = epos
+        while s < len:
+            store8(buf + s - gap, u8(buf + s))
+            s = s + 1
+    return len - gap
+
+# ---- exact: a double's digits from the fraction it is, with big whole numbers --------------------
+# A finite double is m * 2^e exactly (m below 2^53). Its decimal digits are made from that fraction
+# one at a time, with whole numbers of up to 1,600 bits: nothing is rounded before the last digit
+# kept, and a tie goes to the even digit -- what C's printf does (Steele and White's method). A
+# number between 10^-5 and 10^15 has a fraction of a few words, so it is quick; an extreme one takes
+# longer, and is still right.
+const LIMBS = 50                     # 32 bits each, kept in 64 so a carry fits
+let BIG_N = alloc(8 + LIMBS * 8)     # a big number: how many limbs, then the limbs, lowest first
+let BIG_D = alloc(8 + LIMBS * 8)
+let BIG_T = alloc(8 + LIMBS * 8)
+let F_BITS = alloc(8)
+let DIGIT_TEXT = alloc(1024)         # the digits made (%f of 1e308 to 400 places: 709)
+
+fn big_limb(big, i) -> i64: return load64(big + 8 + i * 8)
+
+fn big_from(big, value: i64):        # value: 0 to 2^63 - 1
+    let n = 0
+    let v: i64 = value
+    while v != i64(0):
+        store64(big + 8 + n * 8, v & i64(4294967295))
+        v = v >>> i64(32)
+        n += 1
+    store(big, n)
+
+fn big_multiply(big, factor):        # big * factor (factor below 2^31)
+    let carry: i64 = i64(0)
+    let n = load(big)
+    let i = 0
+    while i < n:
+        let product: i64 = big_limb(big, i) * i64(factor) + carry
+        store64(big + 8 + i * 8, product & i64(4294967295))
+        carry = product >>> i64(32)
+        i += 1
+    if carry != i64(0):
+        store64(big + 8 + n * 8, carry)
+        store(big, n + 1)
+
+fn big_shift(big, bits):             # big * 2^bits
+    while bits >= 30:
+        big_multiply(big, 1073741824)
+        bits -= 30
+    if bits > 0: big_multiply(big, 1 << bits)
+
+fn big_times_ten_to(big, k):         # big * 10^k
+    while k >= 9:
+        big_multiply(big, 1000000000)
+        k -= 9
+    if k > 0: big_multiply(big, pow10i(k))
+
+fn big_compare(one, other):          # -1, 0 or 1
+    let n = load(one)
+    if n != load(other):
+        if n < load(other): return -1
+        return 1
+    let i = n - 1
+    while i >= 0:
+        let a: i64 = big_limb(one, i)
+        let b: i64 = big_limb(other, i)
+        if a < b: return -1
+        if a > b: return 1
+        i -= 1
+    return 0
+
+fn big_subtract(one, other):         # one - other (one is not the smaller)
+    let borrow: i64 = i64(0)
+    let n = load(one)
+    let i = 0
+    while i < n:
+        let difference: i64 = big_limb(one, i) - borrow
+        if i < load(other): difference = difference - big_limb(other, i)
+        borrow = i64(0)
+        if difference < i64(0):
+            difference = difference + i64(4294967296)
+            borrow = i64(1)
+        store64(one + 8 + i * 8, difference)
+        i += 1
+    while n > 0 and big_limb(one, n - 1) == i64(0): n -= 1
+    store(one, n)
+
+fn big_copy(to, from):
+    store(to, load(from))
+    mem_copy(to + 8, from + 8, load(from) * 8)
+
+# BIG_N / BIG_D = x / 10^k, which is at least 1 and below 10: the answer is k (x > 0 and finite)
+fn exact_start(x: f64):
+    storef(F_BITS, x)
+    let low = load(F_BITS)
+    let high = load(F_BITS + 4)
+    let exponent = (high >> 20) & 2047
+    let m: i64 = (i64(high & 1048575) << i64(32)) | (i64(low) & i64(4294967295))
+    let e2 = -1074                                   # (a subnormal: no hidden bit)
+    if exponent != 0:
+        m = m | (i64(1) << i64(52))
+        e2 = exponent - 1075
+    big_from(BIG_N, m)
+    big_from(BIG_D, i64(1))
+    if e2 > 0: big_shift(BIG_N, e2)
+    else: big_shift(BIG_D, 0 - e2)
+    let k = 0                                        # k estimated with floats, then made exact
+    let scaled = x
+    while scaled >= 10.0:
+        scaled = scaled / 10.0
+        k += 1
+    while scaled < 1.0:
+        scaled = scaled * 10.0
+        k -= 1
+    if k >= 0: big_times_ten_to(BIG_D, k)
+    else: big_times_ten_to(BIG_N, 0 - k)
+    big_copy(BIG_T, BIG_D)
+    big_multiply(BIG_T, 10)
+    while big_compare(BIG_N, BIG_T) >= 0:
+        big_multiply(BIG_D, 10)
+        big_multiply(BIG_T, 10)
+        k += 1
+    while big_compare(BIG_N, BIG_D) < 0:
+        big_multiply(BIG_N, 10)
+        k -= 1
+    return k
+
+# `count` digits of BIG_N / BIG_D at DIGIT_TEXT, the last rounded: up past a half, and at exactly a
+# half onto an even digit. 1 when the rounding carried past the first digit (they were all 9: now a
+# 1 and zeros, one power of ten up)
+fn exact_digits(count):
+    let i = 0
+    while i < count:
+        let digit = 0
+        while big_compare(BIG_N, BIG_D) >= 0:
+            big_subtract(BIG_N, BIG_D)
+            digit += 1
+        store8(DIGIT_TEXT + i, 48 + digit)
+        i += 1
+        if i < count: big_multiply(BIG_N, 10)
+    big_copy(BIG_T, BIG_N)
+    big_multiply(BIG_T, 2)
+    let side = big_compare(BIG_T, BIG_D)
+    let last = load8(DIGIT_TEXT + count - 1) - 48
+    if side < 0 or (side == 0 and last % 2 == 0): return 0
+    i = count - 1
+    while i >= 0:
+        if load8(DIGIT_TEXT + i) != 57:
+            store8(DIGIT_TEXT + i, load8(DIGIT_TEXT + i) + 1)
+            return 0
+        store8(DIGIT_TEXT + i, 48)
+        i -= 1
+    store8(DIGIT_TEXT, 49)
+    return 1
+
+fn write_exponent(buf, k, ec):       # e+05, e-324: the letter, the sign, at least two digits
+    store8(buf, ec)
+    let sign = 43
+    let value = k
+    if k < 0:
+        sign = 45
+        value = 0 - k
+    store8(buf + 1, sign)
+    let len = 2
+    if value < 10:
+        store8(buf + 2, 48)
+        len = 3
+    let digits = 1
+    let t = value
+    while t >= 10:
+        t = t / 10
+        digits += 1
+    let j = digits - 1
+    while j >= 0:
+        store8(buf + len + j, 48 + value % 10)
+        value = value / 10
+        j -= 1
+    return len + digits
+
+fn write_scientific(buf, decimals, k, ec):           # the first digit, the point and `decimals` more,
+    store8(buf, load8(DIGIT_TEXT))                   # the exponent
+    let len = 1
+    if decimals > 0:
+        store8(buf + 1, 46)
+        mem_copy(buf + 2, DIGIT_TEXT + 1, decimals)
+        len = 2 + decimals
+    return len + write_exponent(buf + len, k, ec)
+
+fn write_fixed(buf, count, k):       # the digits with the point after the one for 10^0: count of them,
+    let len = 0                      # the first for 10^k
+    if k < 0:
+        store8(buf, 48)
+        len = 1
+        if count > 0 or k < -1:
+            store8(buf + 1, 46)
+            len = 2
+            let zeros = 0 - k - 1
+            mem_fill(buf + len, 48, zeros)
+            len += zeros
+            mem_copy(buf + len, DIGIT_TEXT, count)
+            len += count
+        return len
+    mem_copy(buf, DIGIT_TEXT, k + 1)
+    len = k + 1
+    if count > k + 1:
+        store8(buf + len, 46)
+        mem_copy(buf + len + 1, DIGIT_TEXT + k + 1, count - k - 1)
+        len += 1 + count - k - 1
+    return len
+
+fn exact_scientific(buf, x: f64, decimals, ec):      # %e (x > 0)
+    let k = exact_start(x)
+    if exact_digits(decimals + 1): k += 1
+    return write_scientific(buf, decimals, k, ec)
+
+fn exact_fixed(buf, x: f64, decimals):               # %f (x >= 0)
+    if x == 0.0:
+        mem_fill(DIGIT_TEXT, 48, decimals + 1)
+        return write_fixed(buf, decimals + 1, 0)
+    let k = exact_start(x)
+    let count = k + 1 + decimals
+    if count <= 0:                                   # below the last place shown: 0 there, or 1 when
+        let one = 0                                  # it is more than half of that place (a half is
+        if count == 0:                               # a tie, and 0 is even)
+            big_copy(BIG_T, BIG_D)
+            big_multiply(BIG_T, 5)
+            if big_compare(BIG_N, BIG_T) > 0: one = 1
+        mem_fill(DIGIT_TEXT, 48, decimals + 1)
+        store8(DIGIT_TEXT + decimals, 48 + one)
+        return write_fixed(buf, decimals + 1, 0)
+    if exact_digits(count):
+        k += 1
+        store8(DIGIT_TEXT + count, 48)
+        count += 1
+    return write_fixed(buf, count, k)
+
+fn exact_general(buf, x: f64, precision, ec):        # %g (x > 0): `precision` significant digits,
+    let p = precision                                # as fixed when the exponent is -4 or more and
+    if p <= 0: p = 1                                 # below p, else scientific; trailing zeros go
+    let k = exact_start(x)
+    if exact_digits(p): k += 1
+    let len = 0
+    if k < -4 or k >= p: len = write_scientific(buf, p - 1, k, ec)
+    else: len = write_fixed(buf, p, k)
+    return strip_zeros(buf, len)
+
+# top-level f64 formatter: writes a C-style rendering of x for conversion `conv`
+# (102 f, 101 e, 69 E, 103 g, 71 G) at the given precision into buf (NUL-style
+# not added). returns the byte count. negative prec means "use the default 6". Exact at every
+# precision (the digits made above): the same text as C's printf, with no C under it.
+pub fn fmt_f64(buf, x: f64, conv, prec):
+    let p = prec
+    if p < 0:
+        p = 6
+    let len = 0
+    # NaN and the infinities first: nan and inf, the sign bit shown on both, uppercase for E and G.
+    let up = 0
+    if conv == 69 or conv == 71:
+        up = 1
+    # the sign is the SIGN BIT, not `x < 0`: -0.0 and a negative NaN print with a minus sign
+    storef(F_BITS, x)
+    let hi = load(F_BITS + 4)
+    if x != x:
+        if hi < 0:
+            store8(buf, 45)
+            len = 1
+        store8(buf + len, 110 - up * 32)
+        store8(buf + len + 1, 97 - up * 32)
+        store8(buf + len + 2, 110 - up * 32)
+        return len + 3
+    if x - x != x - x:
+        if x < 0.0:
+            store8(buf, 45)
+            len = 1
+        store8(buf + len, 105 - up * 32)
+        store8(buf + len + 1, 110 - up * 32)
+        store8(buf + len + 2, 102 - up * 32)
+        return len + 3
+    let v = x
+    if hi < 0:
+        store8(buf, 45)
+        len = 1
+        v = 0.0 - v
+    if conv == 101 or conv == 69:
+        if v == 0.0: return len + fmt_sci_zero(buf + len, p, conv)
+        return len + exact_scientific(buf + len, v, p, conv)
+    if conv == 103 or conv == 71:
+        if v == 0.0:
+            store8(buf + len, 48)
+            return len + 1
+        return len + exact_general(buf + len, v, p, conv - 2)
+    return len + exact_fixed(buf + len, v, p)       # f, and a conversion it does not know
+
+# scientific rendering of 0.0: "0.<prec zeros>e+00".
+fn fmt_sci_zero(buf, prec, ec):
+    let len = 0
+    store8(buf + len, 48)
+    len = len + 1
+    if prec > 0:
+        store8(buf + len, 46)
+        len = len + 1
+        len = len + write_frac(buf + len, 0, prec)
+    store8(buf + len, ec)
+    len = len + 1
+    store8(buf + len, 43)
+    len = len + 1
+    store8(buf + len, 48)
+    len = len + 1
+    store8(buf + len, 48)
+    len = len + 1
+    return len

@@ -41,7 +41,8 @@ module gate_judge
 #   judge_full_adder(s, c)      the one-digit adder's sum (gate_01101001) and carry (gate_00010111)
 #                               chained a digit at a time, the same sums checked
 #   judge_start()               the compiler found: from NITROPZ_LIB, as lib/eval finds it, or else at
-#                               NITROPZ (../nitropz unless set)/bin/nitropzc.nitropzb; 0 when it is not
+#                               NITROPZ (nitropz, the copy in this repository, unless set)/bin/
+#                               nitropzc.nitropzb; 0 when it is not
 import std
 import os
 import eval
@@ -119,7 +120,7 @@ pub fn judge_start():
     let folders = alloc(4096)
     if os_env("NITROPZ_LIB", folders, 4096) > 0: return 1
     let home = alloc(4096)
-    if os_env("NITROPZ", home, 4096) <= 0: home = "../nitropz"
+    if os_env("NITROPZ", home, 4096) <= 0: home = "nitropz"
     return eval_set_compiler(concat(home, "/bin/nitropzc.nitropzb"))
 
 pub fn judge_gate(code, g, ins):

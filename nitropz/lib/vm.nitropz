@@ -1,0 +1,1325 @@
+module vm
+
+# vm -- the machine that runs a compiled program: the image a compiler wrote (a .nitropzb file of
+# bytecode: lib/opcodes.nitropz is its instruction set), its instructions carried out.
+# vm/nitropzvm.nitropz is this machine as a program of its own:
+#
+#     nitropzvm program.nitropzb [arguments for the program...]
+#
+# and a program runs another inside itself with it: vm_load makes an image held in memory ready,
+# and vm_run runs it to its end, with the arguments and the input it is given, in a block of memory
+# of its own -- what it prints and what it says went wrong kept for the caller (vm_output,
+# vm_errors), its end or its failure ending only it, and no file its but those it opens.
+#
+# Its rules -- the allocator, the limits, the ways a program can fail -- are also the rules of the
+# runtime that native/ puts in every executable (native/runtime.nitropz), so a program gets the same
+# addresses and the same errors run either way.
+#
+# An image is 24 bytes of header -- "NITROPZ", the instruction count at byte 12, the first
+# instruction at 16, and at 20, 21 and 22 what the program may use of the machine (each a power of
+# two, 0 for all it has: its memory, its frames' memory, how deep its calls go; it gets no more than
+# there is) -- then 8 bytes an instruction: the operation, three register numbers a b c,
+# and a 32-bit number, imm. The machine has three files of 256 registers (32-bit, 64-bit, and
+# 64-bit float), 4096 globals, and a stack of call frames with 8-byte local and argument slots.
+#
+# Memory. vm/nitropzvm.nitropz is made machine code (by native/) with one block of memory, HEAP_END
+# bytes. What the machine needs for itself is taken first, then alloc(0) gives the address where the
+# rest begins, R, and nothing asks the runtime for memory again while a program runs: so there is
+# no string literal inside a function below, and no str() or concat(), since each would take memory
+# from where the program's heap is. (Inside another program, the block vm_run takes is all of it.)
+#
+#     [ the machine's own | freed blocks | call frames -> | the program's heap ->          ]
+#                         R=FL           FB               HB                     HEAP_END
+#
+# A program address p is the byte at HB + p. Nothing is touched before it is used, so the system
+# gives the process only the memory the program uses. Every address a program gives is checked
+# here. The frames sit below the heap, not at the top of memory, so that this machine can run as a
+# program on itself: there the top of memory is its host's, and its host's frames are in it.
+#
+# Speed. The run is one function, its busiest variables kept in machine registers by native/, which
+# makes this machine code. Each shared value below is computed once on purpose (w o ra rb), the hot
+# operations are grouped by shape so that what a group computes stays inside it, and the rare ones
+# live in functions of their own.
+#
+# Names. What a module names at its top level every module sees, so each such name here starts
+# VM_ or vm_ (HEAP_END above is VM_HEAP_END): a program that runs another keeps its own names.
+
+import opcodes
+import failures
+import host_calls
+
+let VM_HEAP_END = 536870912        # 512 MB: the memory native/ gives it (HEAP_BYTES in
+                                   #   native/machine.nitropz)
+let VM_FREE_CAP = 1048576          # freed blocks remembered for reuse, 8 bytes each
+let VM_FRAMES = 67108864           # 64 MB of call frames, and 65,536 calls deep
+let VM_MAX_DEPTH = 65536
+let VM_HEAP_LIMIT = 0              # the program's memory, when its image asks for less than there is
+
+# The operations as the run numbers them: an operation's place in these lists. The first four are
+# tested inline, grouped by shape and each group in order of use (measured: the compiler compiling
+# itself, where these are 99% of what runs); the others go to a function each -- 33.. the other
+# 32-bit ones, 64.. float, 96.. 64-bit. 253 is a global slot out of range, 254 an unknown
+# operation, 255 the end of the code.
+let VM_ORDER_1 = [LOAD_IMM_I32, MOV, ADD_IMM_I32, LD_LOCAL, ST_LOCAL, LD_PARAM, ST_PARAM, LD_GLOBAL]
+let VM_ORDER_2 = [ST_GLOBAL, JZ, JNZ, JMP, ADD_I32, AND_I32, CMP_EQ_I32, XOR_I32, MUL_I32, CMP_LT_I32]
+let VM_ORDER_3 = [SUB_I32, OR_I32, SHL_I32, SHR_I32, SHR_U_I32, CMP_EQ_I32_JZ, CMP_LT_I32_JZ, MEM_LOAD8]
+let VM_ORDER_4 = [MEM_LOAD32, MEM_STORE32, MEM_STORE8, CALL, RET, CALL_INDIRECT, HALT]
+let VM_ORDER_I32_1 = [DIV_I32, MOD_I32, ALLOC, FREE, MEM_LOAD16, MEM_STORE16, TRY, ENDTRY, THROW]
+let VM_ORDER_I32_2 = [GETTHROWN, SETJMP, LONGJMP, MEM_COPY, MEM_FILL, STR_CMP, PRINT_I32, PRINT_STR]
+let VM_ORDER_I32_3 = [FMT_I32, CONCAT_STR, HOST_WRITE, HOST_READ, HOST_OPEN, HOST_CLOSE, HOST_CALL]
+let VM_ORDER_I32_4 = [CLOAD, CCALL, EXTEND_I32, UDIV_I32, UMOD_I32, CMP_LT_U32]
+let VM_ORDER_F64_1 = [FMOV, FADD_F64, FSUB_F64, FMUL_F64, FDIV_F64, I2F_F64, F2I_I32, FCMP_LT_F64]
+let VM_ORDER_F64_2 = [FCMP_EQ_F64, MEM_LOAD_F32, MEM_LOAD_F64, MEM_STORE_F32, MEM_STORE_F64]
+let VM_ORDER_F64_3 = [LD_LOCAL_F64, ST_LOCAL_F64, LD_PARAM_F64, ST_PARAM_F64, PRINT_F64, F2F32]
+let VM_ORDER_F64_4 = [I642F_F64, F2I_I64, DOT_F64, ADD_SCALED_F64, EXP_F64]
+let VM_ORDER_I64_1 = [LOAD_IMM_I64, ADD_I64, SHL_I64, PRINT_I64, SUB_I64, MUL_I64, AND_I64, OR_I64]
+let VM_ORDER_I64_2 = [XOR_I64, SHR_I64, DIV_I64, MOD_I64, LD_LOCAL_I64, ST_LOCAL_I64, LD_PARAM_I64]
+let VM_ORDER_I64_3 = [ST_PARAM_I64, LOAD_IMM_I64_HI, I2I64, I642I, CMP_LT_I64, CMP_EQ_I64]
+let VM_ORDER_I64_4 = [MEM_LOAD_I64, MEM_STORE_I64, SHR_U_I64, CMP_LT_U64, DIV_U_I64, MOD_U_I64]
+let VM_ORDER_I64_5 = [EXTEND_I64, UDIV_I64, UMOD_I64, PRINT_U64]
+
+# (what a failure says -- T_ and S_ -- is lib/failures.nitropz's, the runtime's too)
+let VM_NAN = "nan\n"
+
+let VM_REGS = alloc(21504)         # r0..r255, then f0..f255, q0..q255 (64-bit), and the globals
+let VM_FREGS = VM_REGS + 1024
+let VM_QREGS = VM_REGS + 3072
+let VM_GLOBALS = VM_REGS + 5120
+let VM_HANDLERS = alloc(2048)      # open try blocks: landing pc, frame depth
+let VM_MAP = alloc(256)            # operation -> the number the run knows it by
+let VM_NUM = alloc(32)
+let VM_TXT = alloc(48)
+let VM_F8 = alloc(8)
+let VM_LANES = alloc(64)           # DOT_F64's eight sums
+let VM_EXP_BITS = alloc(8)         # EXP_F64's 2^k, made from its bits
+let VM_OUT_CAP = 65536             # the program's output waits here when it is not going to a
+let VM_OUT = alloc(VM_OUT_CAP)     # terminal: each print written straight out made printing 30
+let vm_nout = 0                    # times slower on Windows
+let vm_buffered = 0
+
+let VM_R = 0                       # where the machine's own memory ends
+let VM_FL = 0                      # the freed blocks' table, the frames, the program's heap
+let VM_FB = 0
+let VM_HB = 0
+let VM_N = 0                       # instructions in the image
+let vm_bump = 0                    # the heap's top: fresh memory starts here
+let vm_nfree = 0                   # freed blocks, in the table at FL: address, size
+let vm_maxfree = 0                 # no freed block is bigger than this
+let vm_maxoff = 0                  # and none starts higher
+let vm_told = 0
+let vm_nh = 0                      # try blocks open
+let vm_thrown = 0
+
+# a program run inside another (vm_run): what it is given, and what it gives back
+let vm_inside = 0                  # 1 while it runs: its end comes back to vm_run,
+let vm_ended = 0                   #   and marks the run ended (1), which then stops
+let VM_ARGUMENTS = 0               # its arguments, a list of texts (or 0), and its input, a text
+let VM_INPUT = 0                   #   (or 0: none), read from the start
+let vm_input_at = 0
+let vm_input_length = 0
+let VM_OUTPUT = 0                  # what it prints, and what it says went wrong: each a count, the
+let VM_ERRORS = 0                  #   room there is, then the bytes and a 0 (keep)
+let vm_opened = 0                  # the files it opened: bit f for file f (3 to 18)
+let vm_status = 0                  # how it ended, and whether the machine stopped it (it failed)
+let vm_failing = 0
+let VM_RANDOM = alloc(16)          # its random numbers' generator, from the start as a program's
+let vm_random_started = 0          #   own (native/runtime.nitropz's: the same numbers)
+let vm_started_at = 0              # when it started, by the milliseconds' clock
+let VM_MEMORY = 0                  # its memory: freed blocks, frames and heap, vm_memory_size bytes
+let vm_memory_size = 16777216      #   (16 MB, until vm_set_memory says otherwise)
+
+fn size_of(s):
+    let n = 0
+    while load8(s + n) != 0: n += 1
+    return n
+
+fn say(fd, s): return send(fd, s, size_of(s))
+
+# n's decimal text at `at`, and its length (worked on the negative side, where INT_MIN fits)
+fn digits(n, at):
+    let m = n
+    if n > 0: m = 0 - n
+    let t = 0
+    if m == 0:
+        store8(VM_NUM, 48)
+        t = 1
+    while m != 0:
+        store8(VM_NUM + t, 48 - m % 10)
+        m = m / 10
+        t += 1
+    let k = 0
+    if n < 0:
+        store8(at, 45)
+        k = 1
+    while t > 0:
+        t -= 1
+        store8(at + k, load8(VM_NUM + t))
+        k += 1
+    store8(at + k, 0)
+    return k
+
+fn say_num(fd, n): return send(fd, VM_TXT, digits(n, VM_TXT))
+
+# the same for a 64-bit n
+fn digits64(n: i64, at):
+    let m: i64 = n
+    if n > i64(0): m = i64(0) - n
+    let t = 0
+    if m == i64(0):
+        store8(VM_NUM, 48)
+        t = 1
+    while m != i64(0):
+        store8(VM_NUM + t, 48 - i32(m % i64(10)))
+        m = m / i64(10)
+        t += 1
+    let k = 0
+    if n < i64(0):
+        store8(at, 45)
+        k = 1
+    while t > 0:
+        t -= 1
+        store8(at + k, load8(VM_NUM + t))
+        k += 1
+    store8(at + k, 0)
+    return k
+
+# and for a 64-bit n taken as unsigned
+fn unsigned_digits64(n: i64, at):
+    let m: i64 = n
+    let t = 0
+    if m == i64(0):
+        store8(VM_NUM, 48)
+        t = 1
+    while m != i64(0):
+        store8(VM_NUM + t, 48 + i32(umod64(m, i64(10))))
+        m = udiv64(m, i64(10))
+        t += 1
+    let k = 0
+    while t > 0:
+        t -= 1
+        store8(at + k, load8(VM_NUM + t))
+        k += 1
+    store8(at + k, 0)
+    return k
+
+# ---- the program's output ----
+fn flush():
+    if vm_nout > 0: send(1, VM_OUT, vm_nout)
+    vm_nout = 0
+    return 0
+
+fn put(p, k):
+    if vm_nout + k > VM_OUT_CAP:
+        flush()
+        if k > VM_OUT_CAP: return send(1, p, k)
+    mem_copy(VM_OUT + vm_nout, p, k)
+    vm_nout += k
+    return k
+
+fn put_line(p, k):                 # k bytes and a newline
+    store8(VM_TXT + 47, 10)
+    put(p, k)
+    return put(VM_TXT + 47, 1)
+
+fn is_terminal(fd): return hostcall(ASK_IS_TERMINAL, fd)             # 1 when file fd goes to a terminal
+
+fn quit(status):                   # the end: what waits written out, the files closed, `status` --
+    flush()                        # the process's; or, inside another program, what vm_run gives
+    let fd = 3                     # back, the run stopping where it is (vm_ended)
+    while fd < 19:
+        if vm_inside == 0 or (vm_opened >> fd) & 1: close(fd)
+        fd += 1
+    if vm_inside:
+        vm_status = status
+        vm_ended = 1
+        return 1
+    exit(status)
+    return 0
+
+# k bytes for file fd -- inside another program, its output (1) and what it says went wrong (2) are
+# kept for the caller instead (vm_output, vm_errors)
+fn send(fd, p, k):
+    if vm_inside and fd == 1: return keep(VM_OUTPUT, p, k)
+    if vm_inside and fd == 2: return keep(VM_ERRORS, p, k)
+    return write(fd, p, k)
+
+fn keep(kept, p, k):               # k bytes after those kept: as many as there is room for
+    let have = load(kept)
+    if k > load(kept + 4) - have: k = load(kept + 4) - have
+    mem_copy(kept + 8 + have, p, k)
+    store(kept, have + k)
+    store8(kept + 8 + have + k, 0)
+    return k
+
+fn stopped(next):                  # "the program stopped at instruction i: " -- i the one
+    vm_failing = 1                 # before `next`, the instruction that failed
+    flush()
+    say(2, S_STOPPED)
+    say_num(2, next - 1)
+    say(2, S_COLON)
+
+fn trap(what, next):               # what failed, and status 1
+    stopped(next)
+    say(2, what)
+    say(2, S_NL)
+    return quit(1)
+
+fn full(size):
+    if vm_told == 0:
+        vm_told = 1
+        flush()
+        say(2, S_FULL)
+        say_num(2, size)
+        say(2, S_BYTES)
+    return -1
+
+# the allocator: a freed block first -- the first that fits among the newest 16, split when bigger --
+# else fresh memory from the top of the heap, which may reach `room`, the end of the program's
+# memory. Blocks are 8-aligned and zeroed.
+fn galloc(size, room):
+    let need = (size + 7) & -8
+    if size < 0 or need < size: return full(size)
+    if need <= vm_maxfree:
+        let stop = 0
+        if vm_nfree > 16: stop = vm_nfree - 16
+        let i = vm_nfree
+        while i > stop:
+            i -= 1
+            let e = VM_FL + i * 8
+            let have = load(e + 4)
+            if have >= need:
+                let off = load(e)
+                if have > need:
+                    store(e, off + need)
+                    store(e + 4, have - need)
+                    if off + need > vm_maxoff: vm_maxoff = off + need
+                else:
+                    vm_nfree -= 1
+                    store(e, load(VM_FL + vm_nfree * 8))
+                    store(e + 4, load(VM_FL + vm_nfree * 8 + 4))
+                mem_fill(VM_HB + off, 0, size)
+                return off
+        if stop == 0: vm_maxfree = need - 1               # the whole table was looked at
+    if vm_bump > room - need: return full(size)
+    let at = vm_bump
+    mem_fill(VM_HB + at, 0, need)
+    vm_bump = at + need
+    return at
+
+# free: the block at the top of the heap moves the top down (and the freed blocks above it are
+# forgotten); any other goes in the table. A block outside the heap is ignored.
+fn gfree(addr, size):
+    if addr < 0 or size < 0 or size > vm_bump or addr > vm_bump - size: return 0
+    let need = (size + 7) & -8
+    if need <= vm_bump and addr == vm_bump - need:
+        vm_bump = addr
+        if vm_maxoff >= vm_bump:
+            let kept = 0
+            let top = 0
+            let i = 0
+            while i < vm_nfree:
+                let o = load(VM_FL + i * 8)
+                if o < vm_bump:
+                    if o > top: top = o
+                    store(VM_FL + kept * 8, o)
+                    store(VM_FL + kept * 8 + 4, load(VM_FL + i * 8 + 4))
+                    kept += 1
+                i += 1
+            vm_nfree = kept
+            vm_maxoff = top
+        return 0
+    if vm_nfree < VM_FREE_CAP:                            # (when the table is full, the block is
+        store(VM_FL + vm_nfree * 8, addr)                 # forgotten)
+        store(VM_FL + vm_nfree * 8 + 4, need)
+        vm_nfree += 1
+        if need > vm_maxfree: vm_maxfree = need
+        if addr > vm_maxoff: vm_maxoff = addr
+    return 0
+
+# the length of the string at program address s, or -1 past the end of memory or past 16 MB
+fn glen(s, lim):
+    if s < 0: return -1
+    let k = 0
+    while s + k < lim:
+        if load8(VM_HB + s + k) == 0: return k
+        k += 1
+        if k > 16777216: return -1
+    return -1
+
+# HOST_CALL: the host's functions, the arguments at p (registers a, a+1, ...), program addresses
+# made into the runtime's. Running a command, changing files and folders, and calling C are not
+# here: they answer -1. An image the program holds, it runs inside it (run_image). Inside another
+# program, its arguments and its input are the ones it was
+# given, it has no terminal, its random numbers and its clock start when it does, and a text or a
+# room it names must be in its own memory, a file its own, or the answer is -1.
+fn host(id, p, next):
+    let m = VM_HB
+    if id == ASK_RUN_IMAGE: return run_image(p)
+    if vm_inside and outside(id, p): return -1
+    if id == ASK_ARGUMENT_COUNT:
+        if vm_inside: return given_count()
+        return hostcall(ASK_ARGUMENT_COUNT) - 1                 # (the runtime counts the image as one)
+    if id == ASK_ARGUMENT:                                         # (and the runtime's first is the image: never
+        if load(p) < 0: return -1                        #  the program's)
+        if vm_inside: return given_argument(load(p), m + load(p + 4), load(p + 8))
+        return hostcall(ASK_ARGUMENT, load(p) + 1, m + load(p + 4), load(p + 8))
+    if id == ASK_FILE_SIZE: return hostcall(ASK_FILE_SIZE, m + load(p))
+    if id == ASK_EXISTS: return hostcall(ASK_EXISTS, m + load(p))
+    if id == ASK_IS_FOLDER: return hostcall(ASK_IS_FOLDER, m + load(p))
+    if id == ASK_MAKE_FOLDER: return hostcall(ASK_MAKE_FOLDER, m + load(p))
+    if id == ASK_LIST_FOLDER: return hostcall(ASK_LIST_FOLDER, m + load(p), m + load(p + 4), load(p + 8))
+    if id == ASK_ENVIRONMENT: return hostcall(ASK_ENVIRONMENT, m + load(p), m + load(p + 4), load(p + 8))
+    if id == ASK_INPUT:
+        flush()                                          # what was printed shows before input
+        if vm_inside: return given_input(m + load(p), load(p + 4))
+        return hostcall(ASK_INPUT, m + load(p), load(p + 4))
+    if id == ASK_MILLISECONDS:
+        if vm_inside: return hostcall(ASK_MILLISECONDS) - vm_started_at
+        return hostcall(ASK_MILLISECONDS)
+    if id == ASK_SECONDS: return hostcall(ASK_SECONDS)
+    if id == ASK_SLEEP:
+        flush()
+        return hostcall(ASK_SLEEP, load(p))
+    if id == ASK_RANDOM:
+        if vm_inside: return own_random()
+        return hostcall(ASK_RANDOM)
+    if id == ASK_SEEK: return hostcall(ASK_SEEK, load(p), load(p + 4), load(p + 8))
+    if id == ASK_TELL: return hostcall(ASK_TELL, load(p))
+    if id == ASK_FORMAT_FLOAT: return hostcall(ASK_FORMAT_FLOAT, load(p), load(p + 4), m + load(p + 8), m + load(p + 12), load(p + 16))
+    if id == ASK_IS_TERMINAL:
+        if vm_inside: return 0
+        return is_terminal(load(p))
+    if id == ASK_CAPTURE or id == ASK_RUN or id == ASK_C_CALL: return -1
+    if id >= ASK_REMOVE_FILE and id <= ASK_RENAME: return -1
+    stopped(next)
+    say(2, S_ASKED)
+    say_num(2, id)
+    say(2, S_NOT_HERE)
+    say(2, S_NL)
+    return quit(1)
+
+# ---- what a program run inside another may reach -------------------------------------------------
+# does host call `id` name memory that is not the program's -- a text running past its end, or room
+# reaching past it -- or a file that is not its own?
+fn outside(id, p):
+    if id == ASK_FILE_SIZE or id == ASK_EXISTS or id == ASK_IS_FOLDER or id == ASK_MAKE_FOLDER:
+        return text_outside(load(p))
+    if id == ASK_LIST_FOLDER or id == ASK_ENVIRONMENT:
+        return text_outside(load(p)) | room_outside(load(p + 4), load(p + 8))
+    if id == ASK_ARGUMENT: return room_outside(load(p + 4), load(p + 8))
+    if id == ASK_INPUT: return room_outside(load(p), load(p + 4))
+    if id == ASK_FORMAT_FLOAT: return room_outside(load(p + 8), 8) | room_outside(load(p + 12), load(p + 16))
+    if id == ASK_SEEK or id == ASK_TELL: return 1 - its_file(load(p))
+    return 0
+
+fn memory_end():                   # how much memory the program has
+    let lim = VM_HEAP_END - VM_HB
+    if VM_HEAP_LIMIT and VM_HEAP_LIMIT < lim: lim = VM_HEAP_LIMIT
+    return lim
+
+fn text_outside(at):
+    if glen(at, memory_end()) < 0: return 1
+    return 0
+
+fn room_outside(at, k):
+    if k < 0 or (at | (memory_end() - at - k)) < 0: return 1
+    return 0
+
+fn its_file(fd):                   # may the program use file fd: 0, 1 and 2 -- and, inside another
+    if fd < 3 or vm_inside == 0: return 1                            # program, those it opened
+    if fd >= 19: return 0
+    return (vm_opened >> fd) & 1
+
+# PCG32, started as its own example starts it (42, 54): native/runtime.nitropz's random(), step for
+# step, so that a program run inside another gets the numbers it would get run on its own
+fn random_step():
+    let old: i64 = load64(VM_RANDOM)
+    store64(VM_RANDOM, old * 6364136223846793005 + load64(VM_RANDOM + 8))
+    let mixed = i32(((old >>> 18) ^ old) >>> 27)
+    let turn = i32(old >>> 59)
+    return (mixed >>> turn) | (mixed << ((0 - turn) & 31))
+
+fn own_random():
+    if vm_random_started == 0:
+        vm_random_started = 1
+        store64(VM_RANDOM, i64(0))
+        store64(VM_RANDOM + 8, i64(109))                 # (54 << 1) | 1
+        random_step()
+        store64(VM_RANDOM, load64(VM_RANDOM) + i64(42))
+        random_step()
+    return random_step() >>> 1
+
+fn given_count():                  # how many arguments it was given (a list's count is before it)
+    if VM_ARGUMENTS == 0: return 0
+    return load(VM_ARGUMENTS - 4)
+
+fn given_argument(i, to, room):    # argument i at `to`, up to room - 1 bytes and a 0: its length, or
+    if i >= given_count() or room < 1: return -1                     # -1 when there is none
+    let text = load(VM_ARGUMENTS + i * 4)
+    let k = size_of(text)
+    if k > room - 1: k = room - 1
+    mem_copy(to, text, k)
+    store8(to + k, 0)
+    return k
+
+fn given_input(to, room):          # ASK_INPUT: the rest of its input, up to room - 1 bytes, and a 0
+    if room < 1: return 0
+    let k = given_bytes(to, room - 1)
+    store8(to + k, 0)
+    return k
+
+fn given_bytes(to, k):             # up to k bytes more of its input: how many there were
+    if k > vm_input_length - vm_input_at: k = vm_input_length - vm_input_at
+    if k <= 0: return 0
+    mem_copy(to, VM_INPUT + vm_input_at, k)
+    vm_input_at += k
+    return k
+
+# The rare 32-bit operations (33..63), but for the ones that move frames, which the run keeps.
+# `(x | (lim - x - k)) < 0` is x < 0 or x + k > lim, in one test.
+fn other(o, w, at, pc, lim):
+    let m = VM_HB
+    let ra = VM_REGS + (((w >>> 8) & 255) << 2)
+    let rb = VM_REGS + (((w >>> 16) & 255) << 2)
+    let rc = VM_REGS + ((w >>> 24) << 2)
+    if o == 35: store(ra, galloc(load(rb), lim))
+    elif o < 35:
+        let x = load(rb)
+        let y = load(rc)
+        if y == 0: return trap(T_DIV, pc)
+        if y == -1 and x == (1 << 31): return trap(T_OVER, pc)
+        if o == 33: store(ra, x / y)
+        else: store(ra, x % y)
+    elif o == 36: gfree(load(ra), load(rb))
+    elif o == 37 or o == 38:
+        let ad = load(rb)
+        if (ad | (lim - ad - 2)) < 0: return trap(T_MEM, pc)
+        if o == 37: store(ra, load16(m + ad))
+        else: store16(m + ad, load(ra))
+    elif o == 45:                                        # (length 0 touches nothing: any address will do)
+        let to = load(ra)
+        let src = load(rb)
+        let len = load(rc)
+        if len < 0: return trap(T_MEM, pc)
+        if len > 0:
+            if (to | (lim - to - len)) < 0 or (src | (lim - src - len)) < 0: return trap(T_MEM, pc)
+            mem_copy(m + to, m + src, len)
+    elif o == 46:
+        let to = load(ra)
+        let len = load(rc)
+        if len < 0: return trap(T_MEM, pc)
+        if len > 0:
+            if (to | (lim - to - len)) < 0: return trap(T_MEM, pc)
+            mem_fill(m + to, load(rb), len)
+    elif o == 47:
+        let s1 = load(rb)
+        let s2 = load(rc)
+        if (s1 | (lim - s1 - 1)) < 0 or (s2 | (lim - s2 - 1)) < 0: return trap(T_MEM, pc)
+        store(ra, str_cmp(m + s1, m + s2))
+    elif o == 51:
+        let s1 = load(rb)
+        let s2 = load(rc)
+        let l1 = glen(s1, lim)
+        let l2 = glen(s2, lim)
+        if l1 < 0 or l2 < 0: return trap(T_MEM, pc)
+        let d = galloc(l1 + l2 + 1, lim)
+        if d >= 0:
+            mem_copy(m + d, m + s1, l1)
+            mem_copy(m + d + l1, m + s2, l2)
+            store8(m + d + l1 + l2, 0)
+        store(ra, d)
+    elif o == 50:
+        let k = digits(load(rb), VM_TXT)
+        let to = load(ra)
+        if (to | (lim - to - k - 1)) < 0: return trap(T_MEM, pc)
+        mem_copy(m + to, VM_TXT, k + 1)
+    elif o == 48:
+        if vm_buffered: put_line(VM_TXT, digits(load(ra), VM_TXT))
+        else: print(load(ra))
+    elif o == 49:
+        let s = load(ra)
+        if (s | (lim - s - 1)) < 0: return trap(T_MEM, pc)
+        if vm_buffered:
+            let k = 0                                    # (1 MB at most)
+            while k < 1048576 and load8(m + s + k) != 0:
+                k += 1
+                if s + k >= lim: return trap(T_MEM, pc)
+            put_line(m + s, k)
+        else: println(m + s)
+    elif o == 56: store(rc, host(load(at + 4), ra, pc))
+    elif o == 52:
+        let fd = load(ra)
+        let ad = load(rb)
+        let len = load(rc)
+        if fd < 1 or fd >= 19 or ad < 0 or len < 0 or its_file(fd) == 0: store(ra, -1)
+        elif len > 0 and ad > lim - len: return trap(T_MEM, pc)
+        elif fd == 1 and vm_buffered: store(ra, put(m + ad, len))
+        else:
+            flush()
+            store(ra, send(fd, m + ad, len))
+    elif o == 53:
+        let fd = load(ra)
+        let ad = load(rb)
+        let len = load(rc)
+        if fd == 1 or fd == 2 or fd < 0 or fd >= 19 or ad < 0 or len < 0 or its_file(fd) == 0:
+            store(ra, -1)
+        elif len > 0 and ad > lim - len: return trap(T_MEM, pc)
+        else:
+            if fd == 0: flush()
+            if fd == 0 and vm_inside: store(ra, given_bytes(m + ad, len))
+            else: store(ra, read(fd, m + ad, len))
+    elif o == 54:
+        let ad = load(rb)
+        let fd = -1
+        if ad >= 0 and ad < lim and (vm_inside == 0 or glen(ad, lim) >= 0):
+            fd = open(m + ad, load(rc))
+            if fd >= 19:                                 # (16 files open at most)
+                close(fd)
+                fd = -1
+        if fd >= 3: vm_opened = vm_opened | (1 << fd)
+        store(ra, fd)
+    elif o == 55:
+        let fd = load(ra)
+        if fd < 3 or fd >= 19 or its_file(fd) == 0: store(ra, -1)
+        else:
+            vm_opened = vm_opened & ~(1 << fd)
+            store(ra, close(fd))
+    elif o == 57: store(rc, -1)                          # cload: there is no C, so no C function
+    elif o == 58: return trap(T_C_CALL, pc)              # is found; and ccall fails
+    elif o == 59:                                        # EXTEND_I32: kept to its low bits, its sign
+        let bits = load(at + 4) & 63                     #   spread above them (imm + 256) or not
+        let x = load(rb)
+        if bits > 0 and bits < 32:
+            x = x << (32 - bits)
+            if load(at + 4) & 256: x = x >> (32 - bits)
+            else: x = x >>> (32 - bits)
+        store(ra, x)
+    elif o == 60 or o == 61:                             # UDIV_I32, UMOD_I32: the 32 bits unsigned
+        let y = load(rc)
+        if y == 0: return trap(T_DIV, pc)
+        let wide_x: i64 = i64(load(rb)) & 4294967295
+        let wide_y: i64 = i64(y) & 4294967295
+        if o == 60: store(ra, i32(wide_x / wide_y))
+        else: store(ra, i32(wide_x % wide_y))
+    elif o == 62:                                        # CMP_LT_U32: below, as unsigned numbers
+        if (load(rb) ^ (1 << 31)) < (load(rc) ^ (1 << 31)): store(ra, 1)
+        else: store(ra, 0)
+    else: return trap(T_OP, pc)
+    return 0
+
+# the float operations (64..)
+fn floats(o, w, at, pc, clb, cpb, lim):
+    let m = VM_HB
+    let fa = VM_FREGS + (((w >>> 8) & 255) << 3)
+    let fb = VM_FREGS + (((w >>> 16) & 255) << 3)
+    let fc = VM_FREGS + ((w >>> 24) << 3)
+    let slot = (w >>> 16) << 3
+    if o == 64: storef(fa, loadf(fb))
+    elif o == 65: storef(fa, loadf(fb) + loadf(fc))
+    elif o == 66: storef(fa, loadf(fb) - loadf(fc))
+    elif o == 67: storef(fa, loadf(fb) * loadf(fc))
+    elif o == 68: storef(fa, loadf(fb) / loadf(fc))
+    elif o == 69: storef(fa, f64(load(VM_REGS + (((w >>> 16) & 255) << 2))))
+    elif o == 70: store(VM_REGS + (((w >>> 8) & 255) << 2), i32(loadf(fb)))
+    elif o == 71 or o == 72:
+        let v = 0
+        if o == 71:
+            if loadf(fb) < loadf(fc): v = 1
+        elif loadf(fb) == loadf(fc): v = 1
+        store(VM_REGS + (((w >>> 8) & 255) << 2), v)
+    elif o == 77: storef(fa, loadf(clb + slot))
+    elif o == 78: storef(clb + slot, loadf(fa))
+    elif o == 79: storef(fa, loadf(cpb + slot))
+    elif o == 80: storef(cpb + slot, loadf(fa))
+    elif o == 81:
+        let v: f64 = loadf(fa)
+        if vm_buffered == 0: print(v)
+        elif v != v: put(VM_NAN, 4)
+        else:                                            # "%g", as the runtime's print
+            storef(VM_F8, v)
+            put_line(VM_TXT, hostcall(ASK_FORMAT_FLOAT, 103, 6, VM_F8, VM_TXT, 40))
+    elif o == 82: storef(fa, f32(loadf(fb)))
+    elif o == 83: storef(fa, f64(load64(VM_QREGS + (((w >>> 16) & 255) << 3))))  # I642F_F64
+    elif o == 84: store64(VM_QREGS + (((w >>> 8) & 255) << 3), i64(loadf(fb)))   # F2I_I64
+    elif o >= 85 and o <= 87: return float_runs(o, w, pc, lim)  # DOT_F64, ADD_SCALED_F64, EXP_F64
+    elif o >= 73 and o <= 76:
+        let ad = load(VM_REGS + (((w >>> 16) & 255) << 2))
+        if o == 73 or o == 75:
+            if (ad | (lim - ad - 4)) < 0: return trap(T_MEM, pc)
+            if o == 73: storef(fa, loadf32(m + ad))
+            else: storef32(m + ad, loadf(fa))
+        else:
+            if (ad | (lim - ad - 8)) < 0: return trap(T_MEM, pc)
+            if o == 74: storef(fa, loadf(m + ad))
+            else: storef(m + ad, loadf(fa))
+    else: return trap(T_OP, pc)
+    return 0
+
+# DOT_F64, ADD_SCALED_F64 and EXP_F64 (85, 86, 87): r[c] floats at r[a] and at r[b], each run inside
+# the program's memory -- else nothing is touched and the program fails, as it does for fewer than 0
+# (0 touches nothing: any address will do). DOT_F64 adds the products in eight lanes: while eight are
+# left, product i goes to lane i % 8, each lane starting from 0 and adding in order; then lanes k and
+# k + 4 are added (k from 0 to 3), those four as (0 + 2) + (1 + 3), and the products left over one
+# after another. Each sum and product takes its operands in the order the machine code does
+# (native/), so a NaN comes out with the same bits. ADD_SCALED_F64 and EXP_F64 go one float after
+# another: a run that overlaps the one it reads reads what was just written there, as the plain loop
+# would.
+fn float_runs(o, w, pc, lim):
+    let ad = load(VM_REGS + (((w >>> 8) & 255) << 2))
+    let bd = load(VM_REGS + (((w >>> 16) & 255) << 2))
+    let n = load(VM_REGS + ((w >>> 24) << 2))
+    let fa = VM_FREGS + (((w >>> 8) & 255) << 3)
+    if n < 0 or n > (lim >> 3): return trap(T_MEM, pc)
+    if n > 0:
+        let bytes = n << 3
+        if (ad | (lim - ad - bytes)) < 0 or (bd | (lim - bd - bytes)) < 0: return trap(T_MEM, pc)
+    let x = VM_HB + ad
+    let y = VM_HB + bd
+    if o == 87:                                          # EXP_F64
+        while n > 0:
+            storef(x, vm_exp(loadf(y)))
+            x += 8
+            y += 8
+            n -= 1
+        return 0
+    if o == 86:                                          # ADD_SCALED_F64
+        let by: f64 = loadf(fa)
+        while n > 0:
+            storef(x, loadf(x) + by * loadf(y))
+            x += 8
+            y += 8
+            n -= 1
+        return 0
+    let lanes = VM_LANES                                 # DOT_F64
+    mem_fill(lanes, 0, 64)
+    let groups = n >> 3
+    while groups > 0:
+        storef(lanes, loadf(lanes) + loadf(x) * loadf(y))
+        storef(lanes + 8, loadf(lanes + 8) + loadf(x + 8) * loadf(y + 8))
+        storef(lanes + 16, loadf(lanes + 16) + loadf(x + 16) * loadf(y + 16))
+        storef(lanes + 24, loadf(lanes + 24) + loadf(x + 24) * loadf(y + 24))
+        storef(lanes + 32, loadf(lanes + 32) + loadf(x + 32) * loadf(y + 32))
+        storef(lanes + 40, loadf(lanes + 40) + loadf(x + 40) * loadf(y + 40))
+        storef(lanes + 48, loadf(lanes + 48) + loadf(x + 48) * loadf(y + 48))
+        storef(lanes + 56, loadf(lanes + 56) + loadf(x + 56) * loadf(y + 56))
+        x += 64
+        y += 64
+        groups -= 1
+    let t0: f64 = loadf(lanes) + loadf(lanes + 32)
+    let t1: f64 = loadf(lanes + 8) + loadf(lanes + 40)
+    let t2: f64 = loadf(lanes + 16) + loadf(lanes + 48)
+    let t3: f64 = loadf(lanes + 24) + loadf(lanes + 56)
+    let dot: f64 = (t0 + t2) + (t1 + t3)
+    let left = n & 7
+    while left > 0:
+        dot = dot + loadf(x) * loadf(y)
+        x += 8
+        y += 8
+        left -= 1
+    storef(fa, dot)
+    return 0
+
+# e^v as EXP_F64 makes it (native/ takes the same steps, four floats at a time): above 709, infinity;
+# below -708, 0; else v = k ln 2 + r -- k the whole number nearest v / ln 2 (a half going away from
+# 0), ln 2 in two parts so that r keeps its digits -- e^r by its series to r^11 (to about 1e-15 of its
+# size), times 2^k written straight into the exponent's bits. A NaN comes out the NaN it went in as.
+fn vm_exp(v: f64) -> f64:
+    if v > 709.0:
+        store64(VM_EXP_BITS, i64(2146435072) << i64(32))          # (infinity)
+        return loadf(VM_EXP_BITS)
+    if v < -708.0: return 0.0
+    let y: f64 = v * 1.4426950408889634
+    let k = 0
+    if y >= 0.0: k = i32(y + 0.5)
+    else: k = 0 - i32(0.5 - y)
+    let r: f64 = v - f64(k) * 0.6931471803691238 - f64(k) * 0.00000000019082149292705877
+    let p: f64 = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666666666666666 + r * (0.041666666666666664 + r * (0.008333333333333333 + r * (0.001388888888888889 + r * (0.0001984126984126984 + r * (0.0000248015873015873 + r * (0.0000027557319223985893 + r * (0.0000002755731922398589 + r * 0.00000002505210838544172))))))))))
+    store64(VM_EXP_BITS, i64(k + 1023) << i64(52))
+    return p * loadf(VM_EXP_BITS)
+
+# the 64-bit operations (96..)
+fn wides(o, w, at, pc, clb, cpb, lim):
+    let m = VM_HB
+    let qa = VM_QREGS + (((w >>> 8) & 255) << 3)
+    let x64: i64 = load64(VM_QREGS + (((w >>> 16) & 255) << 3))
+    let y64: i64 = load64(VM_QREGS + ((w >>> 24) << 3))
+    let slot = (w >>> 16) << 3
+    let ra = VM_REGS + (((w >>> 8) & 255) << 2)
+    if o == 97: store64(qa, x64 + y64)
+    elif o == 96: store64(qa, i64(load(at + 4)))
+    elif o == 108: store64(qa, load64(clb + slot))
+    elif o == 109: store64(clb + slot, load64(qa))
+    elif o == 110: store64(qa, load64(cpb + slot))
+    elif o == 111: store64(cpb + slot, load64(qa))
+    elif o == 113: store64(qa, i64(load(VM_REGS + (((w >>> 16) & 255) << 2))))
+    elif o == 114: store(ra, i32(x64))
+    elif o == 112: store64(qa, (load64(qa) & ((i64(1) << i64(32)) - i64(1))) | (i64(load(at + 4)) << i64(32)))
+    elif o == 100: store64(qa, x64 - y64)
+    elif o == 101: store64(qa, x64 * y64)
+    elif o == 102: store64(qa, x64 & y64)
+    elif o == 103: store64(qa, x64 | y64)
+    elif o == 104: store64(qa, x64 ^ y64)
+    elif o == 98: store64(qa, x64 << (y64 & i64(63)))
+    elif o == 105: store64(qa, x64 >> (y64 & i64(63)))
+    elif o == 119: store64(qa, x64 >>> (y64 & i64(63)))
+    elif o == 115 or o == 116 or o == 120:
+        let v = 0
+        if o == 115:
+            if x64 < y64: v = 1
+        elif o == 116:
+            if x64 == y64: v = 1
+        elif (x64 ^ (i64(1) << i64(63))) < (y64 ^ (i64(1) << i64(63))): v = 1
+        store(ra, v)
+    elif o == 106 or o == 107:
+        if y64 == i64(0): return trap(T_DIV, pc)
+        if y64 == i64(-1) and x64 == (i64(1) << i64(63)): return trap(T_OVER, pc)
+        if o == 106: store64(qa, x64 / y64)
+        else: store64(qa, x64 % y64)
+    elif o == 121 or o == 122:
+        if y64 == i64(0): store64(qa, i64(0))
+        elif o == 121: store64(qa, udiv64(x64, y64))
+        else: store64(qa, umod64(x64, y64))
+    elif o == 99:
+        if vm_buffered: put_line(VM_TXT, digits64(load64(qa), VM_TXT))
+        else: print(load64(qa))
+    elif o == 117 or o == 118:
+        let ad = load(VM_REGS + (((w >>> 16) & 255) << 2))
+        if (ad | (lim - ad - 8)) < 0: return trap(T_MEM, pc)
+        if o == 117: store64(qa, load64(m + ad))
+        else: store64(m + ad, load64(qa))
+    elif o == 123:                                       # EXTEND_I64: as EXTEND_I32, of 64 bits
+        let bits = load(at + 4) & 127
+        let x: i64 = x64
+        if bits > 0 and bits < 64:
+            x = x << i64(64 - bits)
+            if load(at + 4) & 256: x = x >> i64(64 - bits)
+            else: x = x >>> i64(64 - bits)
+        store64(qa, x)
+    elif o == 124 or o == 125:                           # UDIV_I64, UMOD_I64: by 0, the program stops
+        if y64 == i64(0): return trap(T_DIV, pc)
+        if o == 124: store64(qa, udiv64(x64, y64))
+        else: store64(qa, umod64(x64, y64))
+    elif o == 126:                                       # PRINT_U64
+        let k = unsigned_digits64(load64(qa), VM_TXT)
+        store8(VM_TXT + k, 10)
+        if vm_buffered: put(VM_TXT, k + 1)
+        else: write(1, VM_TXT, k + 1)
+    else: return trap(T_OP, pc)
+    return 0
+
+# The run: every instruction goes through here.
+fn run(code, start):
+    let r = VM_REGS
+    let m = VM_HB                                        # program address 0
+    let lim = VM_HEAP_END - VM_HB                        # and the end of the program's memory
+    if VM_HEAP_LIMIT and VM_HEAP_LIMIT < lim: lim = VM_HEAP_LIMIT
+    let fb = VM_FB
+    let pc = start
+    let fsp = 0                                          # bytes of frames in use, from FB up
+    let cur = 0                                          # the current frame: return pc, the caller's
+    let clb = 0                                          # clb cpb cur -- then its locals (from clb)
+    let cpb = 0                                          # and its arguments (from cpb)
+    let depth = 0
+    while 1:
+        let at = code + pc * 8
+        let w = load(at)
+        let o = w & 255
+        let ra = r + ((w >> 6) & 1020)
+        let rb = r + ((w >> 14) & 1020)
+        pc += 1
+        if o < 12:
+            if o < 3:                                    # moves
+                if o == 0: store(ra, load(at + 4))
+                elif o == 1: store(ra, load(rb))
+                else: store(ra, load(rb) + load(at + 4))
+            elif o < 7:                                  # local and argument slots
+                let sb = clb
+                if o > 4: sb = cpb
+                let sa = sb + ((w >> 13) & 524280)
+                if o == 3 or o == 5: store(ra, load(sa))
+                else: store(sa, load(ra))
+            elif o < 9:                                  # globals (the slot checked at the start)
+                let ga = r + 5120 + ((w >> 14) & 262140)
+                if o == 7: store(ra, load(ga))
+                else: store(ga, load(ra))
+            elif o == 9:                                 # jumps
+                if load(ra) == 0: pc = load(at + 4)
+            elif o == 10:
+                if load(ra) != 0: pc = load(at + 4)
+            else: pc = load(at + 4)
+        elif o < 25:                                     # arithmetic
+            let x = load(rb)
+            let y = load(r + ((w >> 22) & 1020))
+            if o == 12: store(ra, x + y)
+            elif o == 13: store(ra, x & y)
+            elif o == 14:
+                if x == y: store(ra, 1)
+                else: store(ra, 0)
+            elif o == 15: store(ra, x ^ y)
+            elif o == 16: store(ra, x * y)
+            elif o == 17:
+                if x < y: store(ra, 1)
+                else: store(ra, 0)
+            elif o == 18: store(ra, x - y)
+            elif o == 19: store(ra, x | y)
+            elif o == 20: store(ra, x << (y & 31))
+            elif o == 21: store(ra, x >> (y & 31))
+            elif o == 22: store(ra, x >>> (y & 31))
+            else:                                        # compare, and jump when false
+                let t = 0
+                if o == 23:
+                    if x == y: t = 1
+                elif x < y: t = 1
+                store(ra, t)
+                if t == 0: pc = load(at + 4)
+        elif o < 29:                                     # memory
+            let ad = load(rb)
+            let k = 4
+            if o == 25 or o == 28: k = 1
+            if (ad | (lim - ad - k)) < 0: return trap(T_MEM, pc)
+            if o == 25: store(ra, load8(m + ad))
+            elif o == 26: store(ra, load(m + ad))
+            elif o == 27: store(m + ad, load(ra))
+            else: store8(m + ad, load(ra))
+        elif o < 33:                                     # calls
+            if o == 30:
+                if depth == 0: return trap(T_FRAME, pc)
+                let back = cur
+                pc = load(back)
+                clb = load(back + 4)
+                cpb = load(back + 8)
+                cur = load(back + 12)
+                fsp = back - fb
+                depth -= 1
+            elif o == 32: return 0
+            else:
+                let to = load(at + 4)
+                let hi = (w >> 16) & 65280               # the frame's size: a, and c or imm above it
+                if o == 31:                              # through a value: the target in register c
+                    to = load(r + ((w >> 22) & 1020))
+                    hi = load(at + 4) << 8
+                    if to <= 0 or to >= VM_N: return trap(T_PC, pc)
+                let nloc = ((w >> 8) & 255) + hi
+                let size = (nloc + ((w >> 16) & 255)) * 8
+                if depth >= VM_MAX_DEPTH or fsp + size + 16 > VM_FRAMES: return trap(T_FRAME, pc)
+                let base = fb + fsp
+                store(base, pc)
+                store(base + 4, clb)
+                store(base + 8, cpb)
+                store(base + 12, cur)
+                mem_fill(base + 16, 0, size)
+                cur = base
+                clb = base + 16
+                cpb = clb + nloc * 8
+                fsp += size + 16
+                depth += 1
+                pc = to
+        elif o < 64:
+            if o < 39 or o > 44:
+                other(o, w, at, pc, lim)
+                if vm_ended: return 0                    # (it ended the program, inside another)
+            elif o == 39:                                # try: its landing place, and this depth
+                if vm_nh >= 256: return trap(T_TRY, pc)
+                store(VM_HANDLERS + vm_nh * 8, load(at + 4))
+                store(VM_HANDLERS + vm_nh * 8 + 4, depth)
+                vm_nh += 1
+            elif o == 40:
+                if vm_nh > 0: vm_nh -= 1
+            elif o == 42: store(ra, vm_thrown)
+            else:                                        # throw, setjmp, longjmp
+                let want = depth
+                let land = pc
+                if o == 41:
+                    if vm_nh <= 0: return trap(T_THROW, pc)
+                    vm_thrown = load(ra)
+                    vm_nh -= 1
+                    want = load(VM_HANDLERS + vm_nh * 8 + 4)
+                    land = load(VM_HANDLERS + vm_nh * 8)
+                else:
+                    let jb = load(rb)
+                    if o == 44: jb = load(ra)
+                    if (jb | (lim - jb - 12)) < 0: return trap(T_MEM, pc)
+                    if o == 43:
+                        store(m + jb, pc)
+                        store(m + jb + 4, depth)
+                        store(m + jb + 8, (w >> 8) & 255)
+                        store(ra, 0)
+                    else:
+                        land = load(m + jb)
+                        want = load(m + jb + 4)
+                        let v = load(rb)
+                        if v == 0: v = 1
+                        store(r + ((load(m + jb + 8) & 255) << 2), v)
+                        if land < 0 or land > VM_N: land = VM_N
+                while depth > want:
+                    let up = cur
+                    clb = load(up + 4)
+                    cpb = load(up + 8)
+                    cur = load(up + 12)
+                    fsp = up - fb
+                    depth -= 1
+                pc = land
+        elif o < 96:
+            floats(o, w, at, pc, clb, cpb, lim)
+            if vm_ended: return 0
+        elif o < 128:
+            wides(o, w, at, pc, clb, cpb, lim)
+            if vm_ended: return 0
+        elif o == 255: return trap(T_PC, pc)
+        elif o == 253: return trap(T_MEM, pc)
+        else: return trap(T_OP, pc)
+
+# ---- a program made ready: its operations numbered as the run knows them ------------------------
+# the operations of a list like ORDER go in MAP, numbered from `base` on
+fn number(list, base):
+    let i = 0
+    while i < len(list):
+        store8(VM_MAP + load(list + i * 4), base + i)
+        i += 1
+    return base + i
+
+fn number_all():
+    mem_fill(VM_MAP, 254, 256)
+    let next = number(VM_ORDER_1, 0)                             # 0..32: the busiest, tested inline
+    next = number(VM_ORDER_2, next)
+    next = number(VM_ORDER_3, next)
+    next = number(VM_ORDER_4, next)
+    next = number(VM_ORDER_I32_1, 33)                            # 33..: the other 32-bit ones
+    next = number(VM_ORDER_I32_2, next)
+    next = number(VM_ORDER_I32_3, next)
+    next = number(VM_ORDER_I32_4, next)
+    next = number(VM_ORDER_F64_1, 64)                            # 64..: the float ones
+    next = number(VM_ORDER_F64_2, next)
+    next = number(VM_ORDER_F64_3, next)
+    next = number(VM_ORDER_F64_4, next)
+    next = number(VM_ORDER_I64_1, 96)                            # 96..: the 64-bit ones
+    next = number(VM_ORDER_I64_2, next)
+    next = number(VM_ORDER_I64_3, next)
+    next = number(VM_ORDER_I64_4, next)
+    number(VM_ORDER_I64_5, next)
+    return 0
+
+number_all()
+
+# n instructions at `code`, checked and renumbered for the run in place, and the end marked after
+# them (8 bytes more): a jump out of the code lands on the end, and a global slot out of range
+# fails when it is run
+pub fn vm_prepare(code, n):
+    let pc = 0
+    while pc < n:
+        let op = load8(code + pc * 8) & 255
+        if op == JMP or op == JNZ or op == JZ or op == TRY or op == CALL or op == CMP_EQ_I32_JZ or op == CMP_LT_I32_JZ:
+            let to = load(code + pc * 8 + 4)
+            if to < 0 or to > n: store(code + pc * 8 + 4, n)
+        let renumbered = load8(VM_MAP + op) & 255
+        if op == LD_GLOBAL or op == ST_GLOBAL:
+            if (load(code + pc * 8) >>> 16) >= 4096: renumbered = 253
+        store8(code + pc * 8, renumbered)
+        pc += 1
+    store(code + n * 8, 255)
+    store(code + n * 8 + 4, 0)
+    return code
+
+pub fn vm_asked(image, at):        # a limit an image's header gives: 0 (none), or a power of two
+    let bits = load8(image + at) & 255
+    if bits > 30: bits = 30
+    if bits == 0: return 0
+    return 1 << bits
+
+# for vm/nitropzvm.nitropz, the program the process is: what it says, how it ends, and its
+# program's run
+pub fn vm_say(fd, text): return say(fd, text)
+pub fn vm_quit(status): return quit(status)
+pub fn vm_start(code, start):
+    run(code, start)
+    return quit(load(VM_REGS))                       # HALT: the program's register 0 is its status
+
+# ---- a machine run inside another -----------------------------------------------------------------
+# A machine is these globals. One run while another waits in a host call (run_inside) has the one
+# waiting saved at the start of its memory and put back after, so that it goes on as it was; the
+# two share only what no run keeps: the operations' numbers, the scratch for digits, and the output
+# buffer, emptied before the one inside starts.
+let MACHINE_BYTES = 152              # (38 words)
+
+fn save_machine(at):
+    store(at + 0, VM_HEAP_END)
+    store(at + 4, VM_FREE_CAP)
+    store(at + 8, VM_FRAMES)
+    store(at + 12, VM_MAX_DEPTH)
+    store(at + 16, VM_HEAP_LIMIT)
+    store(at + 20, VM_REGS)
+    store(at + 24, VM_FREGS)
+    store(at + 28, VM_QREGS)
+    store(at + 32, VM_GLOBALS)
+    store(at + 36, VM_HANDLERS)
+    store(at + 40, vm_nout)
+    store(at + 44, vm_buffered)
+    store(at + 48, VM_R)
+    store(at + 52, VM_FL)
+    store(at + 56, VM_FB)
+    store(at + 60, VM_HB)
+    store(at + 64, VM_N)
+    store(at + 68, vm_bump)
+    store(at + 72, vm_nfree)
+    store(at + 76, vm_maxfree)
+    store(at + 80, vm_maxoff)
+    store(at + 84, vm_told)
+    store(at + 88, vm_nh)
+    store(at + 92, vm_thrown)
+    store(at + 96, vm_inside)
+    store(at + 100, vm_ended)
+    store(at + 104, VM_ARGUMENTS)
+    store(at + 108, VM_INPUT)
+    store(at + 112, vm_input_at)
+    store(at + 116, vm_input_length)
+    store(at + 120, VM_OUTPUT)
+    store(at + 124, VM_ERRORS)
+    store(at + 128, vm_opened)
+    store(at + 132, vm_status)
+    store(at + 136, vm_failing)
+    store(at + 140, VM_RANDOM)
+    store(at + 144, vm_random_started)
+    store(at + 148, vm_started_at)
+    return 0
+
+fn restore_machine(at):
+    VM_HEAP_END = load(at + 0)
+    VM_FREE_CAP = load(at + 4)
+    VM_FRAMES = load(at + 8)
+    VM_MAX_DEPTH = load(at + 12)
+    VM_HEAP_LIMIT = load(at + 16)
+    VM_REGS = load(at + 20)
+    VM_FREGS = load(at + 24)
+    VM_QREGS = load(at + 28)
+    VM_GLOBALS = load(at + 32)
+    VM_HANDLERS = load(at + 36)
+    vm_nout = load(at + 40)
+    vm_buffered = load(at + 44)
+    VM_R = load(at + 48)
+    VM_FL = load(at + 52)
+    VM_FB = load(at + 56)
+    VM_HB = load(at + 60)
+    VM_N = load(at + 64)
+    vm_bump = load(at + 68)
+    vm_nfree = load(at + 72)
+    vm_maxfree = load(at + 76)
+    vm_maxoff = load(at + 80)
+    vm_told = load(at + 84)
+    vm_nh = load(at + 88)
+    vm_thrown = load(at + 92)
+    vm_inside = load(at + 96)
+    vm_ended = load(at + 100)
+    VM_ARGUMENTS = load(at + 104)
+    VM_INPUT = load(at + 108)
+    vm_input_at = load(at + 112)
+    vm_input_length = load(at + 116)
+    VM_OUTPUT = load(at + 120)
+    VM_ERRORS = load(at + 124)
+    vm_opened = load(at + 128)
+    vm_status = load(at + 132)
+    vm_failing = load(at + 136)
+    VM_RANDOM = load(at + 140)
+    vm_random_started = load(at + 144)
+    vm_started_at = load(at + 148)
+    return 0
+
+# `loaded` run to its end in the memory from `at` to `end` -- the machine waiting first, then this
+# one's registers, globals, try blocks and random numbers' state, then its freed blocks' table, its
+# frames (an eighth) and its heap -- given `arguments` (a list of texts, or 0) and `input` (a text,
+# or 0), what it prints and says went wrong kept in `output` and `errors`. After it, the first two
+# words at `at`: the status it ended with, and 1 if it failed. The status.
+fn run_inside(loaded, at, end, arguments, input, output, errors):
+    flush()                                          # (the one waiting: what it printed, out first)
+    save_machine(at)
+    let own = at + MACHINE_BYTES
+    mem_fill(own, 0, 23568)
+    VM_REGS = own
+    VM_FREGS = own + 1024
+    VM_QREGS = own + 3072
+    VM_GLOBALS = own + 5120
+    VM_HANDLERS = own + 21504
+    VM_RANDOM = own + 23552
+    let base = (own + 23568 + 7) & -8
+    let size = end - base
+    VM_N = load(loaded + 4)
+    VM_HEAP_LIMIT = load(loaded + 12)
+    VM_FRAMES = size / 8
+    if load(loaded + 16) and load(loaded + 16) < VM_FRAMES: VM_FRAMES = load(loaded + 16)
+    VM_MAX_DEPTH = 65536
+    if load(loaded + 20) and load(loaded + 20) < VM_MAX_DEPTH: VM_MAX_DEPTH = load(loaded + 20)
+    VM_FREE_CAP = size / 256
+    VM_R = base
+    VM_FL = base
+    VM_FB = VM_FL + VM_FREE_CAP * 8
+    VM_HB = VM_FB + VM_FRAMES
+    VM_HEAP_END = end
+    vm_bump = 0
+    vm_nfree = 0
+    vm_maxfree = 0
+    vm_maxoff = 0
+    vm_told = 0
+    vm_nh = 0
+    vm_thrown = 0
+    vm_nout = 0
+    vm_buffered = 1
+    store(output, 0)
+    store(errors, 0)
+    VM_OUTPUT = output
+    VM_ERRORS = errors
+    VM_ARGUMENTS = arguments
+    VM_INPUT = input
+    vm_input_length = 0
+    if input: vm_input_length = size_of(input)
+    vm_input_at = 0
+    vm_opened = 0
+    vm_random_started = 0
+    vm_started_at = hostcall(ASK_MILLISECONDS)
+    vm_failing = 0
+    vm_ended = 0
+    vm_inside = 1
+    run(load(loaded), load(loaded + 8))
+    if vm_ended == 0: quit(load(VM_REGS))            # HALT: its register 0 is its status
+    let status = vm_status
+    let failed = vm_failing
+    restore_machine(at)
+    store(at, status)
+    store(at + 4, failed)
+    return status
+
+# ASK_RUN_IMAGE: an image in the program's memory, run by this machine inside it -- given a list of
+# texts for its arguments and a text for its input (either 0: none), in the block of memory named
+# (1 MB at least), what it prints and says went wrong kept where named (each a count, the room, the
+# bytes). 1 when it ran, its status and whether it failed then the block's first two words; 0 when
+# it is not an image, or something named is not in the program's memory.
+fn run_image(p):
+    let m = VM_HB
+    let image = load(p)
+    let length = load(p + 4)
+    let arguments = load(p + 8)
+    let input = load(p + 12)
+    let block = load(p + 16)
+    let size = load(p + 20)
+    let output = load(p + 24)
+    let errors = load(p + 28)
+    if room_outside(image, length) or room_outside(block, size) or size < 1048576: return 0
+    if room_outside(output, 8) or room_outside(errors, 8): return 0
+    if room_outside(output, load(m + output + 4) + 9) or room_outside(errors, load(m + errors + 4) + 9): return 0
+    if input and text_outside(input): return 0
+    if length < 24 or load(m + image) != 1381255502 or load(m + image + 4) != 5918799: return 0
+    let n = load(m + image + 12)
+    if n < 1 or n > 8388608 or length < 24 + n * 8: return 0
+    let at = m + block                               # the block: its arguments, as this machine's
+    let list = 0                                     #   addresses, then its code, made ready
+    if arguments:
+        if room_outside(arguments - 4, 4): return 0
+        let count = load(m + arguments - 4)
+        if count < 0 or count > 4096 or room_outside(arguments, count * 4): return 0
+        store(at, count)
+        list = at + 4
+        let i = 0
+        while i < count:
+            let text = load(m + arguments + i * 4)
+            if text_outside(text): return 0
+            store(list + i * 4, m + text)
+            i += 1
+        at = list + count * 4
+    let code = (at + 7) & -8
+    if code + n * 8 + 40 + 1048576 > m + block + size: return 0
+    mem_copy(code, m + image + 24, n * 8)
+    vm_prepare(code, n)
+    let loaded = code + n * 8 + 8
+    store(loaded, code)
+    store(loaded + 4, n)
+    let start = load(m + image + 16)
+    if start < 0 or start > n: start = n
+    store(loaded + 8, start)
+    store(loaded + 12, vm_asked(m + image, 20))
+    store(loaded + 16, vm_asked(m + image, 21))
+    store(loaded + 20, vm_asked(m + image, 22))
+    let own = loaded + 32
+    let input_at = 0
+    if input: input_at = m + input
+    let status = run_inside(loaded, own, m + block + size, list, input_at, m + output, m + errors)
+    store(m + block, status)
+    store(m + block + 4, load(own + 4))
+    return 1
+
+# ---- a program run inside another ----------------------------------------------------------------
+# vm_load(image, length): an image a compiler wrote, held in memory, made ready to run -- its code,
+# how many instructions, the first, the three limits its header asks for, and the image and its
+# length, 32 bytes -- or 0 when it is not an image
+pub fn vm_load(image, length):
+    if length < 24 or load(image) != 1381255502 or load(image + 4) != 5918799: return 0
+    let n = load(image + 12)
+    if n < 1 or n > 8388608 or length < 24 + n * 8: return 0
+    let loaded = alloc(32)
+    store(loaded, alloc(n * 8 + 8))
+    mem_copy(load(loaded), image + 24, n * 8)
+    vm_prepare(load(loaded), n)
+    store(loaded + 24, alloc(length))                # (the image itself too, for a machine this
+    mem_copy(load(loaded + 24), image, length)       #   program runs on to run it)
+    store(loaded + 28, length)
+    store(loaded + 4, n)
+    let start = load(image + 16)
+    if start < 0 or start > n: start = n
+    store(loaded + 8, start)
+    store(loaded + 12, vm_asked(image, 20))
+    store(loaded + 16, vm_asked(image, 21))
+    store(loaded + 20, vm_asked(image, 22))
+    return loaded
+
+# vm_run(loaded, arguments, input): the loaded program run to its end, given the arguments (a list
+# of texts, or 0) and the input (a text, or 0), in memory of its own (vm_set_memory) -- by the
+# machine this program itself runs on, when that one can (ASK_RUN_IMAGE: at its speed, not this
+# one's), else here: the status it ended with, 1 when it failed (vm_errors says how). What it
+# printed is vm_output until the next run.
+pub fn vm_run(loaded, arguments, input):
+    if VM_MEMORY == 0: VM_MEMORY = alloc(vm_memory_size)
+    rooms_ready()
+    if host_runs_images() == 0 or hostcall(ASK_RUN_IMAGE, load(loaded + 24), load(loaded + 28), arguments, input, VM_MEMORY, vm_memory_size, VM_OUTPUT, VM_ERRORS) != 1:
+        run_inside(loaded, VM_MEMORY, VM_MEMORY + vm_memory_size, arguments, input, VM_OUTPUT, VM_ERRORS)
+    vm_last_failed = load(VM_MEMORY + 4)
+    return load(VM_MEMORY)
+
+let vm_host_runs = -1                # can the machine this program runs on run an image? (-1: not
+let vm_last_failed = 0               #   asked yet) and did the last program run fail?
+
+fn host_runs_images():               # (one that can says 0 of no image; one that cannot, -1)
+    if vm_host_runs < 0:
+        vm_host_runs = 0
+        if hostcall(ASK_RUN_IMAGE, 0, 0, 0, 0, 0, 0, 0, 0) == 0: vm_host_runs = 1
+    return vm_host_runs
+
+pub fn vm_failed(): return vm_last_failed                               # did it fail?
+pub fn vm_output(): return rooms_ready() + VM_OUTPUT + 8                # what it printed, a text,
+pub fn vm_output_length(): return rooms_ready() + load(VM_OUTPUT)       #   and how long
+pub fn vm_errors(): return rooms_ready() + VM_ERRORS + 8                # what it said went wrong
+pub fn vm_errors_length(): return rooms_ready() + load(VM_ERRORS)
+
+fn rooms_ready():
+    if VM_OUTPUT == 0: vm_set_rooms(1048576, 65536)
+    return 0
+
+pub fn vm_unload(loaded):          # a loaded program's memory, given back
+    dealloc(load(loaded), load(loaded + 4) * 8 + 8)
+    dealloc(load(loaded + 24), load(loaded + 28))
+    dealloc(loaded, 32)
+    return 0
+
+# how much of a program's output, and of what it says went wrong, is kept (1 MB and 64 KB, unless
+# this says otherwise); what does not fit is left out. -1 while one is running.
+pub fn vm_set_rooms(output, errors):
+    if vm_inside or output < 0 or errors < 0: return -1
+    VM_OUTPUT = alloc(output + 9)
+    store(VM_OUTPUT + 4, output)
+    VM_ERRORS = alloc(errors + 9)
+    store(VM_ERRORS + 4, errors)
+    return 0
+
+# how much memory a program run inside this one has: 16 MB unless this says otherwise, 1 MB at least
+pub fn vm_set_memory(bytes):
+    if vm_inside or bytes < 1048576: return -1
+    if VM_MEMORY: dealloc(VM_MEMORY, vm_memory_size)
+    VM_MEMORY = 0
+    vm_memory_size = bytes & -8
+    return 0

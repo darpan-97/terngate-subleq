@@ -1,0 +1,45 @@
+# chances.nitropz MODEL TEXT -- the model reads TEXT a byte at a time (at most its view: CONTEXT bytes), and
+# after each byte says every next byte's chance as its bits: a line a position, each chance as two whole
+# numbers, its low 32 bits and its high 32. What subleq/page_check.js holds the playground's JavaScript
+# to, bit for bit.
+import std
+import std_io
+import fs
+import os
+import model
+import engine
+
+let LINE = alloc(16384)
+let LINE_N = 0
+
+fn put(text):
+    let n = slen(text)
+    mem_copy(LINE + LINE_N, text, n)
+    LINE_N += n
+
+fn main():
+    let model_path = alloc(4096)
+    let text_path = alloc(4096)
+    if os_arg(0, model_path, 4096) <= 0 or os_arg(1, text_path, 4096) <= 0:
+        put("chances MODEL TEXT\n")
+        write(2, LINE, LINE_N)
+        return 2
+    if engine_load(model_path) == 0: return 2
+    let n = fs_size(text_path)
+    let text = fs_read_file(text_path)
+    if n > CONTEXT: n = CONTEXT
+    let pos = 0
+    while pos < n:
+        engine_step(load8(text + pos) & 255, pos)
+        LINE_N = 0
+        let v = 0
+        while v < VOCAB:
+            put(str(load(CHANCES + v * 8)))
+            put(" ")
+            put(str(load(CHANCES + v * 8 + 4)))
+            put(" ")
+            v += 1
+        store8(LINE + LINE_N, 10)
+        write(1, LINE, LINE_N + 1)
+        pos += 1
+    return 0

@@ -6,9 +6,11 @@
 # back, and the 4 products kept back, then the same numbers of the kinds it was taught, and says how
 # many run right. "check": 120 sums, 16 products and 60 words of the kinds it was taught, from seed 7,
 # and the count right last: to choose among saves by. "live QUESTION": one program, written as you
-# watch, then run. The judge is checked first: right programs judged right, and four broken ones (a
-# line changed, a jump lost, a letter changed, a loop that never ends) judged wrong. MODEL is
-# models/35k_subleq.tlm2 unless said.
+# watch, then run. "export [FILE]": twelve programs written, judged, and run on the gate machine a step
+# at a time, every step a row, as a JavaScript file (out/subleq_data.js unless said): what
+# subleq/page_check.js holds the playground's JavaScript to. The judge is checked first: right programs
+# judged right, and four broken ones (a line changed, a jump lost, a letter changed, a loop that never
+# ends) judged wrong. MODEL is models/35k_subleq.tlm2 unless said.
 import std
 import std_io
 import std_fmt
@@ -112,7 +114,7 @@ fn wp_starts(q, word):
 # read by position: anything else would be cut to fit and judged as cut ("a*b+c" as "a*b"), so it is refused
 pub fn wp_askable(q):
     let n = slen(q)
-    if n < 10 or load8(q + n - 1) != 58: return 0
+    if n < 9 or load8(q + n - 1) != 58: return 0           # ("prog r=a:", one part, is the shortest)
     if wp_starts(q, "prog print "):
         if n - 12 < 1 or n - 12 > 8: return 0
         let i = 11
@@ -137,7 +139,7 @@ pub fn wp_askable(q):
         i += 1
     return parts >= 1 and parts <= 4 and want_letter == 0
 
-# ---- export: programs the model writes, and every step the gate machine takes, for docs/subleq.html ----
+# ---- export: programs the model writes, and every step the gate machine takes, for subleq/page_check.js ----
 let WX_TASKS = ["prog r=a+b:", "prog r=e-a:", "prog r=c-d-e+b:", "prog r=a+b+c+d:", "prog r=d*b:", "prog r=c*a:", "prog r=e*b:", "prog print hi:", "prog print gate:", "prog print subleq:", "prog print ternary:", "prog print computer:"]
 let WX_INPUTS = [3, 5, 7, 11, 13]                # a to e
 
@@ -263,7 +265,7 @@ fn main():
         return 1
     if mode == 3:
         let path = alloc(4096)
-        if os_arg(first + 1, path, 4096) <= 0: path = "docs/subleq_data.js"
+        if os_arg(first + 1, path, 4096) <= 0: path = "out/subleq_data.js"
         return wx_export(path)
     if mode == 2:
         let question = alloc(256)

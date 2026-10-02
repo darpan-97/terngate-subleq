@@ -9,7 +9,13 @@
 #   4. the images in images/ are what the source compiles to now, byte for byte, and the one that writes
 #      programs, run by nitropz's VM, writes the same program as the executable;
 #   5. the binary files -- nitropz/bin, images, models -- are the ones SHA256SUMS lists. After changing
-#      one on purpose: sha256sum -b nitropz/bin/* images/* models/* > SHA256SUMS
+#      one on purpose: sha256sum -b nitropz/bin/* images/* models/* > SHA256SUMS;
+#   6. the playground's two models, docs/program_model.js and docs/gate_model.js, are the model files,
+#      byte for byte. After changing a model: its first line kept, its second remade by
+#      printf 'window.PROGRAM_MODEL = "%s";\n' "$(base64 -w0 models/35k_subleq.tlm2)" (GATE_MODEL, 35k_gates);
+#   7. the playground's JavaScript gives every chance the nitropz engine gives, bit for bit (out/chances),
+#      and writes and runs what the nitropz programs do (subleq/page_check.js), when node is installed;
+#      skipped, and said so, when it is not.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE"
@@ -47,6 +53,19 @@ else fail "the images: run by the VM, not the same program as the executable (ou
 if sha256sum -c --quiet SHA256SUMS > out/check_sums.txt 2>&1; then
   pass "the binary files: all $(grep -c . SHA256SUMS) as SHA256SUMS lists them"
 else fail "the binary files, not as SHA256SUMS lists them: $(tr -d '\r' < out/check_sums.txt | tr '\n' ' ')"; fi
+
+same=0
+for m in "program_model PROGRAM_MODEL 35k_subleq.tlm2" "gate_model GATE_MODEL 35k_gates.tlm2"; do
+  set -- $m
+  sed -n "s/^window\.$2 = \"\(.*\)\";\$/\1/p" "docs/$1.js" | base64 -d 2> /dev/null | cmp -s - "models/$3" && same=$((same + 1))
+done
+if [ $same -eq 2 ]; then pass "the playground's models: docs/program_model.js and docs/gate_model.js are the two model files, byte for byte"
+else fail "the playground's models: $same of 2 are their model files (remake them as the top of check.sh says)"; fi
+
+if command -v node > /dev/null 2>&1; then
+  if node subleq/page_check.js > out/check_page.txt 2>&1; then pass "the playground's JavaScript: $(tail -n 1 out/check_page.txt)"
+  else fail "the playground's JavaScript: $(tr '\n' ' ' < out/check_page.txt)"; fi
+else echo "SKIP  the playground's JavaScript: no node here to run subleq/page_check.js"; fi
 
 echo
 [ $fails -eq 0 ] && { echo "all passed"; exit 0; }

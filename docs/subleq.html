@@ -2,227 +2,501 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>SUBLEQ Playground</title>
-<meta name="description" content="A 15 KB model writes a SUBLEQ program; it runs, step by step, on a one-instruction computer made of logic gates a model learned.">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SUBLEQ playground</title>
+<meta name="description" content="Two tiny transformers run in your browser: one writes the logic gates a one-instruction computer is built from, the other writes programs for it.">
 <style>
-  :root{
-    color-scheme:light;
-    --bg:#f7f5f1; --panel:#ffffff; --ink:#1a1c20; --ink-soft:#4a4e57; --muted:#8a8f9a;
-    --line:#e4e0d8; --line-strong:#d3cec3;
-    --teal:#12a08c; --teal-ink:#053c34; --teal-wash:#dff2ee;
-    --amber:#c67f22; --amber-wash:#f5e6cf;
-    --shadow:0 1px 2px rgba(20,22,28,.04),0 8px 30px rgba(20,22,28,.06);
-    --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,"Times New Roman",serif;
-    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-    --mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,Consolas,monospace;
+  :root {
+    --bg: #ffffff; --ink: #1f1f1f; --soft: #666a70; --rule: #e1e1e1; --field: #f4f4f4;
+    --mark: #fff0b3; --link: #0b57d0;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
   }
-  @media (prefers-color-scheme:dark){
-    :root{
-      color-scheme:dark;
-      --bg:#0e1013; --panel:#171a20; --ink:#e9e7e1; --ink-soft:#b3b7c0; --muted:#6c7280;
-      --line:#242832; --line-strong:#333846;
-      --teal:#2fb8a6; --teal-ink:#03110e; --teal-wash:#123029;
-      --amber:#dc9a3c; --amber-wash:#2a2113;
-      --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 34px rgba(0,0,0,.35);
-    }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #17181a; --ink: #e6e6e6; --soft: #9a9ea5; --rule: #34363a; --field: #222427; --mark: #4a3f17; --link: #8ab4f8; }
   }
-  *{box-sizing:border-box}
-  html,body{margin:0}
-  body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased}
-  .wrap{padding-inline:clamp(16px,5vw,48px);padding-block:clamp(24px,5vw,56px)}
-  .col{max-width:1060px;margin:0 auto;display:flex;flex-direction:column;gap:28px}
-  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--teal);font-weight:600;margin:0 0 12px}
-  h1{font-family:var(--serif);font-weight:600;letter-spacing:-.01em;line-height:1.08;font-size:clamp(28px,4.6vw,46px);margin:0 0 14px;text-wrap:balance}
-  h1 em{font-style:italic;color:var(--ink-soft)}
-  .dek{font-size:clamp(16px,2vw,18px);color:var(--ink-soft);max-width:68ch;margin:0}
-  .kicker{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 8px}
-  .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:clamp(14px,2.6vw,22px);min-width:0}
-  .tasks{display:flex;flex-wrap:wrap;gap:8px}
-  .tasks button{font-family:var(--mono);font-size:13px;padding:6px 10px;border-radius:8px;border:1px solid var(--line-strong);background:var(--bg);color:var(--ink);cursor:pointer}
-  .tasks button[aria-pressed="true"]{background:var(--teal);border-color:var(--teal);color:var(--teal-ink);font-weight:600}
-  .tasks .ok{color:var(--teal);margin-left:4px}
-  .tasks button[aria-pressed="true"] .ok{color:var(--teal-ink)}
-  .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:20px}
-  @media (max-width:820px){.grid{grid-template-columns:minmax(0,1fr)}}
-  pre{margin:0;font-family:var(--mono);font-size:13.5px;line-height:1.7;overflow-x:auto}
-  .line{display:block;padding:0 8px;border-radius:6px;white-space:pre}
-  .line .at{color:var(--muted);display:inline-block;width:3.2em}
-  .line.now{background:var(--amber-wash);box-shadow:inset 3px 0 0 var(--amber)}
-  details{margin-top:14px;font-size:13px;color:var(--ink-soft)}
-  details pre{margin-top:8px;color:var(--ink-soft);font-size:12.5px;line-height:1.6}
-  .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
-  .controls button{font-family:var(--sans);font-size:14px;font-weight:600;padding:8px 13px;border-radius:8px;border:1px solid var(--line-strong);background:var(--panel);color:var(--ink);cursor:pointer}
-  .controls button.primary{background:var(--teal);border-color:var(--teal);color:var(--teal-ink)}
-  .controls button:disabled{opacity:.45;cursor:default}
-  .controls select{font-family:var(--sans);font-size:13px;padding:7px 8px;border-radius:8px;border:1px solid var(--line-strong);background:var(--panel);color:var(--ink)}
-  button:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid var(--teal);outline-offset:2px}
-  .status{font-family:var(--mono);font-size:13px;color:var(--muted);margin-left:auto}
-  .say{font-size:15px;min-height:3.2em;margin:0 0 14px;padding:10px 12px;border-radius:10px;background:var(--bg);border:1px solid var(--line)}
-  .say b{font-family:var(--mono);font-weight:600}
-  .cells{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:8px;margin-bottom:14px}
-  .cell{border:1px solid var(--line);border-radius:9px;padding:6px 8px;background:var(--panel);transition:background .25s,border-color .25s}
-  .cell .name{font-family:var(--mono);font-size:12px;color:var(--muted)}
-  .cell .val{font-family:var(--mono);font-size:17px;font-weight:600}
-  .cell.input .name{color:var(--teal)}
-  .cell.hit{background:var(--amber-wash);border-color:var(--amber)}
-  .out{font-family:var(--mono);font-size:16px;padding:10px 12px;border-radius:10px;border:1px dashed var(--line-strong)}
-  .out .label{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:2px;font-family:var(--mono)}
-  .rule{color:var(--ink-soft);font-size:14px;max-width:80ch}
-  .rule code{font-family:var(--mono);font-size:13px}
-  a{color:var(--teal)}
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body { font: 15px/1.45 var(--sans); }
+  main { max-width: 1080px; margin: 0 auto; padding: 18px 24px 8px; }
+  .top { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 4px; }
+  .top a { font-size: 14px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0; }
+  h2 { font-size: 15px; font-weight: 600; margin: 0; }
+  h3 { font-size: 15px; font-weight: 600; margin: 0; }
+  p { margin: 0; }
+  a { color: var(--link); }
+  code { font-family: var(--mono); font-size: 13px; }
+  .intro { color: var(--soft); }
+
+  button, input, select { font: inherit; font-size: 14px; color: var(--ink); background: var(--bg);
+    border: 1px solid var(--rule); border-radius: 4px; }
+  button { padding: 4px 10px; cursor: pointer; }
+  button:hover:not(:disabled) { background: var(--field); }
+  button:disabled { color: var(--soft); cursor: default; opacity: .6; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+
+  .tabs { display: flex; gap: 22px; margin-top: 14px; border-bottom: 1px solid var(--rule); }
+  .tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 6px 0; margin-bottom: -1px;
+    background: none; color: var(--soft); font-size: 15px; }
+  .tabs button:hover:not(:disabled) { background: none; color: var(--ink); }
+  .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); font-weight: 600; }
+
+  .tasks { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 14px; }
+  .tasks .label { color: var(--soft); margin-right: 2px; }
+  #examples { display: contents; }
+  .tasks button { font-family: var(--mono); font-size: 13px; padding: 4px 8px; }
+  .tasks button[aria-pressed="true"] { background: var(--field); border-color: var(--soft); font-weight: 600; }
+  .own { display: flex; gap: 6px; align-items: center; margin-left: 6px; }
+  .own label { color: var(--soft); }
+  .own input { font-family: var(--mono); font-size: 13px; width: 11em; padding: 4px 8px; }
+  .refused { color: var(--soft); margin-top: 6px; font-size: 14px; }
+
+  .main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 40px; margin-top: 18px; }
+  .head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+  .head button { font-size: 13px; padding: 2px 8px; }
+  .head button[aria-pressed="true"] { background: var(--field); border-color: var(--soft); }
+  table { border-collapse: collapse; }
+  .prog { font-family: var(--mono); font-size: 13px; }
+  .prog td { height: 18px; padding: 0 14px 0 0; white-space: pre; }
+  .prog td.at { color: var(--soft); text-align: right; padding-right: 16px; }
+  .prog tr.now td { background: var(--mark); }
+  .template .tnote { color: var(--soft); font-size: 13px; margin-bottom: 6px; }
+  .template pre { margin: 0; font: 13px/18px var(--mono); }
+  .status { color: var(--soft); font-size: 14px; margin-top: 10px; min-height: 1.45em; }
+
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .controls select { padding: 3px 4px; }
+  .count { margin-left: auto; color: var(--soft); font-size: 14px; font-variant-numeric: tabular-nums; }
+  .say { margin-top: 12px; min-height: 2.9em; }
+  .cells { margin-top: 12px; font-variant-numeric: tabular-nums; }
+  .cells th, .cells td { padding: 2px 14px 2px 0; text-align: right; min-width: 3.2em; }
+  .cells th { font: 13px var(--mono); color: var(--soft); font-weight: normal; }
+  .cells td { font-size: 16px; }
+  .cells .hit { background: var(--mark); }
+  .cells .side { text-align: left; font: 14px var(--sans); color: var(--soft); min-width: 0; padding-right: 16px; }
+  .answer { margin-top: 12px; font-size: 17px; }
+  .answer .more { color: var(--soft); font-size: 15px; }
+  .verdict { margin-top: 4px; color: var(--soft); font-size: 14px; }
+  .note { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--rule); color: var(--soft); font-size: 13px; }
+
+  .gintro { margin-top: 14px; }
+  .gates { display: grid; grid-template-columns: repeat(5, auto); justify-content: space-between; gap: 14px; margin-top: 14px; }
+  .gate h3 { margin-bottom: 6px; }
+  .gate .gdesc { color: var(--soft); font-size: 14px; font-weight: normal; margin-left: 4px; }
+  .gate pre { margin: 0; font: 12px/16px var(--mono); white-space: pre-wrap; }
+  .gate .asked { color: var(--soft); }
+  .gate .gcheck { color: var(--soft); font-size: 14px; margin-top: 8px; }
+  .gfoot { display: flex; align-items: baseline; gap: 14px; margin-top: 14px; }
+  .gfoot .status { margin-top: 0; }
+
+  @media (max-width: 880px) {
+    .main { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+    .gates { grid-template-columns: repeat(2, auto); justify-content: start; }
+    .own { margin-left: 0; }
+  }
 </style>
 </head>
 <body>
-<div class="wrap"><div class="col">
-  <header>
-    <p class="eyebrow">terngate · SUBLEQ</p>
-    <h1>A program written by a <em>15 KB model</em>, run on a computer made of learned gates</h1>
-    <p class="dek">Pick a task. The 35k model writes a SUBLEQ program for it; the program runs on a computer with one
-      instruction, whose subtracting, testing and jumping are made of nothing but five logic gates another small model
-      wrote from their truth tables. Every step below is the machine's own.</p>
+<main>
+  <header class="top">
+    <h1>SUBLEQ playground</h1>
+    <a href="https://github.com/darpan-97/terngate-subleq">Code, models and training on GitHub</a>
   </header>
+  <p class="intro">Two tiny transformers run here, in your browser, 34,976 parameters each (15 KB, their layer weights
+    −1, 0 or +1). The gate model writes logic gates as code from their truth tables, and the computer here is built from
+    five it wrote. The program model writes programs for that computer, which has one instruction.</p>
 
-  <section class="panel" aria-labelledby="tasks-k">
-    <p class="kicker" id="tasks-k">Tasks <span style="text-transform:none;letter-spacing:0">(✓ judged right on 6 sets of inputs)</span></p>
-    <div class="tasks" id="tasks" role="group" aria-label="Tasks"></div>
-  </section>
-
-  <div class="grid">
-    <section class="panel" aria-labelledby="prog-k">
-      <p class="kicker" id="prog-k">What the model wrote</p>
-      <pre id="program" aria-label="The program"></pre>
-      <details><summary>What the model was shown</summary><pre id="prompt"></pre></details>
-    </section>
-
-    <section class="panel" aria-labelledby="mach-k">
-      <p class="kicker" id="mach-k">The machine</p>
-      <div class="controls">
-        <button id="reset" type="button">Reset</button>
-        <button id="back" type="button" aria-label="Step back">◀ Back</button>
-        <button id="step" type="button" class="primary">Step ▶</button>
-        <button id="play" type="button">Play</button>
-        <select id="speed" aria-label="Speed"><option value="900">slow</option><option value="400" selected>steady</option><option value="120">fast</option></select>
-        <span class="status" id="status"></span>
-      </div>
-      <p class="say" id="say" aria-live="polite"></p>
-      <div class="cells" id="cells"></div>
-      <div class="out"><span class="label" id="out-label">r</span><span id="out"></span></div>
-    </section>
+  <div class="tabs" role="tablist" aria-label="The two models">
+    <button type="button" role="tab" id="tab-programs" aria-selected="true" aria-controls="view-programs">The program model</button>
+    <button type="button" role="tab" id="tab-gates" aria-selected="false" aria-controls="view-gates">The gate model</button>
   </div>
 
-  <section class="rule">
-    <p><b>The one instruction</b>, <code>a b c</code>: memory[b] −= memory[a]; if the result is 0 or less, go to c, else to
-      the next instruction. With b = −1 (<code>out</code>) it prints memory[a] instead, and a jump to a negative address
-      stops. Words are 16 bits. A missing c means the next instruction either way.</p>
-    <p><b>The gates</b> are NOT, OR, the full adder's sum and carry, and "choose" (a ? c : b), written by the 35k gate model
-      from their truth tables and checked row by row. The subtractor (x + NOT y + 1, a digit at a time), the "0 or less" test
-      and the jump are made of them alone. Inputs here: a = 3, b = 5, c = 7, d = 11, e = 13.</p>
-    <p>Made by <code>out/subleq_write export</code> (<code>subleq/write.nitropz</code>) from <code>models/35k_subleq.tlm2</code>.
-      <a href="https://github.com/darpan-97/terngate-subleq">The code, on GitHub</a></p>
+  <section id="view-programs" role="tabpanel" aria-labelledby="tab-programs">
+    <div class="tasks">
+      <span class="label">Task</span>
+      <span id="examples" role="group" aria-label="Example tasks"></span>
+      <form class="own" id="own">
+        <label for="ask">or your own</label>
+        <input id="ask" autocomplete="off" spellcheck="false" placeholder="r=a+b-c or print hello">
+        <button type="submit">Write</button>
+      </form>
+    </div>
+    <p class="refused" id="refused" hidden></p>
+
+    <div class="main">
+      <section aria-labelledby="h-prog">
+        <div class="head">
+          <h2 id="h-prog">The program</h2>
+          <button id="reads" type="button" aria-pressed="false">What the model reads</button>
+        </div>
+        <table class="prog"><tbody id="prog"></tbody></table>
+        <div class="template" id="template" hidden>
+          <p class="tnote">The task, as the model reads it: a template that holds each letter the program uses, 12 lines
+            above the place it goes in a sum, 8 in a word or a product. The model writes everything after it.</p>
+          <pre id="template-text"></pre>
+        </div>
+        <p class="status" id="status" aria-live="polite"></p>
+      </section>
+
+      <section aria-labelledby="h-mach">
+        <div class="head"><h2 id="h-mach">The computer</h2></div>
+        <div class="controls">
+          <button id="reset" type="button">Reset</button>
+          <button id="back" type="button">Back</button>
+          <button id="step" type="button">Step</button>
+          <button id="play" type="button">Play</button>
+          <select id="speed" aria-label="Speed"><option value="700">slow</option><option value="300" selected>steady</option><option value="80">fast</option></select>
+          <span class="count" id="count"></span>
+        </div>
+        <p class="say" id="say"></p>
+        <table class="cells" id="cells"></table>
+        <p class="answer" id="answer"></p>
+        <p class="verdict" id="verdict"></p>
+        <p class="note">The one instruction, <code>a b c</code>: take memory[a] from memory[b]; if that leaves 0 or less,
+          go to c, else to the next line (no c: the next line either way). With <code>out</code> as b it prints
+          memory[a]; a jump to −1 stops. <code>z</code> holds 0, <code>one</code> 1, and the inputs are a = 3, b = 5,
+          c = 7, d = 11, e = 13.</p>
+      </section>
+    </div>
   </section>
-</div></div>
 
-<script src="subleq_data.js"></script>
+  <section id="view-gates" role="tabpanel" aria-labelledby="tab-gates" hidden>
+    <p class="gintro">Each gate is asked for by its name and truth table, in grey; the gate model writes the rest. The
+      computer on the other tab is built from these five, as written here, and from nothing else.</p>
+    <div class="gates" id="gates"></div>
+    <div class="gfoot">
+      <button id="again" type="button">Write them again</button>
+      <span class="status" id="gstatus" aria-live="polite"></span>
+    </div>
+    <p class="note">How: x − y is x + NOT y + 1, a NOT, a sum and a carry a digit (48 gates); 0 or less, the top digit
+      OR no digit set (18); the next instruction, pc + 3, a sum and a carry a digit (32); the jump, a choose a digit
+      (16): 114 gates a step, 16 digits each.</p>
+  </section>
+</main>
+
+<script src="program_model.js"></script>
+<script src="gate_model.js"></script>
+<script src="subleq_engine.js"></script>
 <script>
-(function(){
-  const runs = window.SUBLEQ_RUNS || [];
+(function () {
+  'use strict';
+  const S = window.Subleq;
   const $ = id => document.getElementById(id);
-  const inputs = {a:3, b:5, c:7, d:11, e:13};
-  let run = null, s = 0, timer = null;
+  const INPUTS = [3, 5, 7, 11, 13];
+  const EXAMPLES = ['r=a+b', 'r=c-d-e+b', 'r=a+b+c+d', 'r=d*b', 'r=c*a', 'print hi', 'print subleq', 'print computer'];
+  const DESCRIBE = { NOT: '1 when a is 0', OR: '1 when a or b is 1', sum: 'last digit of a + b + c',
+                     carry: 'carry of a + b + c', choose: 'b if a is 0, else c' };
+  const PROGRAM_DELAY = 22;          // ms between written bytes, to watch them written: a program is
+  const GATE_DELAY = 6;              //   100 to 160 bytes, the five gates about 900 together
 
-  const tasksEl = $('tasks');
-  runs.forEach((r, i) => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.textContent = r.task.replace(/^prog /, '').replace(/:$/, '');
-    if (r.right === 1) { const ok = document.createElement('span'); ok.className = 'ok'; ok.textContent = '✓'; b.appendChild(ok); }
-    b.addEventListener('click', () => choose(i));
-    tasksEl.appendChild(b);
-  });
+  const esc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const fmt = v => (v < 0 ? '−' + (0 - v) : String(v));
+  const sleep = ms => new Promise(done => setTimeout(done, ms));
+  const bytesOf = b64 => Uint8Array.from(atob(b64 || ''), c => c.charCodeAt(0));
+  const cap = t => t[0].toUpperCase() + t.slice(1);
 
-  function lines(text){ return text.replace(/\n$/, '').split('\n'); }
-  function name(at){ const c = run.cells.find(c => c[1] === at); return c ? c[0] : '#' + at; }
-  function show(v){ return String(v); }
-
-  function state(){                    // memory and output after s steps
-    const mem = run.memory.slice();
-    for (let k = mem.length; k < 512; k++) mem.push(0);
-    let out = '';
-    for (let i = 0; i < s; i++) {
-      const [pc, a, b, c, before, after, next, printed] = run.steps[i];
-      if (b !== -1) mem[b] = after;
-      if (printed >= 0) out += String.fromCharCode(printed);
-    }
-    return {mem, out};
+  function byteName(b) {
+    if (b === 10) return 'a new line';
+    if (b === 32) return 'a space';
+    return '“' + esc(String.fromCharCode(b)) + '”';
   }
 
-  function explain(){
-    if (s >= run.steps.length) {
-      const last = run.steps[run.steps.length - 1];
-      return 'Stopped: the last instruction jumped to ' + last[6] + ', a negative address. ' + run.steps.length + ' steps.';
+  // writes after a prompt, a byte every `delay` ms by the clock (a browser that slows its timers gets
+  // several a tick); onByte(text, got) after each; stops early, returning null, when stale() turns true
+  async function paced(writer, delay, onByte, stale) {
+    let text = '', ended = false, took = 0;
+    const start = performance.now();
+    while (!ended) {
+      const due = Math.floor((performance.now() - start) / delay) + 1;
+      while (text.length < due) {
+        const t0 = performance.now();
+        const got = writer.next();
+        took += performance.now() - t0;
+        if (got === null) { ended = true; break; }
+        text += String.fromCharCode(got.byte);
+        onByte(text, got);
+      }
+      if (!ended) await sleep(delay);
+      if (stale()) return null;
     }
-    const [pc, a, b, c, before, after, next, printed] = run.steps[s];
-    if (b === -1) return 'At ' + pc + ': <b>' + name(a) + ' out</b> prints memory[' + name(a) + '] = ' + printed + ', the byte <b>' + JSON.stringify(String.fromCharCode(printed)) + '</b>. On to ' + next + '.';
-    const st = state();
-    const av = st.mem[a] >= 32768 ? st.mem[a] - 65536 : st.mem[a];
-    let t = 'At ' + pc + ': <b>' + name(b) + ' = ' + name(b) + ' − ' + name(a) + '</b> = ' + show(before) + ' − ' + (av < 0 ? '(' + av + ')' : show(av)) + ' = <b>' + show(after) + '</b>. ';
-    if (next < 0) t += 'That is 0 or less, and c is ' + next + ': the machine stops.';
-    else if (c === pc + 3) t += 'On to ' + next + ' (no c: the next instruction either way).';
-    else if (after <= 0) t += 'That is 0 or less: jump to c, ' + next + '.';
+    return { text, took };
+  }
+
+  let programModel = null, gateModel = null;
+  try { programModel = S.loadModel(bytesOf(window.PROGRAM_MODEL)); gateModel = S.loadModel(bytesOf(window.GATE_MODEL)); }
+  catch (err) { $('status').textContent = 'The models did not load: ' + err.message; }
+
+  // ---- the gates: written by the gate model as the page starts, read back, and the computer built of them ----
+  const gates = S.GATES.map(gate => {
+    const want = [];
+    for (let r = 0; r < (1 << gate.ins); r++) want.push(S.gateBit(gate.g, gate.ins, r));
+    return { ...gate, question: S.gateQuestion(gate.g, gate.ins), written: '', table: null, want };
+  });
+
+  function judgeGate(k) {
+    const g = gates[k];
+    g.table = S.readGate(g.question + g.written, g.ins);
+    g.right = g.table !== null && g.table.join() === g.want.join();
+  }
+
+  let M = null;
+  if (gateModel) {
+    let took = 0;
+    gates.forEach((g, k) => {
+      const t0 = performance.now();
+      const w = S.GateWriter(S.Engine(gateModel), g.g, g.ins);
+      let got;
+      while ((got = w.next()) !== null) g.written += String.fromCharCode(got.byte);
+      took += performance.now() - t0;
+      judgeGate(k);
+    });
+    if (gates.every(g => g.right)) M = S.machine({ NOT: gates[0].table, OR: gates[1].table, SUM: gates[2].table, CARRY: gates[3].table, CHOOSE: gates[4].table });
+    gates.took = took;
+  }
+
+  function checkText(g) {
+    if (g.table === null) return 'Not in the form this page reads';
+    if (!g.right) return 'Wrong on row ' + g.want.map((b, r) => (b !== g.table[r] ? r : -1)).filter(r => r >= 0).join(', ');
+    return g.ins === 1 ? 'Right on both rows' : 'Right on all ' + (1 << g.ins) + ' rows';
+  }
+
+  function renderGates(writing) {    // writing: the gate being written, or -1
+    $('gates').innerHTML = gates.map((g, k) =>
+      '<div class="gate"><h3>' + esc(g.role === 'NOT' || g.role === 'OR' ? g.role : cap(g.role)) +
+      ' <span class="gdesc">' + esc(DESCRIBE[g.role]) + '</span></h3>' +
+      '<pre><span class="asked">' + esc(g.question) + '</span>' + esc(g.written) + '</pre>' +
+      '<p class="gcheck">' + (writing >= 0 && k >= writing ? (k === writing ? 'Writing…' : '') : checkText(g)) + '</p></div>').join('');
+  }
+
+  let gjob = 0, gatesWatched = false;
+  async function watchGates() {
+    if (!gateModel) return;
+    const mine = ++gjob;
+    gates.forEach(g => { g.written = ''; });
+    $('again').disabled = true;
+    let took = 0, bytes = 0;
+    for (let k = 0; k < gates.length; k++) {
+      const g = gates[k];
+      renderGates(k);
+      const done = await paced(S.GateWriter(S.Engine(gateModel), g.g, g.ins), GATE_DELAY, (text, got) => {
+        g.written = text;
+        renderGates(k);
+        $('gstatus').innerHTML = 'Writing the ' + g.role + ' gate, byte ' + text.length + ': ' + byteName(got.byte) +
+          ', its chance ' + (got.chance * 100).toFixed(1) + '%.';
+      }, () => mine !== gjob);
+      if (done === null) return;
+      took += done.took;
+      bytes += done.text.length;
+      judgeGate(k);
+    }
+    renderGates(-1);
+    $('again').disabled = false;
+    $('gstatus').textContent = 'Written: ' + bytes + ' bytes, each the likeliest; ' + Math.max(1, Math.round(took)) +
+      ' ms of the model’s time in this browser.';
+  }
+
+  // ---- tabs ----
+  function show(which) {
+    const programs = which === 'programs';
+    $('tab-programs').setAttribute('aria-selected', programs ? 'true' : 'false');
+    $('tab-gates').setAttribute('aria-selected', programs ? 'false' : 'true');
+    $('view-programs').hidden = !programs;
+    $('view-gates').hidden = programs;
+    if (!programs && !gatesWatched) { gatesWatched = true; watchGates(); }
+  }
+  $('tab-programs').onclick = () => show('programs');
+  $('tab-gates').onclick = () => show('gates');
+  $('again').onclick = () => watchGates();
+  renderGates(-1);
+
+  // ---- the program, a line a row, its operands in columns ----
+  let job = 0;                       // the program being written; a new task ends the one before
+  let cur = null;                    // the program written and run: question, prompt, program, asm, rows
+  let s = 0, timer = null;
+
+  function parts(line) {
+    const t = line.replace(/^ {4}/, '').split(' ').filter(x => x);
+    const label = t.length && t[0].endsWith(':') ? t.shift() : '';
+    return [label, t[0] || '', t[1] || '', t.slice(2).join(' ')];
+  }
+
+  function renderProgram(written, now) {
+    const lines = written.split('\n');
+    if (lines[lines.length - 1] === '') lines.pop();
+    let ops = 0, html = '';
+    for (const line of lines) {
+      let at = '';
+      if (line.trim() !== '' && !line.startsWith('    #')) { at = ops * 3; ops += 1; }
+      const p = parts(line);
+      html += '<tr' + (at !== '' && at === now ? ' class="now"' : '') + '><td class="at">' + at + '</td><td>' +
+        esc(p[0]) + '</td><td>' + esc(p[1]) + '</td><td>' + esc(p[2]) + '</td><td>' + esc(p[3]) + '</td></tr>';
+    }
+    $('prog').innerHTML = html;
+  }
+
+  $('reads').onclick = () => {
+    const on = $('reads').getAttribute('aria-pressed') !== 'true';
+    $('reads').setAttribute('aria-pressed', on ? 'true' : 'false');
+    $('template').hidden = !on;
+    $('prog').parentElement.hidden = on;
+  };
+
+  // ---- the computer ----
+  function state() {                 // memory and what was printed, after s steps
+    const mem = cur.asm.mem.slice();
+    let out = '';
+    for (let i = 0; i < s; i++) {
+      const [, , b, , , after, , printed] = cur.rows[i];
+      if (b !== -1) mem[b] = after & 65535;
+      if (printed >= 0) out += String.fromCharCode(printed);
+    }
+    return { mem, out };
+  }
+
+  function name(at) { const c = cur.asm.cells.find(c => c[1] === at); return c ? c[0] : '#' + at; }
+
+  function explain(st) {
+    const rows = cur.rows;
+    if (s >= rows.length) {
+      if (!cur.stopped) return 'It has not stopped after ' + rows.length.toLocaleString('en') + ' steps.';
+      return 'Stopped: the last instruction jumped to ' + fmt(rows[rows.length - 1][6]) + ', an address below 0. ' + rows.length + ' steps.';
+    }
+    const [pc, a, b, c, before, after, next, printed] = rows[s];
+    if (b === -1) return 'At ' + pc + ': <code>' + esc(name(a)) + ' out</code> prints ' + esc(name(a)) + ', ' + printed +
+      ', the letter “' + esc(String.fromCharCode(printed)) + '”. On to ' + next + '.';
+    const av = S.signed(st.mem[a]);
+    let t = 'At ' + pc + ': <code>' + esc(name(b)) + ' = ' + esc(name(b)) + ' − ' + esc(name(a)) + '</code>, ' +
+      fmt(before) + ' − ' + (av < 0 ? '(' + fmt(av) + ')' : fmt(av)) + ' = ' + fmt(after) + '. ';
+    if (next < 0) t += 'That is 0 or less, and c is ' + fmt(next) + ': the computer stops.';
+    else if (c === pc + 3) t += 'On to ' + next + '.';
+    else if (after <= 0) t += 'That is 0 or less: jump to ' + next + '.';
     else t += 'More than 0: on to ' + next + '.';
     return t;
   }
 
-  function render(){
-    const progLines = lines(run.program);
-    const pc = s < run.steps.length ? run.steps[s][0] : -1;
-    $('program').innerHTML = '';
-    progLines.forEach((ln, k) => {
-      const span = document.createElement('span');
-      span.className = 'line' + (k * 3 === pc ? ' now' : '');
-      const at = document.createElement('span'); at.className = 'at'; at.textContent = k * 3;
-      span.appendChild(at); span.appendChild(document.createTextNode(ln.replace(/^ {4}/, '')));
-      $('program').appendChild(span); $('program').appendChild(document.createTextNode('\n'));
-    });
-    $('prompt').textContent = run.prompt;
-    const st = state();
-    const written = s > 0 && run.steps[s - 1][2] !== -1 ? run.steps[s - 1][2] : -1;
-    $('cells').innerHTML = '';
-    run.cells.forEach(([nm, at]) => {
-      const d = document.createElement('div');
-      d.className = 'cell' + ('abcde'.includes(nm) && nm.length === 1 ? ' input' : '') + (at === written ? ' hit' : '');
-      let v = st.mem[at]; if (v >= 32768) v -= 65536;
-      const shown = nm.startsWith("'") ? v + ' (' + JSON.stringify(String.fromCharCode(v)) + ')' : v;
-      d.innerHTML = '<div class="name">' + nm + '</div><div class="val">' + shown + '</div>';
-      $('cells').appendChild(d);
-    });
-    if (run.kind === 2) { $('out-label').textContent = 'printed'; $('out').textContent = st.out === '' ? '—' : st.out; }
-    else { const v = st.mem[run.r]; $('out-label').textContent = 'the answer, r'; $('out').textContent = (v >= 32768 ? v - 65536 : v) + (s >= run.steps.length ? '' : ' (so far)'); }
-    $('say').innerHTML = explain();
-    $('status').textContent = 'step ' + s + ' of ' + run.steps.length;
-    $('back').disabled = s === 0;
-    $('step').disabled = s >= run.steps.length;
-    $('play').textContent = timer ? 'Pause' : 'Play';
+  function expected() {              // what r should be here, worked out, for sums and products
+    const q = cur.question, v = l => INPUTS[l.charCodeAt(0) - 97];
+    if (cur.kind === 1) return q[7] + ' × ' + q[9] + ' = ' + v(q[7]) + ' × ' + v(q[9]) + ' = ' + fmt(v(q[7]) * v(q[9]));
+    const expr = q.slice(7, -1);
+    let total = 0, sign = '+', nums = '';
+    for (const ch of expr) {
+      if (ch === '+' || ch === '-') { sign = ch; continue; }
+      total += sign === '+' ? v(ch) : 0 - v(ch);
+      nums += (nums ? (sign === '+' ? ' + ' : ' − ') : (sign === '-' ? '−' : '')) + v(ch);
+    }
+    if (expr.length === 1) return expr + ' = ' + fmt(total);
+    return expr.replace(/-/g, ' − ').replace(/\+/g, ' + ') + ' = ' + nums + ' = ' + fmt(total);
   }
 
-  function stop(){ if (timer) { clearInterval(timer); timer = null; } }
-  function choose(i){
-    stop(); run = runs[i]; s = 0;
-    [...tasksEl.children].forEach((b, k) => b.setAttribute('aria-pressed', k === i ? 'true' : 'false'));
+  function renderComputer() {
+    const ready = cur && cur.asm && M;
+    ['reset', 'back', 'step', 'play'].forEach(id => { $(id).disabled = !ready; });
+    $('play').textContent = timer ? 'Pause' : 'Play';
+    $('count').textContent = '';
+    $('cells').innerHTML = ''; $('answer').textContent = ''; $('verdict').textContent = '';
+    if (!M) { $('say').textContent = 'The gate model’s gates are not all right, so the computer is not built.'; return; }
+    if (!cur) { $('say').textContent = 'The program runs once the model has written it.'; return; }
+    const v = cur.verdict;
+    $('verdict').textContent =
+      v === 1 ? (cur.kind === 2 ? 'Checked: it prints the word asked for.' : 'Checked on 6 sets of random inputs: right every time.') :
+      v === 0 ? (cur.kind === 2 ? 'Checked: it prints something else.' : 'Checked on 6 sets of random inputs: wrong.') :
+      v === -1 ? 'Checked: it does not assemble.' : 'Checked: it does not stop.';
+    if (!cur.asm) { $('say').textContent = 'This program does not assemble, so the computer cannot run it.'; return; }
+    const st = state();
+    const written = s > 0 && cur.rows[s - 1][2] !== -1 ? cur.rows[s - 1][2] : -1;
+    const done = s >= cur.rows.length;
+    $('count').textContent = 'step ' + s + ' of ' + cur.rows.length;
+    $('say').innerHTML = explain(st);
+    const cells = cur.asm.cells;
+    $('cells').innerHTML =
+      '<tr><th class="side">cell</th>' + cells.map(([n, at]) => '<th' + (at === written ? ' class="hit"' : '') + '>' + esc(n) + '</th>').join('') + '</tr>' +
+      '<tr><th class="side">value</th>' + cells.map(([, at]) => '<td' + (at === written ? ' class="hit"' : '') + '>' + fmt(S.signed(st.mem[at])) + '</td>').join('') + '</tr>';
+    if (cur.kind === 2) $('answer').innerHTML = 'Printed: ' + (st.out ? '<code style="font-size:16px">' + esc(st.out) + '</code>' : 'nothing yet');
+    else if (cur.asm.r < 0) $('answer').textContent = 'The program has no cell r.';
+    else $('answer').innerHTML = '<code style="font-size:16px">r</code> = ' + fmt(S.signed(st.mem[cur.asm.r])) +
+      '<span class="more">' + (done ? ', and ' + esc(expected()) : ' so far') + '</span>';
+    $('back').disabled = s === 0;
+    $('reset').disabled = s === 0;
+    $('step').disabled = done;
+  }
+
+  function render() {
+    renderProgram(cur.program, cur.asm && s < cur.rows.length ? cur.rows[s][0] : -1);
+    renderComputer();
+  }
+
+  async function write(question) {
+    if (!programModel) return;
+    const mine = ++job;
+    stop();
+    cur = null;
+    s = 0;
+    [...$('examples').children].forEach(b => b.setAttribute('aria-pressed', 'prog ' + b.textContent + ':' === question ? 'true' : 'false'));
+    $('h-prog').innerHTML = 'The program for <code>' + esc(question.slice(5, -1)) + '</code>';
+    let took = performance.now();
+    const writer = S.Writer(S.Engine(programModel), question);    // reads the template
+    took = performance.now() - took;
+    $('template-text').textContent = writer.prompt;
+    renderProgram('', -1);
+    renderComputer();
+    const done = await paced(writer, PROGRAM_DELAY, (text, got) => {
+      renderProgram(text, -1);
+      $('status').innerHTML = 'Writing byte ' + text.length + ': ' + byteName(got.byte) + ', its chance ' +
+        (got.chance * 100).toFixed(1) + '%, the likeliest of 256.';
+    }, () => mine !== job);
+    if (done === null) return;
+    const program = done.text;
+    $('status').textContent = 'Written: ' + program.length + ' bytes, each the likeliest; ' +
+      Math.max(1, Math.round(took + done.took)) + ' ms of the model’s time in this browser.';
+    const asm = S.assemble(question + '\n' + program, INPUTS);
+    cur = { question, program, asm, kind: S.kind(question), verdict: M ? S.judge(question, program, 12345, M) : null, rows: [], stopped: false };
+    if (asm && M) { const t = S.trace(asm, 2000, M); cur.rows = t.rows; cur.stopped = t.stopped; }
     render();
   }
+
+  function stop() { if (timer) { clearInterval(timer); timer = null; } }
+
   $('reset').onclick = () => { stop(); s = 0; render(); };
-  $('back').onclick = () => { stop(); if (s > 0) s--; render(); };
-  $('step').onclick = () => { stop(); if (s < run.steps.length) s++; render(); };
+  $('back').onclick = () => { stop(); if (s > 0) s -= 1; render(); };
+  $('step').onclick = () => { stop(); if (s < cur.rows.length) s += 1; render(); };
   $('play').onclick = () => {
     if (timer) { stop(); render(); return; }
-    if (s >= run.steps.length) s = 0;
-    timer = setInterval(() => { if (s < run.steps.length) { s++; render(); } if (s >= run.steps.length) { stop(); render(); } }, +$('speed').value);
+    if (s >= cur.rows.length) s = 0;
+    timer = setInterval(() => {
+      if (s < cur.rows.length) s += 1;
+      if (s >= cur.rows.length) stop();
+      render();
+    }, +$('speed').value);
     render();
   };
   $('speed').onchange = () => { if (timer) { stop(); $('play').onclick(); } };
-  if (runs.length) choose(2); else $('say').textContent = 'No runs: docs/subleq_data.js is missing (out/subleq_write export).';
+
+  EXAMPLES.forEach(t => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = t;
+    b.onclick = () => { $('refused').hidden = true; write('prog ' + t + ':'); };
+    $('examples').appendChild(b);
+  });
+
+  $('own').onsubmit = ev => {
+    ev.preventDefault();
+    let t = $('ask').value.trim().toLowerCase();
+    if (t.startsWith('prog ')) t = t.slice(5).trim();
+    if (t.endsWith(':')) t = t.slice(0, -1).trim();
+    t = t.startsWith('print') ? 'print ' + t.slice(5).replace(/\s+/g, '') : t.replace(/\s+/g, '');
+    const question = 'prog ' + t + ':';
+    if (!S.askable(question)) {
+      $('refused').hidden = false;
+      $('refused').textContent = 'It can be asked for a sum of 1 to 4 of the letters a to e (r=c-d-e+b), a product of two (r=a*e), or a word of 1 to 8 small letters (print hello).';
+      return;
+    }
+    $('refused').hidden = true;
+    write(question);
+  };
+
+  write('prog r=d*b:');
 })();
 </script>
 </body>

@@ -56,14 +56,33 @@ it goes: a sum's parts 12 lines up, each part's three lines of program under its
 template; a word's letters and a product's two letters 8 lines up, 15 bytes a line. A minus part needs
 one line, not three; two lines that do nothing (`z z`) keep the distance.
 
+Asked for a quotient, `prog r=e/b:`, the whole number of times b goes into e, it writes another loop:
+
+```
+    l0: one z         z = -1
+    z e               e = e + 1, so that "0 or less" below means b did not fit
+    z z               z = 0
+    l1: b e l9        e = e - b; if that is 0 or less, go to l9
+    one z             z = -1
+    z r               r = r + 1
+    z z l1            z = 0, and back to l1
+    l9: z z -1        stop
+  => run on the gate machine, 13 steps (e = 13, b = 5): r = 2
+```
+
 | tasks, each the model's first try | right |
 |---|---|
 | sums of 1 to 4 parts kept back from all training | 150 of 150 |
 | products kept back from all training (`a*e`, `c*a`, `d*b`, `e*c`) | 4 of 4 |
 | words to print kept back from all training | 60 of 60 |
-| sums, products and words of the kinds taught, from another seed | 150, 16 and 60, all |
+| quotients kept back from all training (`b/a`, `d/c`, `e/b`, `a/d`) | 4 of 4 |
+| sums, products, words and quotients of the kinds taught, from another seed | 150, 16, 60 and 16, all |
+| every sum there is (5,555), every product and every quotient of two different letters (20 each) | all |
+| every word of 1 or 2 letters (702), and 300 drawn of each length from 3 to 8 | all |
 
-It was taught in three stages (`subleq/teach.sh`), from the gate model:
+A product or a quotient of one letter with itself is refused: the loop counts down the cell it works on.
+
+It was taught in four stages (`subleq/teach.sh`), from the gate model:
 
 1. 1,200 steps on 6,000 words to print. A model learns the shape of the lines first and the copying
    much later, all at once: here near step 800.
@@ -72,8 +91,10 @@ It was taught in three stages (`subleq/teach.sh`), from the gate model:
    right after 240 steps. With every byte alike it took 600, and from a model taught products instead
    of words it never wrote half of them right.
 3. 1,200 steps on sums, words and products together, from that save. Every product of the check came
-   right by step 240, and every one of the 196 programs of the check at steps 960 and 1,080; the model
-   is the later.
+   right by step 240, and every one of the 196 programs of the check at steps 960 and 1,080.
+4. 1,200 steps on all four kinds, quotients added, from the model of stage 3: 6 minutes here. 208 of
+   the check's 212 programs came right by step 120, and all 212 at steps 720, 1,080 and 1,200; the model
+   is the last.
 
 Before the templates, the model was shown each task's parts in a numbered list, as `# 0:+a 1:-c`. It
 learned where in the list a part was, and the sign there, but by step 750 it still copied letters no
@@ -83,6 +104,33 @@ source and guessed, nearly evenly over a to e, the one four lines further, throu
 steps and 300 more on products alone. Moving that line up beside its source made it right, and the
 other letter, now further off, the guess. A template holding each letter exactly where words hold
 theirs made products the quickest of the three.
+
+### The compiler
+
+The model writes one step at a time. `out/subleq_compile` (`subleq/compile.nitropz`) takes more: + - *
+/ % and brackets over a to e and whole numbers, as `r = (a + b) * c - 3`. Ordinary code breaks the
+expression into steps the model has been taught -- sums of up to 4 parts, products, quotients -- each
+into a cell of its own; the model writes every step's program after its template; ordinary code renames
+each program (its letters to the step's cells, r to the step's result, its labels to labels of its own)
+and joins them, each step's stop made "go on":
+
+```
+  t1 = a + b               prog r=a+b:
+  t2 = c                   prog r=a:
+  t3 = t1 * t2             prog r=a*b:
+  r = t3 - k1              prog r=a-b:
+```
+
+A product counts its right side down to 0 and a quotient its left side, so a letter or a number there is
+first copied into a cell of its own (`t2 = c`), which is also how a square works; a remainder is
+x - y * (x / y); a number is a cell given its value before the program starts (`= k1 3`). Every
+instruction of the joined program is the model's.
+
+`out/subleq_compile measure 1000` draws 1,000 expressions of 1 to 4 operators over a to e and the
+numbers 0 to 9, compiles each and judges it on 6 sets of inputs from 0 to 20: 964 right and none wrong.
+The other 36 have no such inputs that keep every step inside what the machine does -- it multiplies and
+divides by counting down, so a number it counts must not be below 0, and a divisor must be above 0;
+every value stays from -32768 to 32767. The right ones took 4 steps on average and 14 at most.
 
 ### Teaching itself
 

@@ -62,6 +62,8 @@ fn wp_judge_works():                 # 1 when the judge tells right programs fro
     if sl_judge(concat(concat("prog r=a+b-c:\n", sl_list("prog r=a+b-c:")), sl_answer("prog r=a+b-c:"))) != 1: return 0
     if sl_judge(concat(concat("prog r=c*e:\n", sl_list("prog r=c*e:")), sl_answer("prog r=c*e:"))) != 1: return 0
     if sl_judge(concat(concat("prog print hi:\n", sl_list("prog print hi:")), sl_answer("prog print hi:"))) != 1: return 0
+    if sl_judge(concat(concat("prog r=d/b:\n", sl_list("prog r=d/b:")), sl_answer("prog r=d/b:"))) != 1: return 0
+    if sl_judge("prog r=d/b:\n    l0: one z\n    z d\n    z z\n    l1: one z\n    z r\n    z z\n    b d l9\n    z z l1\n    l9: z z -1\n") == 1: return 0
     if sl_judge("prog r=a+b-c:\n    a z\n    z r\n    z z\n    b z\n    r z\n    z z\n    c r\n    z z -1\n") == 1: return 0
     if sl_judge("prog r=c*e:\n    top: z e end\n    c z\n    z r\n    z z\n    one e\n    z z\n    end: z z -1\n") == 1: return 0
     if sl_judge("prog print hi:\n    'h out\n    'j out\n    z z -1\n") == 1: return 0
@@ -89,12 +91,13 @@ fn wp_count(what):
     WP_ASKED = 0
     return 0
 
-fn wp_set(kind, held, count, show):  # count questions of a kind (0 sums, 1 products, 2 words), kept back or not
-    let n = 0
+fn wp_set(kind, held, count, show):  # count questions of a kind (0 sums, 1 products, 2 words, 3 quotients),
+    let n = 0                        #   kept back or not
     while n < count:
         let q = pc_sum()
         if kind == 1: q = pc_product()
         if kind == 2: q = pc_word()
+        if kind == 3: q = pc_quotient()
         if pc_held(q) == held:
             wp_ask(q, show)
             n += 1
@@ -110,8 +113,9 @@ fn wp_starts(q, word):
     return 1
 
 # can the question be asked? The template it is shown holds a sum of 1 to 4 parts (the letters a to e, each
-# after the first a + or -), a product of two letters, or a word of 1 to 8 small letters, and the question is
-# read by position: anything else would be cut to fit and judged as cut ("a*b+c" as "a*b"), so it is refused
+# after the first a + or -), a product or a quotient of two different letters (with one letter, the loop
+# counts down the cell it works on), or a word of 1 to 8 small letters, and the question is read by
+# position: anything else would be cut to fit and judged as cut ("a*b+c" as "a*b"), so it is refused
 pub fn wp_askable(q):
     let n = slen(q)
     if n < 9 or load8(q + n - 1) != 58: return 0           # ("prog r=a:", one part, is the shortest)
@@ -123,7 +127,8 @@ pub fn wp_askable(q):
             i += 1
         return 1
     if wp_starts(q, "prog r=") == 0: return 0
-    if n == 11 and load8(q + 8) == 42: return wp_letter(load8(q + 7)) and wp_letter(load8(q + 9))
+    if n == 11 and (load8(q + 8) == 42 or load8(q + 8) == 47):
+        return wp_letter(load8(q + 7)) and wp_letter(load8(q + 9)) and load8(q + 7) != load8(q + 9)
     let parts = 0
     let want_letter = 1
     let i = 7
@@ -140,7 +145,7 @@ pub fn wp_askable(q):
     return parts >= 1 and parts <= 4 and want_letter == 0
 
 # ---- export: programs the model writes, and every step the gate machine takes, for subleq/page_check.js ----
-let WX_TASKS = ["prog r=a+b:", "prog r=e-a:", "prog r=c-d-e+b:", "prog r=a+b+c+d:", "prog r=d*b:", "prog r=c*a:", "prog r=e*b:", "prog print hi:", "prog print gate:", "prog print subleq:", "prog print ternary:", "prog print computer:"]
+let WX_TASKS = ["prog r=a+b:", "prog r=e-a:", "prog r=c-d-e+b:", "prog r=a+b+c+d:", "prog r=d*b:", "prog r=c*a:", "prog r=e*b:", "prog r=e/b:", "prog print hi:", "prog print gate:", "prog print subleq:", "prog print ternary:", "prog print computer:"]
 let WX_INPUTS = [3, 5, 7, 11, 13]                # a to e
 
 fn wx_js(text):                      # text as a JavaScript string, quoted
@@ -273,7 +278,7 @@ fn main():
             tell("live QUESTION, as: \"prog r=a+b-c:\" or \"prog print hi:\"\n")
             return 2
         if wp_askable(question) == 0:
-            tell("not a task it can be asked: a sum of 1 to 4 of the letters a to e (\"prog r=c-d-e+b:\"), a product of two (\"prog r=a*e:\"), or a word of 1 to 8 small letters (\"prog print hello:\")\n")
+            tell("not a task it can be asked: a sum of 1 to 4 of the letters a to e (\"prog r=c-d-e+b:\"), a product or a quotient of two different ones (\"prog r=a*e:\", \"prog r=d/b:\"), or a word of 1 to 8 small letters (\"prog print hello:\")\n")
             return 2
         WP_LIVE = 1
         let program = wp_write(question)
@@ -308,7 +313,10 @@ fn main():
         wp_set(2, 0, 60, 0)
         total += WP_RIGHT
         wp_count("words")
-        tell(concat(str(total), " of 196 right (the check, seed 7)\n"))
+        wp_set(3, 0, 16, 0)
+        total += WP_RIGHT
+        wp_count("quotients")
+        tell(concat(str(total), " of 212 right (the check, seed 7)\n"))
         return 0
     tell(concat(concat("\n", model_path), " writes programs for the one-instruction computer; each run there on 6 sets of inputs\n"))
     tell("\nnever taught:\n")
@@ -322,6 +330,11 @@ fn main():
     wp_count("products")
     wp_set(2, 1, 60, 3)
     wp_count("words")
+    wp_ask("prog r=b/a:", 3)
+    wp_ask("prog r=d/c:", 3)
+    wp_ask("prog r=e/b:", 3)
+    wp_ask("prog r=a/d:", 3)
+    wp_count("quotients")
     tell("\ntaught (of the same kinds, not necessarily the same ones):\n")
     wp_set(0, 0, 150, 0)
     wp_count("sums")
@@ -329,6 +342,8 @@ fn main():
     wp_count("products")
     wp_set(2, 0, 60, 0)
     wp_count("words")
+    wp_set(3, 0, 16, 0)
+    wp_count("quotients")
     return 0
 
 exit(main())

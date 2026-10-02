@@ -312,10 +312,11 @@
   }
 
   // ---- the template the model is shown, and the tasks it can be asked ----
-  function kind(question) {          // sl_kind: 0 sums, 1 a product, 2 printing; -1 none
+  function kind(question) {          // sl_kind: 0 sums, 1 a product, 2 printing, 3 a quotient; -1 none
     if (question.length < 9) return -1;
     if (question.charCodeAt(5) === 112) return 2;
-    return question.indexOf('*') >= 0 ? 1 : 0;
+    for (const c of question) { if (c === '*') return 1; if (c === '/') return 3; }
+    return 0;
   }
 
   function part(question, k) {       // sl_part: a sum's part k, [sign, letter], or null
@@ -348,6 +349,14 @@
       return out;
     }
     const x = question[7], y = question[9];
+    if (kd === 3) {                  // a quotient's: x and y 8 lines above where its program copies them
+      let out = 'prog quotient:\n    #         \n';
+      out += '    # ' + x + '       \n';
+      out += '    #         \n';
+      out += '    #   ' + y + ' ' + x + '   \n';
+      for (let k = 4; k < 8; k++) out += '    #         \n';
+      return out;
+    }
     let out = 'prog product:\n';
     out += '    #     ' + y + '   \n';
     out += '    #   ' + y + '     \n';
@@ -366,7 +375,7 @@
       return true;
     }
     if (!q.startsWith('prog r=')) return false;
-    if (n === 11 && q[8] === '*') return letter(q[7]) && letter(q[9]);
+    if (n === 11 && (q[8] === '*' || q[8] === '/')) return letter(q[7]) && letter(q[9]) && q[7] !== q[9];
     let parts = 0, wantLetter = true;
     for (let i = 7; i < n - 1; i++) {
       const c = q[i];
@@ -502,10 +511,17 @@
   function assemble(program, inputs) {   // program: the task's text, question line first; inputs: a to e
     const lines = program.split('\n');
     const ops = [];                  // [label or null, a, b, c or null]
+    const data = [];                 // "= name value": a cell's first value (sl_data)
     for (let i = 1; i < lines.length; i++) {
       const line = lines[i];
       if (line.length === 0) continue;
       if (line.length < 5 || !line.startsWith('    ')) return null;
+      if (line[4] === '=') {
+        const m = /^= (\S+) (-?[0-9]+)$/.exec(line.slice(4));
+        if (!m || data.length >= 32) return null;
+        data.push([m[1], parseInt(m[2], 10)]);
+        continue;
+      }
       if (line[4] === '#') continue;
       if (ops.length >= 120) return null;
       const parts = line.slice(4).split(' ').filter(t => t.length > 0);
@@ -556,6 +572,7 @@
     }
     cell('z', 0);
     cell('one', 1);
+    for (const [name, value] of data) cell(name, value);
     const mem = new Array(SIZE).fill(0);
     for (let k = 0; k < ops.length; k++) {
       const a = operand(ops[k][1], 0, 0), b = operand(ops[k][2], 1, 0), c = operand(ops[k][3], 2, k * 3 + 3);
@@ -610,8 +627,12 @@
     return { mem, out, steps };
   }
 
-  function expect(question, inputs) {   // sl_expect: what r must be (sums and products)
-    if (kind(question) === 1) return (inputs[question.charCodeAt(7) - 97] * inputs[question.charCodeAt(9) - 97]) & 65535;
+  function expect(question, inputs) {   // sl_expect: what r must be (sums, products, quotients)
+    const kd = kind(question);
+    if (kd === 1 || kd === 3) {
+      const x = inputs[question.charCodeAt(7) - 97], y = inputs[question.charCodeAt(9) - 97];
+      return (kd === 3 ? Math.trunc(x / y) : x * y) & 65535;
+    }
     let total = 0, sign = '+';
     for (let i = 7; question[i] !== ':'; i++) {
       const c = question[i];
@@ -631,6 +652,10 @@
       const inputs = [];
       for (let k = 0; k < 5; k++) inputs.push((draw() % 2001) - 1000);
       if (kd === 1) inputs[question.charCodeAt(9) - 97] = draw() % 21;
+      if (kd === 3) {                // a quotient: 0 to 200 over 1 to 20
+        inputs[question.charCodeAt(7) - 97] = draw() % 201;
+        inputs[question.charCodeAt(9) - 97] = 1 + draw() % 20;
+      }
       const asm = assemble(text, inputs);
       if (asm === null) return -1;
       const ran = run(asm, 20000, m);

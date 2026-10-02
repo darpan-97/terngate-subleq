@@ -15,8 +15,10 @@ module subleq_lib
 #         c r
 #         z z -1
 #     prog r=a*b:                r = a * b (b not below 0), with a loop: "top:" names a line
+#     prog r=a/b:                r = a / b, the whole number (a not below 0, b above 0), a loop too
 #     prog print hi:             prints hi: 'h is a cell holding the letter h, "out" prints the first
-# Cells: z (0), one (1), a to e (the task's inputs), r (0, the answer); any other name, a cell of 0.
+# Cells: z (0), one (1), a to e (the task's inputs), r (0, the answer); any other name, a cell of 0,
+# or the value a line "= name value" gives it (a constant: what the expression compiler writes).
 # The model is not shown the task itself but sl_prompt's template of it, laid out as the program will
 # be, so that every letter the program copies stands a fixed distance above where it goes.
 import std
@@ -238,10 +240,40 @@ fn sl_operand(tok, where, next):     # an operand's number: -1 when it is not on
     if slen(tok) == 1 and load8(tok) >= 97 and load8(tok) <= 101: value = load(SL_INPUTS + (load8(tok) - 97) * 4)
     return sl_cell(tok, value)
 
+let SL_DATA_NAME = alloc(32 * 4)             # "= name value" lines: cells given a first value
+let SL_DATA_VALUE = alloc(32 * 4)
+let SL_DATA = 0
+
+fn sl_data(line):                    # "= name value" (after the line's 4 spaces): 1 when it is one
+    let n = slen(line)
+    if n < 5 or load8(line + 1) != 32 or SL_DATA >= 32: return 0
+    let i = 2
+    while i < n and load8(line + i) != 32: i += 1
+    if i == 2 or i >= n: return 0
+    let name = sl_token(line, 2, i)
+    i += 1
+    let neg = 0
+    if i < n and load8(line + i) == 45:
+        neg = 1
+        i += 1
+    if i >= n: return 0
+    let v = 0
+    while i < n:
+        let d = load8(line + i)
+        if d < 48 or d > 57: return 0
+        v = v * 10 + d - 48
+        i += 1
+    if neg: v = 0 - v
+    store(SL_DATA_NAME + SL_DATA * 4, name)
+    store(SL_DATA_VALUE + SL_DATA * 4, v)
+    SL_DATA += 1
+    return 1
+
 pub fn sl_assemble(program):         # the answer lines after the "prog" line, into SL_MEM; 1 if they assemble
     SL_OPS = 0
     SL_CELLS = 0
     SL_R = -1
+    SL_DATA = 0
     let n = slen(program)
     let i = 0
     while i < n and load8(program + i) != 10: i += 1        # past the question
@@ -253,12 +285,18 @@ pub fn sl_assemble(program):         # the answer lines after the "prog" line, i
         i += 1
         if slen(line) > 0:
             if slen(line) < 5 or load8(line) != 32 or load8(line + 1) != 32 or load8(line + 2) != 32 or load8(line + 3) != 32: return 0
-            if load8(line + 4) != 35:                    # "# ..." lines are the question's list, not code
+            if load8(line + 4) == 61:                    # "= name value": a cell's first value
+                if sl_data(line + 4) == 0: return 0
+            elif load8(line + 4) != 35:                  # "# ..." lines are the question's list, not code
                 if SL_OPS >= SL_MAX_OPS: return 0
                 if sl_split(line + 4) == 0: return 0
     if SL_OPS == 0: return 0
     sl_cell("z", 0)                              # the cells the machine always has
     sl_cell("one", 1)
+    let d = 0
+    while d < SL_DATA:
+        sl_cell(load(SL_DATA_NAME + d * 4), load(SL_DATA_VALUE + d * 4))
+        d += 1
     mem_fill(SL_MEM, 0, SL_SIZE * 4)
     let k = 0
     while k < SL_OPS:
@@ -322,12 +360,13 @@ pub fn sl_draw():                    # Park and Miller, worked out so no product
     if SL_SEED <= 0: SL_SEED += 2147483647
     return SL_SEED
 
-pub fn sl_kind(question):            # 0 sums, 1 a product, 2 printing; -1 none
+pub fn sl_kind(question):            # 0 sums, 1 a product, 2 printing, 3 a quotient; -1 none
     if slen(question) < 9: return -1
     if load8(question + 5) == 112: return 2              # "prog print ..."
     let i = 0
     while load8(question + i) != 0:
         if load8(question + i) == 42: return 1
+        if load8(question + i) == 47: return 3
         i += 1
     return 0
 
@@ -349,7 +388,7 @@ pub fn sl_list(question):            # the question's second line: its parts, nu
                 out = concat(concat(concat(concat(out, " "), str(k)), ":"), part)
                 k += 1
             i += 1
-    if kind == 1:
+    if kind == 1 or kind == 3:
         out = concat(concat(concat(out, " 0: "), sl_token(question, 7, 8)), concat(" 1: ", sl_token(question, 9, 10)))
     if kind == 2:                    # "0: 'h": the letter as the answer writes it, as far from its number
         let i = 11                   #   as there ("l0: 'h"), so that looking it up by number lands on it
@@ -409,6 +448,18 @@ pub fn sl_prompt(question):          # what the model is shown: a template with 
             out = concat(out, "    #      \n    #      \n")
             k += 1
         return out
+    if kind == 3:                    # a quotient's: 8 lines of 15 bytes over the program's 8, its x and y
+        let x = sl_char(load8(question + 7))     #   8 lines above where the program copies them
+        let y = sl_char(load8(question + 9))
+        let out = "prog quotient:\n    #         \n"
+        out = concat(out, concat(concat("    # ", x), "       \n"))
+        out = concat(out, "    #         \n")
+        out = concat(out, concat(concat(concat(concat("    #   ", y), " "), x), "   \n"))
+        let k = 4
+        while k < 8:
+            out = concat(out, "    #         \n")
+            k += 1
+        return out
     let x = sl_char(load8(question + 7))         # a product's: 8 lines of 15 bytes over the program's 6,
     let y = sl_char(load8(question + 9))         #   each letter it copies in its column, 8 lines up, as a
     let out = "prog product:\n"                  #   word's are
@@ -453,6 +504,13 @@ pub fn sl_answer(question):          # the reference program for a question (the
             k += 1
             i += 1
         return concat(out, "    z z -1    \n")
+    if kind == 3:                                        # "prog r=x/y:": x made x + 1, then y taken from
+        let x = sl_token(question, 7, 8)                 #   it while that leaves more than 0, r counting
+        let y = sl_token(question, 9, 10)                #   each time (so 0 or less: y did not fit); 15
+        out = concat("    l0: one z \n", concat(concat("    z ", x), "       \n"))   #   bytes a line
+        out = concat(out, "    z z       \n")
+        out = concat(out, concat(concat(concat(concat("    l1: ", y), " "), x), " l9\n"))
+        return concat(out, "    one z     \n    z r       \n    z z l1    \n    l9: z z -1\n")
     return 0
 
 fn sl_like(line, n, pattern, whole): # the line (n bytes) starts as the pattern does (whole: is it),
@@ -496,14 +554,19 @@ pub fn sl_weights(prompt, answer, focused):  # a digit a byte for prompt, answer
         if ended and sl_like(line, length, "    l1: z @ l9", 1): store8(w + q + start + 10, 57)
         if ended and sl_like(line, length, "    one @     ", 1): store8(w + q + start + 8, 57)
         if ended and sl_like(line, length, "    l0: @ z   ", 1): store8(w + q + start + 8, 57)
+        if ended and sl_like(line, length, "    z @       ", 1): store8(w + q + start + 6, 57)
+        if ended and sl_like(line, length, "    l1: @ @ l9", 1):
+            store8(w + q + start + 8, 57)
+            store8(w + q + start + 10, 57)
         i += 1
     return w
 
-pub fn sl_expect(question):          # what r must be for the inputs in SL_INPUTS (sums and products)
+pub fn sl_expect(question):          # what r must be for the inputs in SL_INPUTS (sums, products, quotients)
     let kind = sl_kind(question)
-    if kind == 1:
+    if kind == 1 or kind == 3:
         let x = load(SL_INPUTS + (load8(question + 7) - 97) * 4)
         let y = load(SL_INPUTS + (load8(question + 9) - 97) * 4)
+        if kind == 3: return (x / y) & 65535
         return (x * y) & 65535
     let total = 0
     let i = 7
@@ -532,6 +595,9 @@ pub fn sl_judge(program):            # the question and answer: 1 right, 0 wrong
             store(SL_INPUTS + k * 4, (sl_draw() % 2001) - 1000)
             k += 1
         if kind == 1: store(SL_INPUTS + (load8(question + 9) - 97) * 4, sl_draw() % 21)
+        if kind == 3:                                # a quotient: 0 to 200 over 1 to 20
+            store(SL_INPUTS + (load8(question + 7) - 97) * 4, sl_draw() % 201)
+            store(SL_INPUTS + (load8(question + 9) - 97) * 4, 1 + sl_draw() % 20)
         if sl_assemble(program) == 0: return -1
         if sl_run(20000) == 0: return -2
         if kind == 2:
@@ -549,6 +615,11 @@ pub fn sl_judge(program):            # the question and answer: 1 right, 0 wrong
 
 # ---- the tasks drawn for training and testing (os_rand: the same every run) ----
 pub fn pc_held(question):            # kept back from training: tested on, never learned from
+    if sl_kind(question) == 3:                       # quotients: b/a, d/c, e/b, a/d
+        let x = load8(question + 7)
+        let y = load8(question + 9)
+        if (x == 98 and y == 97) or (x == 100 and y == 99) or (x == 101 and y == 98) or (x == 97 and y == 100): return 1
+        return 0
     if sl_kind(question) == 1:
         let x = load8(question + 7)
         let y = load8(question + 9)
@@ -583,6 +654,16 @@ pub fn pc_product():
     while y == x: y = os_rand() % 5
     let q = alloc(16)
     mem_copy(q, "prog r=a*b:", 12)
+    store8(q + 7, 97 + x)
+    store8(q + 9, 97 + y)
+    return q
+
+pub fn pc_quotient():                # "prog r=x/y:", two different letters
+    let x = os_rand() % 5
+    let y = os_rand() % 5
+    while y == x: y = os_rand() % 5
+    let q = alloc(16)
+    mem_copy(q, "prog r=a/b:", 12)
     store8(q + 7, 97 + x)
     store8(q + 9, 97 + y)
     return q

@@ -1,6 +1,6 @@
 # corpus.nitropz KIND COUNT TEXT WEIGHTS [focused] [PARTS] -- the text the language model learns to
-# program from: COUNT tasks of KIND (products, words of 1 to PARTS letters, or sums of 1 to PARTS
-# parts; every length there is unless said: 8 letters, 4 parts), each
+# program from: COUNT tasks of KIND (products, quotients, words of 1 to PARTS letters, or sums of 1 to
+# PARTS parts; every length there is unless said: 8 letters, 4 parts), each
 # its prompt (subleq_lib's sl_prompt: the template it is shown) and then its reference program, and a
 # blank line; and a digit a byte for how much each byte counts in learning (sl_weights: the prompt 0, the
 # program 8, or "focused", 1 with each letter it copies from the prompt 9). Every program is run on the
@@ -64,9 +64,10 @@ fn main():
     if str_cmp(kind, "sums") == 0: which = 0
     if str_cmp(kind, "products") == 0: which = 1
     if str_cmp(kind, "words") == 0: which = 2
-    if str_cmp(kind, "held") == 0: which = 3      # only kept-back tasks, of every kind in turn: the
-    if which < 0 or count <= 0:                     #   text to measure held-out bits on
-        tell("corpus: KIND is products, words, sums or held, and COUNT a number above 0\n")
+    if str_cmp(kind, "held") == 0: which = 3      # only kept-back tasks of the first three kinds in
+    if str_cmp(kind, "quotients") == 0: which = 4 #   turn: the text to measure held-out bits on
+    if which < 0 or count <= 0:
+        tell("corpus: KIND is products, quotients, words, sums or held, and COUNT a number above 0\n")
         return 2
     CO_TEXT = alloc(count * 320 + 4096)          # a task and its program: 311 bytes at most
     CO_WEIGHTS = alloc(count * 320 + 4096)
@@ -80,7 +81,8 @@ fn main():
         if kind_now == 0: q = pc_sum()
         if kind_now == 1: q = pc_product()
         if kind_now == 2: q = pc_word()
-        if pc_held(q) == held and (kind_now == 1 or co_parts(q) <= parts):
+        if kind_now == 4: q = pc_quotient()
+        if pc_held(q) == held and (kind_now == 1 or kind_now == 4 or co_parts(q) <= parts):
             co_add(q, focused)
             made += 1
     fs_write_file(text_path, CO_TEXT, CO_N)

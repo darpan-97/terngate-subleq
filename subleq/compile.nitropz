@@ -1,0 +1,605 @@
+# compile.nitropz [MODEL] SOURCE | measure N -- arithmetic compiled to SUBLEQ, every instruction of it written by the
+# program model (models/35k_subleq.tlm2 unless said). SOURCE: an expression over the letters a to e and
+# whole numbers 0 and up, with + - * / % and brackets in the usual order, as "r = (a + b) * c - 3" (the
+# "r =" may be left out). It is broken into steps the model has been taught -- a sum of 1 to 4 parts, a
+# product of two cells, a quotient of two cells -- each into a cell of its own; the model writes each
+# step's program after its template, as `subleq_write live` does; each program is renamed (its letters
+# to the step's cells, r to the step's result, its labels to labels of its own) and joined to the next
+# (its stop turned into "go on"). Constants are cells given a first value ("= k1 3"). A product counts
+# its right side down to 0 and a quotient its left side, so a letter or constant there is copied first
+# (a one-part sum) into a cell of its own; a remainder is x - y * (x / y). The program runs on the gate
+# machine with a = 3, b = 5, c = 7, d = 11, e = 13, and is judged on 6 sets of inputs drawn from 0 to 20
+# that keep every step inside what the machine does (a product's counted side and a quotient's left side
+# not below 0, a divisor above 0, every value from -32768 to 32767). docs/subleq_compiler.js is its port
+# to the playground, held to it by subleq/page_check.js. "measure N": N expressions drawn at random (1 to
+# 4 operators over a to e and the numbers 0 to 9), each compiled and judged, and how many came out right.
+import std
+import std_io
+import std_fmt
+import os
+import model
+import engine
+import sample
+import subleq_lib
+
+fn tell(text): write(1, text, slen(text))
+
+# ---- reading ----
+let SRC = 0                          # the source: no spaces, small letters, "r=" taken off
+let AT = 0
+let ERR = 0                          # why it cannot be read, or 0
+let N_KIND = alloc(512 * 4)          # each node: its kind (the operator's byte; 118 a letter, 110 a number,
+let N_A = alloc(512 * 4)             #   109 a minus sign before something), its two sides, its letter or
+let N_B = alloc(512 * 4)             #   number, and the side a product counts down (97 a, 98 b)
+let N_V = alloc(512 * 4)
+let N_COUNT = alloc(512 * 4)
+let NODES = 0
+
+fn node(kind, a, b, v):
+    if NODES >= 512:
+        ERR = "the expression is too long"
+        return 0
+    store(N_KIND + NODES * 4, kind)
+    store(N_A + NODES * 4, a)
+    store(N_B + NODES * 4, b)
+    store(N_V + NODES * 4, v)
+    store(N_COUNT + NODES * 4, 98)
+    NODES += 1
+    return NODES - 1
+
+fn peek(): return load8(SRC + AT) & 255
+
+fn factor():
+    if ERR: return 0
+    let c = peek()
+    if c == 45:
+        AT += 1
+        let a = factor()
+        return node(109, a, 0, 0)
+    if c == 40:
+        AT += 1
+        let e = expr()
+        if ERR: return 0
+        if peek() != 41:
+            ERR = "a bracket is not closed"
+            return 0
+        AT += 1
+        return e
+    if c >= 97 and c <= 101:
+        AT += 1
+        return node(118, 0, 0, c)
+    if c >= 48 and c <= 57:
+        let v = 0
+        while peek() >= 48 and peek() <= 57:
+            v = v * 10 + peek() - 48
+            if v > 32767:
+                ERR = "a number above 32767"
+                return 0
+            AT += 1
+        return node(110, 0, 0, v)
+    if c == 0: ERR = "the expression ends too soon"
+    else: ERR = concat(concat("cannot read \"", sl_char(c)), "\": use a to e, numbers, + - * / % and brackets")
+    return 0
+
+fn term():
+    let n = factor()
+    while ERR == 0 and (peek() == 42 or peek() == 47 or peek() == 37):
+        let op = peek()
+        AT += 1
+        let b = factor()
+        n = node(op, n, b, 0)
+    return n
+
+fn expr():
+    let n = term()
+    while ERR == 0 and (peek() == 43 or peek() == 45):
+        let op = peek()
+        AT += 1
+        let b = term()
+        n = node(op, n, b, 0)
+    return n
+
+fn parse(source):                    # the root node, or -1 (ERR says why)
+    let n = slen(source)
+    SRC = alloc(n + 1)
+    let k = 0
+    let i = 0
+    while i < n:
+        let c = load8(source + i) & 255
+        if c != 32 and c != 9 and c != 10 and c != 13:
+            if c >= 65 and c <= 90: c = c + 32
+            store8(SRC + k, c)
+            k += 1
+        i += 1
+    store8(SRC + k, 0)
+    if k >= 2 and load8(SRC) == 114 and load8(SRC + 1) == 61: SRC = SRC + 2
+    ERR = 0
+    NODES = 0
+    AT = 0
+    if load8(SRC) == 0:
+        ERR = "nothing to compile"
+        return -1
+    let root = expr()
+    if ERR == 0 and peek() != 0: ERR = concat(concat("cannot read \"", sl_char(peek())), "\"")
+    if ERR: return -1
+    return root
+
+# ---- lowering: into steps the model has been taught ----
+let STEP_Q = alloc(256 * 4)          # each step: the task the model is asked, its letters' cells (a to d),
+let STEP_NAMES = alloc(256 * 16)     #   its result's cell, how it reads, and the program the model wrote
+let STEP_RESULT = alloc(256 * 4)
+let STEP_SHOWN = alloc(256 * 4)
+let STEP_PROGRAM = alloc(256 * 4)
+let STEPS = 0
+let DATA_NAME = alloc(64 * 4)        # the constants: their cells and values
+let DATA_VALUE = alloc(64 * 4)
+let DATA = 0
+let TEMPS = 0
+
+fn fresh():
+    TEMPS += 1
+    return concat("t", str(TEMPS))
+
+fn const_cell(v):
+    if v == 1: return "one"
+    let i = 0
+    while i < DATA:
+        if load(DATA_VALUE + i * 4) == v: return load(DATA_NAME + i * 4)
+        i += 1
+    store(DATA_NAME + DATA * 4, concat("k", str(DATA + 1)))
+    store(DATA_VALUE + DATA * 4, v)
+    DATA += 1
+    return load(DATA_NAME + (DATA - 1) * 4)
+
+fn add_step(question, result, shown):
+    if STEPS >= 255: return 0
+    store(STEP_Q + STEPS * 4, question)
+    store(STEP_RESULT + STEPS * 4, result)
+    store(STEP_SHOWN + STEPS * 4, shown)
+    STEPS += 1
+    return 0
+
+fn sum_step(result, signs, cells, count, again):   # at most 4 parts, the first a +: each cell a letter,
+    let row = STEP_NAMES + STEPS * 16                #   a to d in order, a cell once
+    mem_fill(row, 0, 16)
+    let names = 0
+    let q = "prog r="
+    let shown = ""
+    let i = 0
+    while i < count:
+        let cell = load(cells + i * 4)
+        let letter = -1
+        let j = 0
+        while j < names:
+            if str_cmp(load(row + j * 4), cell) == 0: letter = j
+            j += 1
+        if letter < 0:
+            letter = names
+            store(row + names * 4, cell)
+            names += 1
+        if i > 0:
+            if load(signs + i * 4) > 0:
+                q = concat(q, "+")
+                shown = concat(shown, " + ")
+            else:
+                q = concat(q, "-")
+                shown = concat(shown, " - ")
+        q = concat(q, sl_char(97 + letter))
+        shown = concat(shown, cell)
+        i += 1
+    let head = concat(result, " = ")
+    if again: head = concat(concat(head, result), " + ")
+    return add_step(concat(q, ":"), result, concat(head, shown))
+
+fn sum_one(target, cell):            # a copy: a one-part sum
+    let signs = alloc(4)
+    let cells = alloc(4)
+    store(signs, 1)
+    store(cells, cell)
+    return sum_step(target, signs, cells, 1, 0)
+
+fn sums(result, signs, cells, count):     # any number of parts: the + first, 4 to a step (a step adds
+    let order_s = alloc(count * 4 + 4)    #   into its result); a step that would start with a - starts
+    let order_c = alloc(count * 4 + 4)    #   with a constant 0 instead
+    let n = 0
+    let pass = 0
+    while pass < 2:
+        let i = 0
+        while i < count:
+            let s = load(signs + i * 4)
+            if (pass == 0 and s > 0) or (pass == 1 and s < 0):
+                store(order_s + n * 4, s)
+                store(order_c + n * 4, load(cells + i * 4))
+                n += 1
+            i += 1
+        pass += 1
+    let chunk_s = alloc(16)
+    let chunk_c = alloc(16)
+    let at = 0
+    let again = 0
+    while at < n:
+        let m = 0
+        if load(order_s + at * 4) < 0:
+            store(chunk_s, 1)
+            store(chunk_c, const_cell(0))
+            m = 1
+        while m < 4 and at < n:
+            store(chunk_s + m * 4, load(order_s + at * 4))
+            store(chunk_c + m * 4, load(order_c + at * 4))
+            m += 1
+            at += 1
+        sum_step(result, chunk_s, chunk_c, m, again)
+        again = 1
+    return 0
+
+fn two_step(op, result, x, y):       # a product (y counted down) or a quotient (x counted down)
+    let row = STEP_NAMES + STEPS * 16
+    mem_fill(row, 0, 16)
+    store(row, x)
+    store(row + 4, y)
+    let shown = concat(concat(concat(concat(result, " = "), x), concat(concat(" ", sl_char(op)), " ")), y)
+    return add_step(concat(concat("prog r=a", sl_char(op)), "b:"), result, shown)
+
+fn plain(n): return load(N_KIND + n * 4) == 118 or load(N_KIND + n * 4) == 110
+
+fn leaf_cell(n):
+    if load(N_KIND + n * 4) == 118: return sl_char(load(N_V + n * 4))
+    return const_cell(load(N_V + n * 4))
+
+fn flatten(n, sign, signs, cells, count_at):     # a chain of + and - (and minus signs) into parts
+    let k = load(N_KIND + n * 4)
+    if k == 43:
+        flatten(load(N_A + n * 4), sign, signs, cells, count_at)
+        flatten(load(N_B + n * 4), sign, signs, cells, count_at)
+    elif k == 45:
+        flatten(load(N_A + n * 4), sign, signs, cells, count_at)
+        flatten(load(N_B + n * 4), 0 - sign, signs, cells, count_at)
+    elif k == 109:
+        flatten(load(N_A + n * 4), 0 - sign, signs, cells, count_at)
+    else:
+        let cell = value(n, 0)
+        let c = load(count_at)
+        store(signs + c * 4, sign)
+        store(cells + c * 4, cell)
+        store(count_at, c + 1)
+    return 0
+
+fn value(n, target):                 # the cell holding n's value, made target's when one is given (not 0)
+    let k = load(N_KIND + n * 4)
+    if k == 118 or k == 110:
+        let cell = leaf_cell(n)
+        if target:
+            sum_one(target, cell)
+            return target
+        return cell
+    if k == 43 or k == 45 or k == 109:
+        let signs = alloc(512 * 4)
+        let cells = alloc(512 * 4)
+        let count_at = alloc(4)
+        store(count_at, 0)
+        flatten(n, 1, signs, cells, count_at)
+        let result = target
+        if result == 0: result = fresh()
+        sums(result, signs, cells, load(count_at))
+        return result
+    let x = value(load(N_A + n * 4), 0)
+    let y = value(load(N_B + n * 4), 0)
+    if k == 42:
+        let mult = x
+        let count = y
+        let count_node = load(N_B + n * 4)
+        store(N_COUNT + n * 4, 98)
+        if plain(load(N_B + n * 4)) == 0 and plain(load(N_A + n * 4)):
+            mult = y
+            count = x
+            count_node = load(N_A + n * 4)
+            store(N_COUNT + n * 4, 97)
+        if plain(count_node):
+            let c = fresh()
+            sum_one(c, count)
+            count = c
+        let result = target
+        if result == 0: result = fresh()
+        two_step(42, result, mult, count)
+        return result
+    if k == 47:
+        let dividend = x
+        if plain(load(N_A + n * 4)):
+            dividend = fresh()
+            sum_one(dividend, x)
+        let result = target
+        if result == 0: result = fresh()
+        two_step(47, result, dividend, y)
+        return result
+    let d = fresh()                  # %: x - y * (x / y), x copied for the division
+    sum_one(d, x)
+    let q = fresh()
+    two_step(47, q, d, y)
+    let p = fresh()
+    two_step(42, p, y, q)
+    let result = target
+    if result == 0: result = fresh()
+    let signs = alloc(8)
+    let cells = alloc(8)
+    store(signs, 1)
+    store(cells, x)
+    store(signs + 4, 0 - 1)
+    store(cells + 4, p)
+    sums(result, signs, cells, 2)
+    return result
+
+# ---- writing: each step's program, as write.nitropz's wp_write writes it ----
+let TEXT = alloc(4096)
+
+fn write_program(question):          # the lines the model writes after the question's template
+    let q = sl_prompt(question)
+    let length = slen(q)
+    mem_copy(TEXT, q, length)
+    let pos = 0
+    while pos < length:
+        engine_step(load8(TEXT + pos) & 255, pos)
+        pos += 1
+    while length < 1000:
+        if pos == CONTEXT:
+            let keep = CONTEXT / 2
+            let from = length - keep
+            pos = 0
+            while pos < keep:
+                engine_step(load8(TEXT + from + pos) & 255, pos)
+                pos += 1
+        let next = sample_draw(0.0)
+        if next != 32 and load8(TEXT + length - 1) == 10: break
+        store8(TEXT + length, next)
+        length += 1
+        engine_step(next, pos)
+        pos += 1
+    store8(TEXT + length, 0)
+    return concat(TEXT + slen(q), "")
+
+# ---- linking: each step's program renamed and joined to the next ----
+let TOKS = alloc(16 * 4)
+let LABELS = alloc(32 * 4)
+let NLABELS = 0
+
+fn split(line):                      # its words into TOKS; how many
+    let n = slen(line)
+    let count = 0
+    let i = 0
+    while i < n:
+        while i < n and load8(line + i) == 32: i += 1
+        if i >= n: break
+        let start = i
+        while i < n and load8(line + i) != 32: i += 1
+        if count < 16:
+            store(TOKS + count * 4, sl_token(line, start, i))
+            count += 1
+    return count
+
+fn ends_colon(t): return slen(t) > 0 and load8(t + slen(t) - 1) == 58
+
+fn rename(tok, k):
+    let i = 0
+    while i < NLABELS:
+        if str_cmp(load(LABELS + i * 4), tok) == 0: return concat(concat("s", str(k + 1)), tok)
+        i += 1
+    if str_cmp(tok, "r") == 0: return load(STEP_RESULT + k * 4)
+    if slen(tok) == 1:
+        let c = load8(tok)
+        if c >= 97 and c <= 100:
+            let cell = load(STEP_NAMES + k * 16 + (c - 97) * 4)
+            if cell: return cell
+    return tok
+
+fn link_step(k):                     # step k's program, renamed: its lines
+    let program = load(STEP_PROGRAM + k * 4)
+    let n = slen(program)
+    NLABELS = 0
+    let i = 0
+    while i < n:                     # its labels first
+        let start = i
+        while i < n and load8(program + i) != 10: i += 1
+        let count = split(sl_token(program, start, i))
+        if count > 0 and ends_colon(load(TOKS)) and NLABELS < 32:
+            let t = load(TOKS)
+            store(LABELS + NLABELS * 4, sl_token(t, 0, slen(t) - 1))
+            NLABELS += 1
+        i += 1
+    let out = ""
+    i = 0
+    while i < n:
+        let start = i
+        while i < n and load8(program + i) != 10: i += 1
+        let count = split(sl_token(program, start, i))
+        i += 1
+        if count > 0:
+            let line = "    "
+            let first = 0
+            if ends_colon(load(TOKS)):
+                let t = load(TOKS)
+                line = concat(concat(line, rename(sl_token(t, 0, slen(t) - 1), k)), ": ")
+                first = 1
+            let ops = count - first
+            if k < STEPS - 1 and ops == 3 and str_cmp(load(TOKS + (count - 1) * 4), "-1") == 0: count -= 1
+            let j = first
+            while j < count:
+                if j > first: line = concat(line, " ")
+                line = concat(line, rename(load(TOKS + j * 4), k))
+                j += 1
+            out = concat(concat(out, line), "\n")
+    return out
+
+fn link(text):
+    let out = concat(concat("prog ", text), ":\n")
+    let d = 0
+    while d < DATA:
+        out = concat(out, concat(concat(concat(concat("    = ", load(DATA_NAME + d * 4)), " "), str(load(DATA_VALUE + d * 4))), "\n"))
+        d += 1
+    let k = 0
+    while k < STEPS:
+        out = concat(out, link_step(k))
+        k += 1
+    return out
+
+# ---- the judge: the expression worked out where the machine can do it ----
+let BAD = 0                          # 1 when a step goes outside what the machine does
+
+fn fits(v):
+    if v < 0 - 32768 or v > 32767: BAD = 1
+    return v
+
+fn evaluate(n):                      # n's value for the inputs in SL_INPUTS
+    let k = load(N_KIND + n * 4)
+    if k == 118: return load(SL_INPUTS + (load(N_V + n * 4) - 97) * 4)
+    if k == 110: return load(N_V + n * 4)
+    if k == 109: return fits(0 - evaluate(load(N_A + n * 4)))
+    let a = evaluate(load(N_A + n * 4))
+    let b = evaluate(load(N_B + n * 4))
+    if BAD: return 0
+    if k == 43: return fits(a + b)
+    if k == 45: return fits(a - b)
+    if k == 42:
+        let count = b
+        if load(N_COUNT + n * 4) == 97: count = a
+        if count < 0: BAD = 1
+        return fits(a * b)
+    if a < 0 or a > 32766 or b <= 0:              # (a quotient's loop works on a + 1)
+        BAD = 1
+        return 0
+    if k == 47: return a / b
+    return a - b * (a / b)
+
+let JUDGED = 0                       # the sets of inputs the judge ran
+
+fn judge(root, program):             # 1 right on every set tried, 0 wrong, -1 no assemble, -2 no stop, -3 no
+    SL_SEED = 12345                  #   set of inputs (a to e from 0 to 20) keeps it inside the machine
+    let tried = 0
+    JUDGED = 0
+    while JUDGED < 6 and tried < 400:
+        tried += 1
+        let k = 0
+        while k < 5:
+            store(SL_INPUTS + k * 4, sl_draw() % 21)
+            k += 1
+        BAD = 0
+        let want = evaluate(root)
+        if BAD == 0:
+            JUDGED += 1
+            if sl_assemble(program) == 0: return -1
+            if sl_run(400000) == 0: return -2
+            if SL_R < 0: return 0
+            let got = load(SL_MEM + SL_R * 4)
+            if got >= 32768: got = got - 65536
+            if got != want: return 0
+    if JUDGED == 0: return -3
+    return 1
+
+let SEED = 7                         # measure's draws (Park and Miller's rule)
+
+fn draw(n):
+    SEED = 48271 * (SEED % 44488) - 3399 * (SEED / 44488)
+    if SEED <= 0: SEED += 2147483647
+    return SEED % n
+
+fn random_expr(ops):                 # an expression of ops operators, every one in brackets
+    if ops == 0:
+        if draw(5) == 0: return str(draw(10))
+        return sl_char(97 + draw(5))
+    let left = draw(ops)
+    let op = load8("+-*/%" + draw(5))
+    return concat(concat(concat(concat("(", random_expr(left)), sl_char(op)), random_expr(ops - 1 - left)), ")")
+
+let ROOT = 0                         # the last expression compiled: its tree's root
+
+fn compile(source, show):            # the program, or 0 (ERR says why); steps written by the model
+    let root = parse(source)
+    if root < 0: return 0
+    STEPS = 0
+    DATA = 0
+    TEMPS = 0
+    ROOT = root
+    let text = concat("r=", SRC)
+    value(root, "r")
+    if show: tell(concat(text, "\nsteps, each a task the model has been taught:\n"))
+    let k = 0
+    while k < STEPS:
+        store(STEP_PROGRAM + k * 4, write_program(load(STEP_Q + k * 4)))
+        if show:
+            let shown = concat("  ", load(STEP_SHOWN + k * 4))
+            while slen(shown) < 26: shown = concat(shown, " ")
+            tell(concat(concat(concat(shown, " "), load(STEP_Q + k * 4)), "\n"))
+        k += 1
+    return link(text)
+
+fn measure(count):                   # count drawn expressions compiled and judged
+    let right = 0
+    let wrong = 0
+    let outside = 0
+    let steps = 0
+    let most = 0
+    let i = 0
+    while i < count:
+        let source = random_expr(1 + draw(4))
+        let program = compile(source, 0)
+        let verdict = -1
+        if program: verdict = judge(ROOT, program)
+        if verdict == 1:
+            right += 1
+            steps += STEPS
+            if STEPS > most: most = STEPS
+        elif verdict == -3: outside += 1
+        else:
+            wrong += 1
+            if wrong <= 5: tell(concat(concat(concat(concat("  not right (", str(verdict)), "): "), source), "\n"))
+        i += 1
+    tell(concat(concat(concat(str(right), " right, "), str(wrong)), concat(concat(" wrong, ", str(outside)), " with no inputs from 0 to 20 inside what the machine does\n")))
+    tell(concat(concat(concat(concat("of ", str(count)), " drawn; the right ones "), str(steps / (right + 1))), concat(concat(" steps on average, at most ", str(most)), "\n")))
+    return 0
+
+fn main():
+    let model_path = "models/35k_subleq.tlm2"
+    let source = alloc(4096)
+    let first = 0
+    if os_arg(0, source, 4096) > 0 and slen(source) > 5 and str_cmp(source + slen(source) - 5, ".tlm2") == 0:
+        model_path = concat(source, "")
+        first = 1
+    if os_arg(first, source, 4096) <= 0:
+        tell("compile [MODEL] SOURCE, as: compile \"r = (a + b) * c - 3\"; or compile [MODEL] measure N\n")
+        return 2
+    if engine_load(model_path) == 0:
+        tell(concat(concat("not a model: ", model_path), "\n"))
+        return 2
+    if str_cmp(source, "measure") == 0:
+        let n = alloc(64)
+        if os_arg(first + 1, n, 64) <= 0: return measure(1000)
+        return measure(atoi(n))
+    let program = compile(source, 1)
+    if program == 0:
+        tell(concat(concat("cannot compile: ", ERR), "\n"))
+        return 2
+    let root = ROOT
+    tell("the program, every instruction the model's:\n")
+    tell(program)
+    store(SL_INPUTS, 3)
+    store(SL_INPUTS + 4, 5)
+    store(SL_INPUTS + 8, 7)
+    store(SL_INPUTS + 12, 11)
+    store(SL_INPUTS + 16, 13)
+    BAD = 0
+    evaluate(root)
+    tell("  => a = 3, b = 5, c = 7, d = 11, e = 13: ")
+    if BAD: tell("outside what the machine does")
+    elif sl_assemble(program) == 0: tell("does not assemble")
+    elif sl_run(400000) == 0: tell("does not stop")
+    else:
+        let r = load(SL_MEM + SL_R * 4)
+        if r >= 32768: r = r - 65536
+        tell(concat(concat(concat(str(SL_STEPS), " steps on the gate machine, r = "), str(r)), ""))
+    let verdict = judge(root, program)
+    if verdict == 1: tell(concat(concat(" -- right on ", str(JUDGED)), " sets of inputs\n"))
+    elif verdict == 0: tell(" -- WRONG\n")
+    elif verdict == -1: tell(" -- does not assemble\n")
+    elif verdict == -2: tell(" -- does not stop\n")
+    else: tell(" -- no inputs from 0 to 20 keep it inside what the machine does\n")
+    return 0
+
+exit(main())

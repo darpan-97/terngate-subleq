@@ -138,35 +138,44 @@ The computer above is ordinary code. `models/subleq_computer.tlm2` is the same c
 transformer, run by the same engine as the two models -- but nothing in it was learned:
 `subleq/computer_build.nitropz` sets every one of its weights by hand. Given a program's memory as bytes,
 it writes the run itself, a byte a pass. `out/subleq_computer run subleq/programs/product.txt 0 0 7 3`
-(c = 7, d = 3; r is the word at 22):
+(c = 7, d = 3; r is the word at 22) shows every byte it reads and writes, as it writes it:
 
 ```
-  step 1: the model writes 3 at 20, next 3   | the machine writes 3 at 20, next 3
-  step 2: the model writes 2 at 20, next 6   | the machine writes 2 at 20, next 6
-  step 3: the model writes 65529 at 18, next 9   | the machine writes 65529 at 18, next 9
-  step 4: the model writes 7 at 22, next 12   | the machine writes 7 at 22, next 12
+the model reads 144 bytes -- each word of memory that is not 0, its value's nibbles (v) then its address's (a), lowest first; then pc 0 (n):
+  v2 v1 v0 v0 a0 a0 a0    mem[0] = 18
+  v4 v1 v0 v0 a1 a0 a0    mem[1] = 20
   ...
-  step 14: the model writes 21 at 22, next 12   | the machine writes 21 at 22, next 12
-  step 15: the model writes 0 at 18, next 0   | the machine writes 0 at 18, next 0
-  step 16: the model writes 0 at 20, next 15   | the machine writes 0 at 20, next 15
-  step 17: the model writes 0 at 18, next 65535   | the machine writes 0 at 18, next 65535
-  the model ended with STOP
+  v7 v0 v0 v0 a5 a1 a0    mem[21] = 7
+  n0 n0 n0 n0                pc = 0
+and writes, a byte a pass (each step: the word it changes, where, the next pc; or the byte it prints):
+  v3 v0 v0 v0 a4 a1 a0 n3 n0 n0 n0    = 3 at 20, next 3   | the machine: 3 at 20, next 3   (step 1)
+  v2 v0 v0 v0 a4 a1 a0 n6 n0 n0 n0    = 2 at 20, next 6   | the machine: 2 at 20, next 6   (step 2)
+  v9 vf vf vf a2 a1 a0 n9 n0 n0 n0    = 65529 at 18, next 9   | the machine: 65529 at 18, next 9   (step 3)
+  v7 v0 v0 v0 a6 a1 a0 nc n0 n0 n0    = 7 at 22, next 12   | the machine: 7 at 22, next 12   (step 4)
+  ...
+  v5 v1 v0 v0 a6 a1 a0 nc n0 n0 n0    = 21 at 22, next 12   | the machine: 21 at 22, next 12   (step 14)
+  v0 v0 v0 v0 a2 a1 a0 n0 n0 n0 n0    = 0 at 18, next 0   | the machine: 0 at 18, next 0   (step 15)
+  v0 v0 v0 v0 a4 a1 a0 nf n0 n0 n0    = 0 at 20, next 15   | the machine: 0 at 20, next 15   (step 16)
+  v0 v0 v0 v0 a2 a1 a0 nf nf nf nf    = 0 at 18, next 65535   | the machine: 0 at 18, next 65535   (step 17)
+  STOP    | the machine: STOP
   r = 21 (the machine: 21)
 every step the same as the machine's
 ```
 
-The left side is what the model wrote, read back; the right is the gate machine. `subleq/programs/`
-holds five programs to try (a product, a quotient, a sum, a word, a countdown), and any program the
-playground's assembler reads runs as well -- including what the program model writes: `run` takes what
-`out/subleq_write live` or `out/subleq_compile` printed, so one model writes a program and the other
-runs it, neither of them ordinary code. Of 20 so written -- sums, products to 20 x 1,000, 200 / 7, three
-words, four expressions compiled into the model's steps -- 19 ran to their end, every step the same as
-the gate machine's; `r = a % b + 100 / (c + 1)` with c = 4 needs 148 steps, and filled the view after 85,
-all of them right (with c = 49 it fits, and ends right). A byte is a type and a
-nibble (16 * type + nibble). The prompt states each word of memory that is not 0 -- its value's four
-nibbles, then its address's three -- and then pc 0. Each step the model writes the word it changes and
-where (11 bytes with the next pc), or the byte it prints (6), and at the end STOP, or END where the
-playground's trace ends a run without a stop (pc past 509, an address past 511).
+Each token is one byte, 16 * type + nibble: `v4` is the byte 20 (type 1, a value's lowest nibble, and
+4). The prompt states each word of memory that is not 0 -- its value's four nibbles, then its
+address's three -- and then pc 0. Each step the model writes the word it changes and where, with the
+next pc (11 bytes), or the byte it prints (`p8 p6`, 104, an h) with the next pc (6), and at the end
+STOP, or END where the playground's trace ends a run without a stop (pc past 509, an address past
+511). After each step's last byte the runner reads the step back, beside the gate machine's.
+
+`subleq/programs/` holds five programs to try (a product, a quotient, a sum, a word, a countdown), and
+any program the playground's assembler reads runs as well -- including what the program model writes:
+`run` takes what `out/subleq_write live` or `out/subleq_compile` printed, so one model writes a program
+and the other runs it, neither of them ordinary code. Of 20 so written -- sums, products to 20 x
+1,000, 200 / 7, three words, four expressions compiled into the model's steps -- 19 ran to their end,
+every step the same as the gate machine's; `r = a % b + 100 / (c + 1)` with c = 4 needs 148 steps,
+and filled the view after 85, all of them right (with c = 49 it fits, and ends right).
 
 How a transformer can do that exactly, with every layer weight -1, 0 or +1 and every layer's input
 rounded to whole numbers from -127 to 127:

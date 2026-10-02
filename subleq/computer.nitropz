@@ -2,7 +2,9 @@
 # (models/subleq_computer.tlm2 unless said: a transformer whose weights were set by hand, see
 # subleq/computer_build.nitropz) running SUBLEQ programs, every step it writes held to the gate machine.
 #   run FILE      a program as the playground's assembler reads it (the "prog ..." line, then a line an
-#                 instruction; a to e as given, 0 if not): the model's run printed beside the machine's.
+#                 instruction; a to e as given, 0 if not): every byte the model reads, then every byte
+#                 it writes, as it writes it (v4: a value's nibble 4; a address, n next pc, p printed),
+#                 each step read back beside the machine's as soon as its last byte is written.
 #                 FILE may be what `out/subleq_write live` or `out/subleq_compile` printed: the program
 #                 model's own program, run by this one
 #   check         the programs below, each right at every step and in how it ends
@@ -30,11 +32,65 @@ let WRITTEN_N = 0
 let MEM_COPY = alloc(SL_SIZE * 4)
 let FULL = 0                         # 1: the run filled the model's view before it ended
 
+let SHOW = 0                         # 1: every byte shown as it is read or written (run)
+let HEX = "0123456789abcdef"
+
+fn tok(b):                           # a byte as a token: its field (v value, a address, n next pc,
+    let t = b >> 4                   #   p printed) and its nibble; or STOP, END
+    let d = sl_char(load8(HEX + (b & 15)))
+    if t == CP_STOP: return "STOP"
+    if t == CP_END: return "END"
+    if t >= 1 and t <= 4: return concat("v", d)
+    if t >= 5 and t <= 7: return concat("a", d)
+    if t >= 8 and t <= 11: return concat("n", d)
+    if t == 12 or t == 13: return concat("p", d)
+    return concat("?", str(b))
+
+fn nibbles(at, count):               # count nibbles from at in TEXT, the lowest first
+    let v = 0
+    let k = 0
+    while k < count:
+        v = v | ((load8(TEXT + at + k) & 15) << (4 * k))
+        k += 1
+    return v
+
+fn show_prompt():                    # what the model reads: a statement a line, then pc 0
+    tell(concat(concat("the model reads ", str(PROMPT_N)), " bytes -- each word of memory that is not 0, its value's nibbles (v) then its address's (a), lowest first; then pc 0 (n):\n"))
+    let at = 0
+    while at + 7 <= PROMPT_N - 4:
+        let line = "  "
+        let k = 0
+        while k < 7:
+            line = concat(concat(line, tok(load8(TEXT + at + k) & 255)), " ")
+            k += 1
+        tell(concat(concat(concat(concat(line, "   mem["), str(nibbles(at + 4, 3))), "] = "), concat(str(nibbles(at, 4)), "\n")))
+        at += 7
+    tell("  n0 n0 n0 n0                pc = 0\n")
+    tell("and writes, a byte a pass (each step: the word it changes, where, the next pc; or the byte it prints):\n  ")
+
+fn machine_says(k):                  # the machine's step k (or how it ends), for beside the model's
+    if k >= REF_ROWS:
+        if REF_STOPPED: return "the machine: STOP"
+        return "the machine: END"
+    if load(REF_PRINTED + k * 4) >= 0: return concat(concat(concat("the machine: prints ", str(load(REF_PRINTED + k * 4))), ", next "), str(load(REF_NEXT + k * 4)))
+    return concat(concat(concat(concat(concat("the machine: ", str(load(REF_AFTER + k * 4))), " at "), str(load(REF_B + k * 4))), ", next "), str(load(REF_NEXT + k * 4)))
+
+# the step the model just finished writing: bytes [from, to] of TEXT, its k-th
+fn show_step(from, to, k):
+    let t = (load8(TEXT + from) & 255) >> 4
+    let mine = ""
+    if t == CP_V0 and to - from == 10:
+        mine = concat(concat(concat(concat(concat("= ", str(nibbles(from, 4))), " at "), str(nibbles(from + 4, 3))), ", next "), str(nibbles(from + 7, 4)))
+    elif t == CP_P0 and to - from == 5:
+        mine = concat(concat(concat(concat("= prints ", str(nibbles(from, 2))), ", next "), str(nibbles(from + 2, 4))), "")
+    tell(concat(concat(concat(concat("   ", mine), "   | "), machine_says(k)), concat(concat("   (step ", str(k + 1)), ")\n  ")))
+
 # SL_MEM's program, read and then written a byte a pass until STOP or END, `limit` steps, or the view's end
 fn run_model(limit):
     TEXT = alloc(SL_SIZE * 7 + CONTEXT + 16)       # room for a prompt of all 512 words, then the run
     PROMPT_N = cp_prompt(TEXT)
     if PROMPT_N >= CONTEXT: return 0
+    if SHOW: show_prompt()
     let pos = 0
     while pos < PROMPT_N:
         engine_step(load8(TEXT + pos) & 255, pos)
@@ -43,50 +99,42 @@ fn run_model(limit):
     WRITTEN_N = 0
     FULL = 0
     let steps = 0
+    let rec_from = PROMPT_N                          # where the step being written began
     while pos < CONTEXT:
         let b = engine_likeliest()
         store8(WRITTEN + WRITTEN_N, b)
         WRITTEN_N += 1
         let t = b >> 4
-        if t == CP_STOP or t == CP_END: return 1
+        if SHOW: tell(concat(tok(b), " "))
+        if t == CP_STOP or t == CP_END:
+            if SHOW: tell(concat(concat("   | ", machine_says(steps)), "\n"))
+            return 1
         if t == CP_N3:
+            if SHOW: show_step(rec_from, pos, steps)
+            rec_from = pos + 1
             steps += 1
             if steps >= limit: return 1
         engine_step(b, pos)
         pos += 1
     FULL = 1
+    if SHOW: tell("   (the view is full)\n")
     return 1
 
-# SL_MEM as assembled: the model's run and the machine's, compared; 1 if every step is the same
+# SL_MEM as assembled: the model's run and the machine's, compared; 1 if every step is the same. show:
+# every byte as the model reads or writes it, each step beside the machine's as it is written
 fn judge(limit, show):
     mem_copy(MEM_COPY, SL_MEM, SL_SIZE * 4)
-    if run_model(limit) == 0:
+    cp_reference(limit)                              # the machine's run first (it changes SL_MEM)
+    mem_copy(SL_MEM, MEM_COPY, SL_SIZE * 4)
+    SHOW = show
+    let ran = run_model(limit)
+    SHOW = 0
+    if ran == 0:
         tell("  the program does not fit the model's view\n")
         return 0
     cp_decode(WRITTEN, WRITTEN_N)
-    mem_copy(SL_MEM, MEM_COPY, SL_SIZE * 4)
-    cp_reference(limit)
-    mem_copy(SL_MEM, MEM_COPY, SL_SIZE * 4)
     let right = cp_compare(limit, FULL)
-    if show:
-        let s = 0
-        while s < REF_ROWS or s < OUT_ROWS:
-            let line = concat(concat("  step ", str(s + 1)), ": ")
-            if s < OUT_ROWS:
-                if load(OUT_PRINTED + s * 4) >= 0: line = concat(concat(line, "the model prints "), str(load(OUT_PRINTED + s * 4)))
-                else: line = concat(concat(concat(concat(line, "the model writes "), str(load(OUT_AFTER + s * 4))), " at "), str(load(OUT_B + s * 4)))
-                line = concat(concat(line, ", next "), str(load(OUT_NEXT + s * 4)))
-            if s < REF_ROWS:
-                if load(REF_PRINTED + s * 4) >= 0: line = concat(concat(line, "   | the machine prints "), str(load(REF_PRINTED + s * 4)))
-                else: line = concat(concat(concat(concat(line, "   | the machine writes "), str(load(REF_AFTER + s * 4))), " at "), str(load(REF_B + s * 4)))
-                line = concat(concat(line, ", next "), str(load(REF_NEXT + s * 4)))
-            tell(concat(line, "\n"))
-            s += 1
-        let ended = "neither"
-        if OUT_END == 1: ended = "STOP"
-        if OUT_END == 2: ended = "END"
-        tell(concat(concat("  the model ended with ", ended), "\n"))
-        answer()
+    if show: answer()
     if CP_WHY == 0 and (right == REF_ROWS or CP_FULL): return 1
     tell(concat(concat(concat(concat("  WRONG at step ", str(CP_AT + 1)), ": "), CP_WHY), "\n"))
     return 0

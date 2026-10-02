@@ -1,0 +1,184 @@
+# pack.nitropz CHECKPOINT OUT -- a trained model made as small as it is: train.nitropz's checkpoint
+# ("TLM1", every parameter a double) written as "TLM2" (engine.nitropz has the layout): each layer
+# matrix's weights, -1, 0 or +1, five to a byte; its scale; the embedding a byte a number times a scale a
+# row; the norms' gains as floats. The layer matrices are already -1, 0, +1 times a scale -- that is
+# how the model was trained -- so they lose nothing; the embedding is rounded to 255 steps a row. Then it
+# reads OUT back and holds it to that: every weight and scale as it was, every embedding number within
+# half a step of its row's scale. Exits 1 when not.
+import std
+import std_io
+import std_fmt
+import fs
+import os
+import model
+import engine
+
+fn say(text): write(1, text, slen(text))
+fn say_int(v): say(str(v))
+
+fn round_half_away(x: f64) -> f64:
+    if x >= 0.0: return f64(i32(x + 0.5))
+    return 0.0 - f64(i32(0.5 - x))
+
+let DIGITS_OUT = 0                   # packing: the next byte to write, its digits so far, and their value
+let DIGITS_COUNT = 0
+let DIGITS_VALUE = 0
+let DIGITS_UNIT = 1
+
+fn put_digit(d):                     # d (0 1 2) the next digit
+    DIGITS_VALUE += d * DIGITS_UNIT
+    DIGITS_UNIT *= 3
+    DIGITS_COUNT += 1
+    if DIGITS_COUNT == 5:
+        store8(DIGITS_OUT, DIGITS_VALUE)
+        DIGITS_OUT += 1
+        DIGITS_COUNT = 0
+        DIGITS_VALUE = 0
+        DIGITS_UNIT = 1
+
+fn pack_weights(at, count):          # count weights of TERNARY from at
+    let i = 0
+    while i < count:
+        put_digit(i32(loadf(TERNARY + (at + i) * 8)) + 1)
+        i += 1
+
+fn put_floats(at, count, to):        # count parameters from at, as floats at to
+    let i = 0
+    while i < count:
+        storef32(to + i * 4, loadf(PARAMS + (at + i) * 8))
+        i += 1
+    return to + count * 4
+
+let path = alloc(4096)
+let out_path = alloc(4096)
+os_arg(0, path, 4096)
+os_arg(1, out_path, 4096)
+if engine_load(path) == 0:
+    say(concat(concat("not a model: ", path), "\n"))
+    exit(2)
+let size = packed_size()
+let out = alloc(size)
+store8(out, 84)                      # "TLM2"
+store8(out + 1, 76)
+store8(out + 2, 77)
+store8(out + 3, 50)
+store(out + 4, VOCAB)
+store(out + 8, DIM)
+store(out + 12, model_layers_field())
+store(out + 16, HEADS)
+store(out + 20, HIDDEN)
+store(out + 24, CONTEXT)
+let at = out + 28
+let i = 0
+while i < BLOCK * 7:
+    storef(at + i * 8, loadf(SCALES + i * 8))
+    i += 1
+DIGITS_OUT = at + BLOCK * 7 * 8
+let l = 0
+while l < BLOCK:
+    let base = OFF_LAYERS + l * LAYER_SIZE
+    pack_weights(base + L_WQ, 4 * DIM * DIM)
+    pack_weights(base + L_W1, 3 * HIDDEN * DIM)
+    l += 1
+while DIGITS_COUNT > 0: put_digit(1)                 # the last byte made up with zeros (digit 1)
+let trits = BLOCK * (4 * DIM * DIM + 3 * HIDDEN * DIM)
+let scales = at + BLOCK * 7 * 8 + ((trits + 4) / 5 + 3) / 4 * 4
+let numbers = scales + VOCAB * 4
+let v = 0
+while v < VOCAB:                     # each row: its largest size over 127 is its step
+    let row = PARAMS + v * DIM * 8
+    let most: f64 = 0.0
+    let j = 0
+    while j < DIM:
+        let e: f64 = loadf(row + j * 8)
+        if e < 0.0: e = 0.0 - e
+        if e > most: most = e
+        j += 1
+    let s: f64 = most / 127.0
+    if s == 0.0: s = 1.0
+    storef32(scales + v * 4, s)
+    s = loadf32(scales + v * 4)                      # the step as written
+    j = 0
+    while j < DIM:
+        let q: f64 = round_half_away(loadf(row + j * 8) / s)
+        if q > 127.0: q = 127.0
+        if q < -127.0: q = -127.0
+        store8(numbers + v * DIM + j, i32(q))
+        j += 1
+    v += 1
+let gains = numbers + VOCAB * DIM
+l = 0
+while l < BLOCK:
+    let base = OFF_LAYERS + l * LAYER_SIZE
+    gains = put_floats(base + L_G1, DIM, gains)
+    gains = put_floats(base + L_G2, DIM, gains)
+    l += 1
+put_floats(OFF_FINAL, DIM, gains)
+fs_write_file(out_path, out, size)
+
+# read back: the engine's own reading of OUT, against what was packed
+let was_params = PARAMS
+let was_ternary = TERNARY
+let was_scales = SCALES
+if engine_load(out_path) == 0:
+    say("the packed model does not read back\n")
+    exit(1)
+let wrong = 0
+i = 0
+while i < BLOCK * 7:
+    if loadf(SCALES + i * 8) != loadf(was_scales + i * 8): wrong += 1
+    i += 1
+l = 0
+while l < BLOCK:
+    let base = OFF_LAYERS + l * LAYER_SIZE
+    i = 0
+    while i < LAYER_SIZE:
+        let w = (base + i) * 8
+        if i >= L_WQ and i < L_G2 and loadf(TERNARY + w) != loadf(was_ternary + w): wrong += 1
+        if i >= L_W1 and loadf(TERNARY + w) != loadf(was_ternary + w): wrong += 1
+        i += 1
+    l += 1
+let off = 0                          # the gains: floats, so within a float's rounding
+l = 0
+while l <= BLOCK:
+    let base = OFF_FINAL
+    if l < BLOCK: base = OFF_LAYERS + l * LAYER_SIZE
+    i = 0
+    while i < DIM:
+        let a: f64 = loadf(PARAMS + (base + i) * 8)
+        let b: f64 = loadf(was_params + (base + i) * 8)
+        let c: f64 = 0.0
+        let d: f64 = 0.0
+        if l < BLOCK:
+            c = loadf(PARAMS + (base + L_G2 + i) * 8)
+            d = loadf(was_params + (base + L_G2 + i) * 8)
+        let gap: f64 = a - b
+        if gap < 0.0: gap = 0.0 - gap
+        if b < 0.0: b = 0.0 - b
+        if gap > b * 0.0000001: off += 1
+        gap = c - d
+        if gap < 0.0: gap = 0.0 - gap
+        if d < 0.0: d = 0.0 - d
+        if gap > d * 0.0000001: off += 1
+        i += 1
+    l += 1
+let far = 0
+v = 0
+while v < VOCAB:
+    let half: f64 = 0.5 * loadf32(scales + v * 4) * 1.000001
+    let j = 0
+    while j < DIM:
+        let gap: f64 = loadf(PARAMS + (v * DIM + j) * 8) - loadf(was_params + (v * DIM + j) * 8)
+        if gap < 0.0: gap = 0.0 - gap
+        if gap > half: far += 1
+        j += 1
+    v += 1
+say(concat(concat(concat(concat("packed ", str(size)), " bytes, from "), str(28 + PARAM_COUNT * 8)), " -- "))
+say_int(trits)
+say(" weights at 1.6 bits each, the embedding a byte a number\n")
+if wrong == 0 and far == 0 and off == 0:
+    say("read back: every weight and scale as it was, every embedding number within half a step, every gain within a float's rounding\n")
+    exit(0)
+say(concat(concat(concat(str(wrong), " weights or scales differ, "), str(far)), " embedding numbers more than half a step off, "))
+say(concat(str(off), " gains off\n"))
+exit(1)

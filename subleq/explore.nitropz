@@ -1,0 +1,239 @@
+# explore.nitropz MODEL KIND TASKS TRIES TEXT WEIGHTS [SKIP [HELD [FIRST [HEAT [FLOOR [FOCUSED]]]]]] --
+# the model tries programs of its own, for teaching itself: for TASKS tasks of KIND it writes up to TRIES
+# programs (its likeliest first, then drawn at a temperature of HEAT hundredths, 90 unless said, from
+# every byte with at least 1/FLOOR of the likeliest's chance, 100 unless said), each run on the gate
+# machine and judged (subleq_lib). The shortest right one of each task (FIRST 1: the first right one)
+# goes into TEXT, prompt and program as the model wrote it, with WEIGHTS for learning it (sl_weights:
+# focused, or FOCUSED 0, every byte of the program alike). Nobody writes these programs: only the judge
+# says which of the model's own are right.
+# KIND: sums, words or products, or sums:N, words:N (exactly N parts or letters), or sums:A-B, words:A-B
+# (A to B); a sum of a given length never adds and takes away the same letter, so that no part of it
+# can be left out and still give the right answer. SKIP draws that many numbers first, for other tasks;
+# HELD 1 takes only the tasks kept back from all training, 0 only the others, -1 any. Says how many it
+# solved, how many by its likeliest program, and how long those programs are.
+import std
+import std_io
+import std_fmt
+import fs
+import os
+import std_mem
+import mathf
+import fastmath
+import model
+import engine
+import sample
+import subleq_lib
+
+fn tell(text): write(1, text, slen(text))
+
+let EX_TEXT = alloc(4096)
+let EX_FLOOR: f64 = 100.0
+let EX_WEIGHTS = 0
+
+fn ex_draw(temperature: f64):        # sample_draw, with the floor EX_FLOOR: how far down it may reach
+    if temperature <= 0.0: return engine_likeliest()
+    if EX_WEIGHTS == 0: EX_WEIGHTS = alloc(VOCAB * 8)
+    let floor: f64 = loadf(CHANCES + engine_likeliest() * 8) / EX_FLOOR
+    let total: f64 = 0.0
+    let v = 0
+    while v < VOCAB:
+        let p: f64 = loadf(CHANCES + v * 8)
+        let q: f64 = 0.0
+        if p >= floor and p > 0.0: q = fast_exp(flog(p) / temperature)
+        storef(EX_WEIGHTS + v * 8, q)
+        total = total + q
+        v += 1
+    let pick: f64 = f64(os_rand()) / 2147483648.0 * total
+    let last = 0
+    v = 0
+    while v < VOCAB:
+        let q: f64 = loadf(EX_WEIGHTS + v * 8)
+        if q > 0.0:
+            last = v
+            pick = pick - q
+            if pick < 0.0: return v
+        v += 1
+    return last
+
+fn ex_write(prompt, temperature: f64):       # what the model writes after the prompt: prompt and all
+    let length = slen(prompt)
+    mem_copy(EX_TEXT, prompt, length)
+    let pos = 0
+    while pos < length:
+        engine_step(load8(EX_TEXT + pos) & 255, pos)
+        pos += 1
+    while length < 1000:
+        if pos == CONTEXT:
+            let keep = CONTEXT / 2
+            let from = length - keep
+            pos = 0
+            while pos < keep:
+                engine_step(load8(EX_TEXT + from + pos) & 255, pos)
+                pos += 1
+        let next = ex_draw(temperature)
+        if next != 32 and load8(EX_TEXT + length - 1) == 10: break
+        store8(EX_TEXT + length, next)
+        length += 1
+        engine_step(next, pos)
+        pos += 1
+    store8(EX_TEXT + length, 0)
+    return concat(EX_TEXT, "")
+
+fn ex_sum_of(parts):                 # a sum of exactly that many of a to e, never one letter both added
+    let q = "prog r="                #   and taken away
+    let signs = alloc(5 * 4)
+    mem_fill(signs, 0, 5 * 4)
+    let k = 0
+    while k < parts:
+        let sign = 43
+        if k > 0:
+            if os_rand() % 2 == 0: q = concat(q, "+")
+            else:
+                q = concat(q, "-")
+                sign = 45
+        let letter = os_rand() % 5
+        let was = load(signs + letter * 4)
+        if was != 0 and was != sign: return 0
+        store(signs + letter * 4, sign)
+        let v = alloc(2)
+        store8(v, 97 + letter)
+        store8(v + 1, 0)
+        q = concat(q, v)
+        k += 1
+    return concat(q, ":")
+
+fn ex_word_of(letters):              # a word of exactly that many letters
+    let w = alloc(letters + 1)
+    let i = 0
+    while i < letters:
+        store8(w + i, 97 + os_rand() % 26)
+        i += 1
+    store8(w + letters, 0)
+    return concat(concat("prog print ", w), ":")
+
+let EX_OUT = alloc(8000000)
+let EX_W = alloc(8000000)
+let EX_N = 0
+let EX_FOCUSED = 1                   # the kept programs' weights: 1 focused, 0 every byte of them 8
+
+fn ex_keep(program, prompt_n):       # the right program into the training text, weighted
+    let n = slen(program)
+    if EX_N + n + 1 >= 8000000: return 0
+    mem_copy(EX_OUT + EX_N, program, n)
+    let prompt = alloc(prompt_n + 1)
+    mem_copy(prompt, program, prompt_n)
+    store8(prompt + prompt_n, 0)
+    mem_copy(EX_W + EX_N, sl_weights(prompt, program + prompt_n, EX_FOCUSED), n + 1)
+    store8(EX_OUT + EX_N + n, 10)
+    EX_N += n + 1
+    return 1
+
+let EX_END = 0
+
+fn ex_number(text, at):              # the number in text from at, and where it ends (into EX_END)
+    let v = 0
+    let i = at
+    while load8(text + i) >= 48 and load8(text + i) <= 57:
+        v = v * 10 + load8(text + i) - 48
+        i += 1
+    EX_END = i
+    return v
+
+fn ex_task(kind, low, high):         # one task of the kind (0 sums, 1 products, 2 words), its length
+    if kind == 1: return pc_product()                  #   low to high when low > 0; 0: draw again
+    if low <= 0:
+        if kind == 0: return pc_sum()
+        return pc_word()
+    let n = low
+    if high > low: n = low + os_rand() % (high - low + 1)
+    if kind == 0: return ex_sum_of(n)
+    return ex_word_of(n)
+
+fn main():
+    let arg = alloc(4096)
+    if os_argc() < 6:
+        tell("explore.nitropz MODEL KIND TASKS TRIES TEXT WEIGHTS [SKIP [HELD [FIRST [HEAT [FLOOR]]]]]\n")
+        return 2
+    os_arg(0, arg, 4096)
+    if engine_load(arg) == 0:
+        tell(concat(concat("not a model: ", arg), "\n"))
+        return 2
+    let kind_text = alloc(64)
+    os_arg(1, kind_text, 64)
+    let kind = -1
+    let at = 0
+    if mem_eq(kind_text, "sums", 4):
+        kind = 0
+        at = 4
+    if mem_eq(kind_text, "products", 8):
+        kind = 1
+        at = 8
+    if mem_eq(kind_text, "words", 5):
+        kind = 2
+        at = 5
+    let low = 0
+    let high = 0
+    if kind >= 0 and load8(kind_text + at) == 58:
+        low = ex_number(kind_text, at + 1)
+        high = low
+        if load8(kind_text + EX_END) == 45: high = ex_number(kind_text, EX_END + 1)
+    if kind < 0 or (kind == 0 and (low > 4 or high > 4)) or (kind == 2 and (low > 8 or high > 8)):
+        tell("explore: KIND is sums, words or products, or sums:N or words:N (up to 4 parts, 8 letters)\n")
+        return 2
+    os_arg(2, arg, 4096)
+    let tasks = atoi(arg)
+    os_arg(3, arg, 4096)
+    let tries = atoi(arg)
+    let text_path = alloc(4096)
+    let weights_path = alloc(4096)
+    os_arg(4, text_path, 4096)
+    os_arg(5, weights_path, 4096)
+    if os_arg(6, arg, 4096) > 0:
+        let skip = atoi(arg)
+        while skip > 0:
+            os_rand()
+            skip -= 1
+    let held = -1                    # 1: only the tasks kept back from all training; 0: only the others
+    if os_arg(7, arg, 4096) > 0: held = atoi(arg)
+    let first_only = 0               # 1: keep the first right try (its likeliest, if right), not the shortest
+    if os_arg(8, arg, 4096) > 0: first_only = atoi(arg)
+    let heat: f64 = 0.9
+    if os_arg(9, arg, 4096) > 0: heat = f64(atoi(arg)) / 100.0
+    if os_arg(10, arg, 4096) > 0: EX_FLOOR = f64(atoi(arg))
+    if os_arg(11, arg, 4096) > 0: EX_FOCUSED = atoi(arg)
+    SL_SEED = 99
+    let solved = 0
+    let first_try = 0
+    let first_bytes = 0              # the length of its likeliest programs, where right
+    let t = 0
+    while t < tasks:
+        let q = ex_task(kind, low, high)
+        if q == 0: continue
+        if held >= 0 and pc_held(q) != held: continue
+        let prompt = sl_prompt(q)    # what the model is shown; the task itself is the judge's
+        let k = 0
+        let best = 0                 # the shortest right program of the tries: right but roundabout
+        while k < tries:             #   (r = c as c + c - c) would teach it to pad
+            let temperature: f64 = heat
+            if k == 0: temperature = 0.0
+            let program = ex_write(prompt, temperature)
+            if sl_judge(concat(concat(q, "\n"), program + slen(prompt))) == 1:
+                if k == 0:
+                    first_try += 1
+                    first_bytes += slen(program) - slen(prompt)
+                if best == 0 or slen(program) < slen(best): best = program
+                if first_only: k = tries
+            k += 1
+        if best != 0:
+            ex_keep(best, slen(prompt))
+            solved += 1
+        t += 1
+    fs_write_file(text_path, EX_OUT, EX_N)
+    fs_write_file(weights_path, EX_W, EX_N)
+    tell(concat(concat(concat(concat(str(solved), " of "), str(tasks)), " solved within "), concat(str(tries), " tries; ")))
+    let average = 0
+    if first_try > 0: average = first_bytes / first_try
+    tell(concat(concat(str(first_try), " by its likeliest program ("), concat(str(average), " bytes a program)\n")))
+    return 0
+
+exit(main())

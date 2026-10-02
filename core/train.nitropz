@@ -1,0 +1,344 @@
+# train.nitropz SIZE STEPS BATCH TRAIN VALID OUT [LEARNING_RATE [FROM [CONTEXT [WEIGHTS]]]] -- teaches the model. SIZE is 217k
+# (4 layers of 64, 4 heads, a feed-forward of 176, 128 bytes of context: 217 thousand parameters) or 35k
+# (2 layers of 32, 2 heads, 96, 64 bytes: 35 thousand), or either looped: 35kx4 runs the 35k model's
+# layers 4 times over, the same weights each time (8 layers deep, still 35 thousand parameters; FROM may
+# be a checkpoint of the plain 35k, whose weights fit). Each step is optimize.nitropz's train_step:
+# BATCH windows of the text at random places, each forward and back, then AdamW (a warm-up of 1/20 of
+# the steps to LEARNING_RATE, 0.003 unless said, then down a cosine to a tenth; weight decay 0.1 on the
+# layer matrices alone). Says the loss in bits a byte every 1/50 of the steps, and on VALID's fixed
+# windows every 1/10, on the error output (unbuffered: a log shows each line as it comes); writes OUT (a
+# checkpoint) then, and at the end, and the text the model writes after "fn ". A checkpoint is "TLM1",
+# six whole numbers (VOCAB DIM LAYERS HEADS HIDDEN CONTEXT), and PARAMS, a double each. FROM, a
+# checkpoint of the same size, is where the weights start instead of drawn (the schedule starts over:
+# for more of a run already made, a lower LEARNING_RATE). CONTEXT, the bytes the model looks back over,
+# is the size's own unless said; FROM's may be another, since no weight depends on it (positions are
+# turned in, not learned), so a model can go on learning with a longer view than it began with.
+# WEIGHTS, a file as long as TRAIN, is a digit for each of its bytes, 0 to 9: how much learning to write
+# that byte counts (optimize_weights) -- 0 for bytes not to be learned, more for the ones that matter.
+# Without it every byte counts the same; the held-out loss is always every byte alike. KEEP, "keep",
+# writes each checkpoint also as OUT.STEP, so that the best of them can be chosen afterwards: a model
+# whose weights are rounded to -1, 0 or +1 does not settle smoothly, and the last is not always best.
+# par.sh N ... runs it on N cores: the lead and N workers share each step's windows (TRAIN_ROLE,
+# TRAIN_WORKERS, TRAIN_DIR; below), and the model is the same whatever N is.
+import std
+import std_io
+import std_fmt
+import fs
+import os
+import host_calls
+import mathf
+import model
+import optimize
+
+let TEXT = 0                         # the training text, and how long
+let TEXT_SIZE = 0
+let VALID = 0
+let VALID_SIZE = 0
+let NUMBER = alloc(64)               # a number's digits, on their way out
+
+fn say(text): write(2, text, slen(text))
+fn say_int(v): write(2, NUMBER, itoa(NUMBER, v))
+fn say_f64(v: f64, digits): write(2, NUMBER, fmt_f64(NUMBER, v, 102, digits))
+
+fn read_text(path, size_at):         # the whole file, and its size into size_at
+    let size = fs_size(path)
+    if size < 1:
+        println(concat("cannot read ", path))
+        exit(2)
+    store(size_at, size)
+    return fs_read_file(path)
+
+fn bits(loss: f64, count) -> f64: return loss / f64(count) / 0.6931471805599453
+
+fn valid_bits(tokens, targets, T) -> f64:        # the loss on 16 fixed windows of VALID, every byte alike
+    let weights = LOSS_WEIGHTS
+    LOSS_WEIGHTS = 0
+    let total: f64 = 0.0
+    let w = 0
+    while w < 16:
+        let at = (VALID_SIZE - T - 1) / 16 * w
+        window(VALID, at, tokens, targets, T)
+        total = total + model_forward(tokens, targets, T)
+        w += 1
+    LOSS_WEIGHTS = weights
+    return bits(total, 16 * T)
+
+fn start_from(path):                 # PARAMS from a checkpoint of this size, or say why not and stop
+    let size = fs_size(path)
+    let bytes = 0
+    if size == 28 + PARAM_COUNT * 8: bytes = fs_read_file(path)
+    if bytes == 0 or load(bytes) != 827149396 or load(bytes + 4) != VOCAB or load(bytes + 8) != DIM or (load(bytes + 12) & 65535) != BLOCK or load(bytes + 16) != HEADS or load(bytes + 20) != HIDDEN:
+        say(concat(concat("not a checkpoint of this size: ", path), "\n"))
+        exit(2)
+    mem_copy(PARAMS, bytes + 28, PARAM_COUNT * 8)
+
+fn save(path):
+    let size = 28 + PARAM_COUNT * 8
+    let out = alloc(size)
+    store8(out, 84)                  # "TLM1"
+    store8(out + 1, 76)
+    store8(out + 2, 77)
+    store8(out + 3, 49)
+    store(out + 4, VOCAB)
+    store(out + 8, DIM)
+    store(out + 12, model_layers_field())
+    store(out + 16, HEADS)
+    store(out + 20, HIDDEN)
+    store(out + 24, CONTEXT)
+    mem_copy(out + 28, PARAMS, PARAM_COUNT * 8)
+    fs_write_file(path, out, size)
+    dealloc(out, size)
+
+fn write_sample(prompt, count, tokens):          # greedy: each next byte the likeliest
+    let T = slen(prompt)
+    let i = 0
+    while i < T:
+        store(tokens + i * 4, load8(prompt + i) & 255)
+        i += 1
+    let text = alloc(count + 1)
+    let made = 0
+    while made < count:
+        let start = 0
+        if T > CONTEXT: start = T - CONTEXT
+        let n = T - start
+        model_forward(tokens + start * 4, 0, n)
+        let p = PR + (n - 1) * VOCAB * 8
+        let best = 0
+        let v = 1
+        while v < VOCAB:
+            if loadf(p + v * 8) > loadf(p + best * 8): best = v
+            v += 1
+        store(tokens + T * 4, best)
+        store8(text + made, best)
+        T += 1
+        made += 1
+    print_str(prompt)
+    write(1, text, count)
+    println("")
+
+# ---- parallel: a step's windows shared among worker processes (par.sh starts them) ---------------------
+# TRAIN_ROLE "lead" or a worker's number from 0, TRAIN_WORKERS how many workers, TRAIN_DIR their folder.
+# Each step the lead writes the parameters, then the step's number as the size of "clock"; worker k does
+# the windows whose number is k counting by the workers (every worker draws every window's place, so
+# they are train_step's places), each into its own file of gradients and loss, then the step's number
+# as the size of "done" k; the lead adds the windows up in their order and moves the parameters. The
+# sum is always in the windows' order, so any number of workers gives the same model to the last bit.
+let PAR_ROLE = -2                    # -2 alone (train_step); -1 the lead; 0, 1, ... a worker
+let PAR_N = 0
+let PAR_BUF = 0                      # a window's gradients and loss on their way through a file
+let PAR_MARK = 0                     # the bytes a step file is written with: its size is its step
+let PAR_PARAMS = 0                   # the files' paths, made once
+let PAR_CLOCK = 0
+let PAR_GRAD = 0                     # a path for each window
+let PAR_DONE = 0                     # a path for each worker
+
+fn par_wait(path, n, who):           # until the file's size is n; 60 s without it and the run stops
+    let since = hostcall(ASK_MILLISECONDS)
+    while fs_size(path) != n:
+        if hostcall(ASK_MILLISECONDS) - since > 60000:
+            say(concat(concat(concat(who, " waited a minute for step "), str(n)), concat(concat(" at ", path), ": stopping\n")))
+            exit(1)
+        os_sleep(1)
+    return 0
+
+fn par_read(path, at, count):        # count bytes of the file into at, read as they come
+    let fd = open(path, 0)
+    if fd < 0: return 0
+    let got = 0
+    let going = 1
+    while going:
+        let r = read(fd, at + got, count - got)
+        if r <= 0: going = 0
+        else:
+            got += r
+            if got >= count: going = 0
+    close(fd)
+    if got == count: return 1
+    return 0
+
+fn par_start(dir, batch, steps):     # the paths and buffers, made once
+    PAR_BUF = alloc(PARAM_COUNT * 8 + 8)
+    PAR_MARK = alloc(steps + 8)
+    mem_fill(PAR_MARK, 115, steps + 8)
+    PAR_PARAMS = concat(dir, "/params")
+    PAR_CLOCK = concat(dir, "/clock")
+    PAR_GRAD = alloc(batch * 4)
+    let w = 0
+    while w < batch:
+        store(PAR_GRAD + w * 4, concat(concat(dir, "/window"), str(w)))
+        w += 1
+    PAR_DONE = alloc(PAR_N * 4)
+    let k = 0
+    while k < PAR_N:
+        store(PAR_DONE + k * 4, concat(concat(dir, "/done"), str(k)))
+        k += 1
+    return 0
+
+fn par_lead_step(batch, rate: f64, n) -> f64:    # step n: the windows' gradients added in order, AdamW
+    fs_write_file(PAR_PARAMS, PARAMS, PARAM_COUNT * 8)
+    fs_write_file(PAR_CLOCK, PAR_MARK, n)
+    let k = 0
+    while k < PAR_N:
+        par_wait(load(PAR_DONE + k * 4), n, "the lead")
+        k += 1
+    mem_fill(GRADS, 0, PARAM_COUNT * 8)
+    let loss: f64 = 0.0
+    let w = 0
+    while w < batch:
+        if par_read(load(PAR_GRAD + w * 4), PAR_BUF, PARAM_COUNT * 8 + 8) == 0:
+            say(concat(concat("the lead could not read window ", str(w)), ": stopping\n"))
+            exit(1)
+        let i = 0
+        while i < PARAM_COUNT:
+            storef(GRADS + i * 8, loadf(GRADS + i * 8) + loadf(PAR_BUF + i * 8))
+            i += 1
+        loss = loss + loadf(PAR_BUF + PARAM_COUNT * 8)
+        w += 1
+    optimize_apply(rate, n)
+    return loss
+
+fn par_worker_step(text, size, tokens, targets, batch, n):      # step n: this worker's windows
+    par_wait(PAR_CLOCK, n, concat("worker ", str(PAR_ROLE)))
+    if par_read(PAR_PARAMS, PARAMS, PARAM_COUNT * 8) == 0:
+        say("a worker could not read the parameters: stopping\n")
+        exit(1)
+    model_round()
+    let weight: f64 = 1.0 / f64(batch * CONTEXT)
+    let w = 0
+    while w < batch:
+        let at = os_rand() % (size - CONTEXT - 1)
+        if w % PAR_N == PAR_ROLE:
+            mem_fill(GRADS, 0, PARAM_COUNT * 8)
+            let loss: f64 = optimize_window(text, at, tokens, targets, weight)
+            mem_copy(PAR_BUF, GRADS, PARAM_COUNT * 8)
+            storef(PAR_BUF + PARAM_COUNT * 8, loss)
+            fs_write_file(load(PAR_GRAD + w * 4), PAR_BUF, PARAM_COUNT * 8 + 8)
+        w += 1
+    fs_write_file(load(PAR_DONE + PAR_ROLE * 4), PAR_MARK, n)
+    return 0
+
+# ---- the run -------------------------------------------------------------------------------------------
+let arg = alloc(4096)
+os_arg(0, arg, 4096)
+let loops = 1                        # "35kx4": the 35k model's layers run 4 times over, the same weights
+let size_end = 0
+if load8(arg) == 51 and load8(arg + 1) == 53 and load8(arg + 2) == 107:                # 35k
+    model_shape(256, 32, 2, 2, 96, 64)
+    size_end = 3
+elif load8(arg) == 50 and load8(arg + 1) == 49 and load8(arg + 2) == 55 and load8(arg + 3) == 107:   # 217k
+    model_shape(256, 64, 4, 4, 176, 128)
+    size_end = 4
+elif load8(arg) == 55 and load8(arg + 1) == 50 and load8(arg + 2) == 107:              # 72k (experiments:
+    model_shape(256, 48, 2, 3, 144, 64)                                                 #   2 layers of 48)
+    size_end = 3
+if size_end > 0 and load8(arg + size_end) == 120: loops = atoi(arg + size_end + 1)
+if size_end == 0 or loops < 1 or (load8(arg + size_end) != 0 and load8(arg + size_end) != 120):
+    say(concat(concat("SIZE is 35k or 217k, or either looped (35kx4), not ", arg), "\n"))
+    exit(2)
+model_loops(loops)
+os_arg(1, arg, 4096)
+let steps = atoi(arg)
+os_arg(2, arg, 4096)
+let batch = atoi(arg)
+let train_path = alloc(4096)
+let valid_path = alloc(4096)
+let out_path = alloc(4096)
+os_arg(3, train_path, 4096)
+os_arg(4, valid_path, 4096)
+os_arg(5, out_path, 4096)
+let peak: f64 = 0.003
+if os_arg(6, arg, 4096) > 0: peak = f64(atoi(arg)) / 10000.0        # (in ten-thousandths)
+let context_arg = alloc(64)
+if os_arg(8, context_arg, 64) > 0:
+    if atoi(context_arg) < 16 or atoi(context_arg) > 4096:
+        say("CONTEXT is 16 to 4096 bytes\n")
+        exit(2)
+    model_shape(VOCAB, DIM, model_layers_field(), HEADS, HIDDEN, atoi(context_arg))
+let size_at = alloc(8)
+TEXT = read_text(train_path, size_at)
+TEXT_SIZE = load(size_at)
+VALID = read_text(valid_path, size_at)
+VALID_SIZE = load(size_at)
+model_start()
+if os_arg(7, arg, 4096) > 0: start_from(arg)
+optimize_start()
+let keep = 0
+let keep_arg = alloc(64)
+if os_arg(10, keep_arg, 64) > 0 and str_cmp(keep_arg, "keep") == 0: keep = 1
+let weights_path = alloc(4096)
+if os_arg(9, weights_path, 4096) > 0 and str_cmp(weights_path, "-") != 0:
+    let weights = read_text(weights_path, size_at)
+    if load(size_at) != TEXT_SIZE:
+        say(concat(concat("the weights are not as long as the text: ", weights_path), "\n"))
+        exit(2)
+    optimize_weights(weights)
+let levels_text = alloc(64)          # experiments: TRAIN_LEVELS, the values a layer weight may take (3
+if os_env("TRAIN_LEVELS", levels_text, 64) > 0:   # unless set; model_levels), each TRAIN_STEP thousandths
+    let step_text = alloc(64)                     # of its matrix's average size (1000 unless set); and
+    let step_per_mille = 1000                     # TRAIN_UNROUNDED, nothing rounded at all
+    if os_env("TRAIN_STEP", step_text, 64) > 0: step_per_mille = atoi(step_text)
+    model_levels(atoi(levels_text), step_per_mille)
+if os_env("TRAIN_UNROUNDED", levels_text, 64) > 0: model_quantize(0)
+let T = CONTEXT
+let tokens = alloc((CONTEXT + 512) * 4)
+let targets = alloc((CONTEXT + 1) * 4)
+let role_text = alloc(64)
+if os_env("TRAIN_ROLE", role_text, 64) > 0:
+    let workers_text = alloc(64)
+    let dir = alloc(4096)
+    if os_env("TRAIN_WORKERS", workers_text, 64) <= 0 or os_env("TRAIN_DIR", dir, 4096) <= 0:
+        say("TRAIN_ROLE wants TRAIN_WORKERS and TRAIN_DIR too (par.sh sets all three)\n")
+        exit(2)
+    PAR_N = atoi(workers_text)
+    if str_cmp(role_text, "lead") == 0: PAR_ROLE = -1
+    else: PAR_ROLE = atoi(role_text)
+    if PAR_N < 1 or PAR_N > batch or PAR_ROLE < -1 or PAR_ROLE >= PAR_N:
+        say("TRAIN_WORKERS is 1 to BATCH, and TRAIN_ROLE lead or 0 to TRAIN_WORKERS - 1\n")
+        exit(2)
+    par_start(dir, batch, steps)
+if PAR_ROLE >= 0:                    # a worker: its windows, every step, and nothing said
+    let wstep = 0
+    while wstep < steps:
+        par_worker_step(TEXT, TEXT_SIZE, tokens, targets, batch, wstep + 1)
+        wstep += 1
+    exit(0)
+say_int(PARAM_COUNT)
+say(" parameters; ")
+say_int(TEXT_SIZE)
+say(" bytes to learn from\n")
+let every = steps / 50
+if every < 1: every = 1
+let report = steps / 10
+if report < 1: report = 1
+let started = hostcall(ASK_MILLISECONDS)
+let running: f64 = 0.0
+let seen = 0
+let said = 0                         # the step the loss was last said at
+let step = 0
+while step < steps:
+    if PAR_ROLE == -1: running = running + par_lead_step(batch, rate_at(step, steps, peak), step + 1)
+    else: running = running + train_step(TEXT, TEXT_SIZE, tokens, targets, batch, rate_at(step, steps, peak), step + 1)
+    seen += batch * T
+    step += 1
+    if step % every == 0 or step == steps:
+        let ms = hostcall(ASK_MILLISECONDS) - started
+        say("step ")
+        say_int(step)
+        say(": ")
+        say_f64(bits(running, (step - said) * batch * T), 3)
+        say(" bits a byte, ")
+        say_int(ms / step)
+        say(" ms a step, ")
+        say_f64(f64(seen) * 1000.0 / f64(ms + 1), 0)
+        say(" bytes a second\n")
+        running = 0.0
+        said = step
+    if step % report == 0 or step == steps:
+        model_round()
+        say("  held out: ")
+        say_f64(valid_bits(tokens, targets, T), 3)
+        say(" bits a byte\n")
+        save(out_path)
+        if keep: save(concat(concat(out_path, "."), str(step)))
+model_round()
+write_sample("fn ", 200, tokens)

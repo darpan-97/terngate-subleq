@@ -1,0 +1,37 @@
+module fastmath
+
+# fastmath -- e^x, 1 / sqrt(x) and sqrt(x), what the model and its optimizer spend on, made fast:
+# mathf's are general (a long series for e^x, Newton's method with checks for the square root) and took
+# over a quarter of the engine's instructions. They work on a double's own bits, through one scratch word.
+
+let FM_BITS = alloc(8)
+
+# e^x for x from -700 to 700, to about 1e-15 of its size: x = k ln 2 + r with |r| <= ln 2 / 2 (ln 2 in
+# two parts, so r keeps its digits), e^r by its series to r^11 (the next term is under 1e-14), and 2^k
+# written straight into the exponent's bits
+pub fn fast_exp(x: f64) -> f64:
+    let y: f64 = x * 1.4426950408889634
+    let k = 0
+    if y >= 0.0: k = i32(y + 0.5)
+    else: k = 0 - i32(0.5 - y)
+    let r: f64 = x - f64(k) * 0.6931471803691238 - f64(k) * 0.00000000019082149292705877
+    let p: f64 = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666666666666666 + r * (0.041666666666666664 + r * (0.008333333333333333 + r * (0.001388888888888889 + r * (0.0001984126984126984 + r * (0.0000248015873015873 + r * (0.0000027557319223985893 + r * (0.0000002755731922398589 + r * 0.00000002505210838544172))))))))))
+    store64(FM_BITS, i64(k + 1023) << 52)
+    return p * loadf(FM_BITS)
+
+# 1 / sqrt(x) for x > 0, to a double's last digit: a first guess from x's bits (the constant
+# 0x5FE6EB50C7B537A9 halves the exponent), then four Newton steps, each doubling the digits right
+pub fn fast_rsqrt(x: f64) -> f64:
+    storef(FM_BITS, x)
+    store64(FM_BITS, 6910469410427058089 - (load64(FM_BITS) >> 1))
+    let y: f64 = loadf(FM_BITS)
+    let half: f64 = 0.5 * x
+    y = y * (1.5 - half * y * y)
+    y = y * (1.5 - half * y * y)
+    y = y * (1.5 - half * y * y)
+    y = y * (1.5 - half * y * y)
+    return y
+
+pub fn fast_sqrt(x: f64) -> f64:     # sqrt(x), 0 for x <= 0: x times 1 / sqrt(x)
+    if x <= 0.0: return 0.0
+    return x * fast_rsqrt(x)

@@ -1,0 +1,599 @@
+module subleq_lib
+# subleq_lib.nitropz -- programs for the one-instruction computer built from the gate model's gates:
+# the machine (every working part one of its gates), an assembler, the tasks, the prompt the language
+# model is shown for each, a reference program for each, the weights its bytes are learned with, and
+# the judge, which runs a program and says if it does what the task asks.
+#
+# A task, and a program for it (a line each, program lines set in by 4):
+#     prog r=a+b-c:              r = a + b - c, for any a to e
+#         a z                    each line one SUBLEQ: first second [where]: second -= first, and if
+#         z r                    that is 0 or less, go to where (the next line unless said); -1 stops
+#         z z
+#         b z
+#         z r
+#         z z
+#         c r
+#         z z -1
+#     prog r=a*b:                r = a * b (b not below 0), with a loop: "top:" names a line
+#     prog print hi:             prints hi: 'h is a cell holding the letter h, "out" prints the first
+# Cells: z (0), one (1), a to e (the task's inputs), r (0, the answer); any other name, a cell of 0.
+# The model is not shown the task itself but sl_prompt's template of it, laid out as the program will
+# be, so that every letter the program copies stands a fixed distance above where it goes.
+import std
+import std_io
+import std_fmt
+import os
+
+# ---- the gate model's five gates, as it writes them ----
+fn gate_10(a):
+    # 0:1 1:0
+    let n = a
+    if n == 0: return 1
+    if n == 1: return 0
+    return 0
+
+fn gate_0111(a, b):
+    # 0:0 1:1 2:1 3:1
+    let n = a * 2 + b
+    if n == 0: return 0
+    if n == 1: return 1
+    if n == 2: return 1
+    if n == 3: return 1
+    return 0
+
+fn gate_01101001(a, b, c):
+    # 0:0 1:1 2:1 3:0 4:1 5:0 6:0 7:1
+    let n = a * 4 + b * 2 + c
+    if n == 0: return 0
+    if n == 1: return 1
+    if n == 2: return 1
+    if n == 3: return 0
+    if n == 4: return 1
+    if n == 5: return 0
+    if n == 6: return 0
+    if n == 7: return 1
+    return 0
+
+fn gate_00010111(a, b, c):
+    # 0:0 1:0 2:0 3:1 4:0 5:1 6:1 7:1
+    let n = a * 4 + b * 2 + c
+    if n == 0: return 0
+    if n == 1: return 0
+    if n == 2: return 0
+    if n == 3: return 1
+    if n == 4: return 0
+    if n == 5: return 1
+    if n == 6: return 1
+    if n == 7: return 1
+    return 0
+
+fn gate_00110101(a, b, c):
+    # 0:0 1:0 2:1 3:1 4:0 5:1 6:0 7:1
+    let n = a * 4 + b * 2 + c
+    if n == 0: return 0
+    if n == 1: return 0
+    if n == 2: return 1
+    if n == 3: return 1
+    if n == 4: return 0
+    if n == 5: return 1
+    if n == 6: return 0
+    if n == 7: return 1
+    return 0
+
+pub fn sl_gate_text(k):              # gate k (0 NOT, 1 OR, 2 sum, 3 carry, 4 choose) as the machine has it
+    return load(SL_TEXTS + k * 4)
+
+let SL_TEXTS = ["fn gate_10(a):\n    # 0:1 1:0\n    let n = a\n    if n == 0: return 1\n    if n == 1: return 0\n    return 0\n", "fn gate_0111(a, b):\n    # 0:0 1:1 2:1 3:1\n    let n = a * 2 + b\n    if n == 0: return 0\n    if n == 1: return 1\n    if n == 2: return 1\n    if n == 3: return 1\n    return 0\n", "fn gate_01101001(a, b, c):\n    # 0:0 1:1 2:1 3:0 4:1 5:0 6:0 7:1\n    let n = a * 4 + b * 2 + c\n    if n == 0: return 0\n    if n == 1: return 1\n    if n == 2: return 1\n    if n == 3: return 0\n    if n == 4: return 1\n    if n == 5: return 0\n    if n == 6: return 0\n    if n == 7: return 1\n    return 0\n", "fn gate_00010111(a, b, c):\n    # 0:0 1:0 2:0 3:1 4:0 5:1 6:1 7:1\n    let n = a * 4 + b * 2 + c\n    if n == 0: return 0\n    if n == 1: return 0\n    if n == 2: return 0\n    if n == 3: return 1\n    if n == 4: return 0\n    if n == 5: return 1\n    if n == 6: return 1\n    if n == 7: return 1\n    return 0\n", "fn gate_00110101(a, b, c):\n    # 0:0 1:0 2:1 3:1 4:0 5:1 6:0 7:1\n    let n = a * 4 + b * 2 + c\n    if n == 0: return 0\n    if n == 1: return 0\n    if n == 2: return 1\n    if n == 3: return 1\n    if n == 4: return 0\n    if n == 5: return 1\n    if n == 6: return 0\n    if n == 7: return 1\n    return 0\n"]
+let SL_GATE_NUMBERS = [2, 1, 7, 2, 105, 3, 23, 3, 53, 3]
+
+# ---- the datapath: nothing but those gates ----
+pub fn sl_sub16(x, y):
+    let r = 0
+    let carry = 1
+    let i = 0
+    while i < 16:
+        let a = (x >> i) & 1
+        let b = gate_10((y >> i) & 1)
+        r = r | (gate_01101001(a, b, carry) << i)
+        carry = gate_00010111(a, b, carry)
+        i += 1
+    return r
+
+pub fn sl_add16(x, y):
+    let r = 0
+    let carry = 0
+    let i = 0
+    while i < 16:
+        let a = (x >> i) & 1
+        let b = (y >> i) & 1
+        r = r | (gate_01101001(a, b, carry) << i)
+        carry = gate_00010111(a, b, carry)
+        i += 1
+    return r
+
+pub fn sl_at_most_zero(r):
+    let any = 0
+    let i = 0
+    while i < 16:
+        any = gate_0111(any, (r >> i) & 1)
+        i += 1
+    return gate_0111((r >> 15) & 1, gate_10(any))
+
+pub fn sl_choose16(s, x0, x1):
+    let r = 0
+    let i = 0
+    while i < 16:
+        r = r | (gate_00110101(s, (x0 >> i) & 1, (x1 >> i) & 1) << i)
+        i += 1
+    return r
+
+# ---- the assembler ----
+let SL_SIZE = 512
+let SL_MEM = alloc(SL_SIZE * 4)
+let SL_MAX_OPS = 120
+let SL_TOKENS = alloc(SL_MAX_OPS * 3 * 4)    # each line's three operands, as text (0: the next line)
+let SL_LABELS = alloc(SL_MAX_OPS * 4)        # each line's label, or 0
+let SL_OPS = 0
+let SL_CELL_NAME = alloc(64 * 4)             # the cells: name, address, first value
+let SL_CELL_AT = alloc(64 * 4)
+let SL_CELL_VALUE = alloc(64 * 4)
+let SL_CELLS = 0
+let SL_INPUTS = alloc(5 * 4)             # a to e
+let SL_R = -1                            # r's address, once assembled
+
+fn sl_is_letter(c): return c >= 97 and c <= 122
+
+pub fn sl_token(text, from, to):     # text[from..to) as a string
+    let t = alloc(to - from + 1)
+    mem_copy(t, text + from, to - from)
+    store8(t + to - from, 0)
+    return t
+
+fn sl_split(line):                   # one answer line into its label and operands; 0 if it is not one
+    let n = slen(line)
+    let parts = alloc(4 * 4)
+    let count = 0
+    let i = 0
+    while i < n:
+        while i < n and load8(line + i) == 32: i += 1
+        if i >= n: break
+        let start = i
+        while i < n and load8(line + i) != 32: i += 1
+        if count >= 4: return 0
+        store(parts + count * 4, sl_token(line, start, i))
+        count += 1
+    let first = 0
+    if count > 0 and load8(load(parts) + slen(load(parts)) - 1) == 58:
+        let label = load(parts)
+        store8(label + slen(label) - 1, 0)
+        store(SL_LABELS + SL_OPS * 4, label)
+        first = 1
+    else: store(SL_LABELS + SL_OPS * 4, 0)
+    let operands = count - first
+    if operands < 2 or operands > 3: return 0
+    store(SL_TOKENS + (SL_OPS * 3) * 4, load(parts + first * 4))
+    store(SL_TOKENS + (SL_OPS * 3 + 1) * 4, load(parts + (first + 1) * 4))
+    store(SL_TOKENS + (SL_OPS * 3 + 2) * 4, 0)
+    if operands == 3: store(SL_TOKENS + (SL_OPS * 3 + 2) * 4, load(parts + (first + 2) * 4))
+    SL_OPS += 1
+    return 1
+
+fn sl_label_at(name):                # the address of the line labelled name, or -1
+    let k = 0
+    while k < SL_OPS:
+        let label = load(SL_LABELS + k * 4)
+        if label != 0 and str_cmp(label, name) == 0: return k * 3
+        k += 1
+    return -1
+
+fn sl_cell(name, value):             # the cell called name (made, with value, the first time)
+    let k = 0
+    while k < SL_CELLS:
+        if str_cmp(load(SL_CELL_NAME + k * 4), name) == 0: return load(SL_CELL_AT + k * 4)
+        k += 1
+    if SL_CELLS >= 64: return -1
+    let at = SL_OPS * 3 + SL_CELLS
+    if at >= SL_SIZE: return -1
+    store(SL_CELL_NAME + SL_CELLS * 4, name)
+    store(SL_CELL_AT + SL_CELLS * 4, at)
+    store(SL_CELL_VALUE + SL_CELLS * 4, value & 65535)
+    SL_CELLS += 1
+    return at
+
+fn sl_operand(tok, where, next):     # an operand's number: -1 when it is not one
+    if tok == 0: return next
+    let c = load8(tok)
+    if where == 1 and str_cmp(tok, "out") == 0: return 65535
+    if c == 45 or (c >= 48 and c <= 57):
+        if where != 2: return -1
+        let neg = 0
+        let i = 0
+        if c == 45:
+            neg = 1
+            i = 1
+        let v = 0
+        if load8(tok + i) == 0: return -1
+        while load8(tok + i) != 0:
+            let d = load8(tok + i)
+            if d < 48 or d > 57: return -1
+            v = v * 10 + d - 48
+            i += 1
+        if neg: v = 0 - v
+        return v & 65535
+    if c == 39:                                  # 'x: a cell holding the letter x
+        if slen(tok) != 2: return -1
+        if where == 2: return -1
+        return sl_cell(tok, load8(tok + 1))
+    if sl_is_letter(c) == 0: return -1           # a name: a letter, then letters or digits
+    let i = 1
+    while load8(tok + i) != 0:
+        let d = load8(tok + i)
+        if sl_is_letter(d) == 0 and (d < 48 or d > 57): return -1
+        i += 1
+    let label = sl_label_at(tok)
+    if label >= 0: return label
+    if where == 2: return -1
+    let value = 0
+    if str_cmp(tok, "one") == 0: value = 1
+    if slen(tok) == 1 and load8(tok) >= 97 and load8(tok) <= 101: value = load(SL_INPUTS + (load8(tok) - 97) * 4)
+    return sl_cell(tok, value)
+
+pub fn sl_assemble(program):         # the answer lines after the "prog" line, into SL_MEM; 1 if they assemble
+    SL_OPS = 0
+    SL_CELLS = 0
+    SL_R = -1
+    let n = slen(program)
+    let i = 0
+    while i < n and load8(program + i) != 10: i += 1        # past the question
+    i += 1
+    while i < n:
+        let start = i
+        while i < n and load8(program + i) != 10: i += 1
+        let line = sl_token(program, start, i)
+        i += 1
+        if slen(line) > 0:
+            if slen(line) < 5 or load8(line) != 32 or load8(line + 1) != 32 or load8(line + 2) != 32 or load8(line + 3) != 32: return 0
+            if load8(line + 4) != 35:                    # "# ..." lines are the question's list, not code
+                if SL_OPS >= SL_MAX_OPS: return 0
+                if sl_split(line + 4) == 0: return 0
+    if SL_OPS == 0: return 0
+    sl_cell("z", 0)                              # the cells the machine always has
+    sl_cell("one", 1)
+    mem_fill(SL_MEM, 0, SL_SIZE * 4)
+    let k = 0
+    while k < SL_OPS:
+        let a = sl_operand(load(SL_TOKENS + (k * 3) * 4), 0, 0)
+        let b = sl_operand(load(SL_TOKENS + (k * 3 + 1) * 4), 1, 0)
+        let c = sl_operand(load(SL_TOKENS + (k * 3 + 2) * 4), 2, k * 3 + 3)
+        if a < 0 or b < 0 or c < 0: return 0
+        store(SL_MEM + (k * 3) * 4, a)
+        store(SL_MEM + (k * 3 + 1) * 4, b)
+        store(SL_MEM + (k * 3 + 2) * 4, c)
+        k += 1
+    k = 0
+    while k < SL_CELLS:
+        store(SL_MEM + load(SL_CELL_AT + k * 4) * 4, load(SL_CELL_VALUE + k * 4))
+        if str_cmp(load(SL_CELL_NAME + k * 4), "r") == 0: SL_R = load(SL_CELL_AT + k * 4)
+        k += 1
+    return 1
+
+# ---- the machine ----
+let SL_OUT = alloc(512)
+let SL_OUT_N = 0
+let SL_STEPS = 0
+let SL_GATES = 1                         # 1: the gate machine; 0: plain - and <=
+
+pub fn sl_run(limit):                # the program in SL_MEM from 0 until it stops: 1, or 0 if it does not
+    SL_OUT_N = 0
+    SL_STEPS = 0
+    let pc = 0
+    while pc < 32768:
+        if SL_STEPS >= limit: return 0
+        if pc > SL_SIZE - 3: return 0
+        let a = load(SL_MEM + pc * 4)
+        let b = load(SL_MEM + (pc + 1) * 4)
+        let c = load(SL_MEM + (pc + 2) * 4)
+        if a >= SL_SIZE: return 0
+        if b == 65535:
+            if SL_OUT_N < 500:
+                store8(SL_OUT + SL_OUT_N, load(SL_MEM + a * 4) & 255)
+                SL_OUT_N += 1
+            if SL_GATES: pc = sl_add16(pc, 3)
+            else: pc = pc + 3
+        else:
+            if b >= SL_SIZE: return 0
+            if SL_GATES:
+                let r = sl_sub16(load(SL_MEM + b * 4), load(SL_MEM + a * 4))
+                store(SL_MEM + b * 4, r)
+                pc = sl_choose16(sl_at_most_zero(r), sl_add16(pc, 3), c)
+            else:
+                let r = (load(SL_MEM + b * 4) - load(SL_MEM + a * 4)) & 65535
+                store(SL_MEM + b * 4, r)
+                if r == 0 or r >= 32768: pc = c
+                else: pc = pc + 3
+        SL_STEPS += 1
+    return 1
+
+# ---- tasks: the question's text, and what a right program does ----
+let SL_SEED = 1
+
+pub fn sl_draw():                    # Park and Miller, worked out so no product overflows
+    SL_SEED = 48271 * (SL_SEED % 44488) - 3399 * (SL_SEED / 44488)
+    if SL_SEED <= 0: SL_SEED += 2147483647
+    return SL_SEED
+
+pub fn sl_kind(question):            # 0 sums, 1 a product, 2 printing; -1 none
+    if slen(question) < 9: return -1
+    if load8(question + 5) == 112: return 2              # "prog print ..."
+    let i = 0
+    while load8(question + i) != 0:
+        if load8(question + i) == 42: return 1
+        i += 1
+    return 0
+
+pub fn sl_list(question):            # the question's second line: its parts, numbered, as a truth table's
+    let kind = sl_kind(question)     #   entries are ("    # 0:+a 1:+b 2:-c"), so that the answer can find
+    let out = "    #"               #   each part by its number
+    let k = 0
+    if kind == 0:
+        let i = 7
+        let sign = 43
+        while load8(question + i) != 58:
+            let c = load8(question + i)
+            if c == 43 or c == 45: sign = c
+            else:
+                let part = alloc(3)
+                store8(part, sign)
+                store8(part + 1, c)
+                store8(part + 2, 0)
+                out = concat(concat(concat(concat(out, " "), str(k)), ":"), part)
+                k += 1
+            i += 1
+    if kind == 1:
+        out = concat(concat(concat(out, " 0: "), sl_token(question, 7, 8)), concat(" 1: ", sl_token(question, 9, 10)))
+    if kind == 2:                    # "0: 'h": the letter as the answer writes it, as far from its number
+        let i = 11                   #   as there ("l0: 'h"), so that looking it up by number lands on it
+        while load8(question + i) != 58:
+            out = concat(concat(concat(concat(out, " "), str(k)), ": '"), sl_token(question, i, i + 1))
+            k += 1
+            i += 1
+    return concat(out, "\n")
+
+let SL_WORD_SLOTS = 8                # a word's prompt: 8 lines, one a letter; a sum's: 4 parts, 3 lines each
+let SL_SUM_SLOTS = 4
+
+pub fn sl_letter_at(question, k):    # a word's letter k, or 0 past its end
+    if 11 + k >= slen(question) - 1: return 0
+    return load8(question + 11 + k)
+
+pub fn sl_part(question, k, sign_at): # a sum's part k: its letter (and its sign into sign_at), or 0
+    let i = 7
+    let n = 0
+    let sign = 43
+    while load8(question + i) != 58:
+        let c = load8(question + i)
+        if c == 43 or c == 45: sign = c
+        else:
+            if n == k:
+                store(sign_at, sign)
+                return c
+            n += 1
+        i += 1
+    return 0
+
+pub fn sl_char(c):                   # a one-byte string
+    let s = alloc(2)
+    store8(s, c)
+    store8(s + 1, 0)
+    return s
+
+pub fn sl_prompt(question):          # what the model is shown: a template with the answer's own layout,
+    let kind = sl_kind(question)     #   so that everything the answer copies stands a fixed distance
+    let sign_at = alloc(8)           #   above it (as a sum's digits stand from the digits they add)
+    if kind == 2:                    # "    #0: 'h    " over "    l0: 'h out": 8 lines apart, same column
+        let out = "prog print:\n"
+        let k = 0
+        while k < SL_WORD_SLOTS:
+            let c = sl_letter_at(question, k)
+            if c != 0: out = concat(out, concat(concat(concat("    #", str(k)), ": '"), concat(sl_char(c), "    \n")))
+            else: out = concat(out, concat(concat("    #", str(k)), ": .     \n"))
+            k += 1
+        return out
+    if kind == 0:                    # "    #0:+a  " then two lines, over the part's three lines: 12 apart
+        let out = "prog sum:\n"
+        let k = 0
+        while k < SL_SUM_SLOTS:
+            let c = sl_part(question, k, sign_at)
+            if c != 0: out = concat(out, concat(concat(concat("    #", str(k)), ":"), concat(concat(sl_char(load(sign_at)), sl_char(c)), "  \n")))
+            else: out = concat(out, concat(concat("    #", str(k)), ":.   \n"))
+            out = concat(out, "    #      \n    #      \n")
+            k += 1
+        return out
+    let x = sl_char(load8(question + 7))         # a product's: 8 lines of 15 bytes over the program's 6,
+    let y = sl_char(load8(question + 9))         #   each letter it copies in its column, 8 lines up, as a
+    let out = "prog product:\n"                  #   word's are
+    out = concat(out, concat(concat("    #     ", y), "   \n"))
+    out = concat(out, concat(concat("    #   ", y), "     \n"))
+    out = concat(out, concat(concat("    #   ", x), "     \n"))
+    let k = 3
+    while k < 8:
+        out = concat(out, "    #         \n")
+        k += 1
+    return out
+
+pub fn sl_answer(question):          # the reference program for a question (the text after its prompt)
+    let kind = sl_kind(question)     #   each part's code starts on a line labelled l0, l1, ...
+    let out = ""
+    let k = 0
+    if kind == 0:                                        # "prog r=a+b-c:": three lines a part, 12 bytes
+        let i = 7                                        #   each (a minus part two do-nothing lines more)
+        let sign = 43
+        while load8(question + i) != 58:
+            let c = load8(question + i)
+            if c == 43 or c == 45: sign = c
+            else:
+                let label = concat(concat("    l", str(k)), ": ")
+                let v = sl_token(question, i, i + 1)
+                if sign == 43: out = concat(out, concat(concat(label, v), " z\n    z r    \n    z z    \n"))
+                else: out = concat(out, concat(concat(label, v), " r\n    z z    \n    z z    \n"))
+                k += 1
+            i += 1
+        return concat(out, "    z z -1 \n")
+    if kind == 1:                                        # "prog r=x*y:": l1 is the loop's top: y is
+        let x = sl_token(question, 7, 8)                 #   tested, counted down, x added to r, and
+        let y = sl_token(question, 9, 10)                #   z z both clears z and goes back; 15
+        out = concat(concat("    l1: z ", y), " l9\n")   #   bytes a line, as a word's
+        out = concat(out, concat(concat("    one ", y), "     \n"))
+        out = concat(out, concat(concat("    l0: ", x), " z   \n    z r       \n    z z l1    \n    l9: z z -1\n"))
+        return out
+    if kind == 2:                                        # "prog print word:": 15 bytes a line
+        let i = 11
+        while load8(question + i) != 58:
+            out = concat(out, concat(concat(concat(concat("    l", str(k)), ": '"), sl_token(question, i, i + 1)), " out\n"))
+            k += 1
+            i += 1
+        return concat(out, "    z z -1    \n")
+    return 0
+
+fn sl_like(line, n, pattern, whole): # the line (n bytes) starts as the pattern does (whole: is it),
+    let m = slen(pattern)            #   where % is any digit, ? any letter, @ any of a to e, ^ z or r
+    if n < m or (whole and n != m): return 0
+    let i = 0
+    while i < m:
+        let p = load8(pattern + i)
+        let c = load8(line + i)
+        if p == 37:
+            if c < 48 or c > 57: return 0
+        elif p == 63:
+            if sl_is_letter(c) == 0: return 0
+        elif p == 64:
+            if c < 97 or c > 101: return 0
+        elif p == 94:
+            if c != 122 and c != 114: return 0
+        elif c != p: return 0
+        i += 1
+    return 1
+
+pub fn sl_weights(prompt, answer, focused):  # a digit a byte for prompt, answer and the newline after:
+    let q = slen(prompt)             #   the prompt 0 (not learned), the answer 8 -- or, focused, 1 and
+    let n = slen(answer)             #   9 for each letter it copies from the prompt (a word's letter,
+    let w = alloc(q + n + 2)         #   a sum's part, a product's x and y), which is the hard part
+    mem_fill(w, 48, q)
+    let every = 56
+    if focused: every = 49
+    mem_fill(w + q, every, n + 1)
+    store8(w + q + n + 1, 0)
+    if focused == 0: return w
+    let i = 0
+    while i < n:
+        let start = i
+        while i < n and load8(answer + i) != 10: i += 1
+        let line = answer + start
+        let length = i - start
+        let ended = i < n            # the line has its newline
+        if sl_like(line, length, "    l%: '? out", 0): store8(w + q + start + 9, 57)
+        if ended and sl_like(line, length, "    l%: @ ^", 1): store8(w + q + start + 8, 57)
+        if ended and sl_like(line, length, "    l1: z @ l9", 1): store8(w + q + start + 10, 57)
+        if ended and sl_like(line, length, "    one @     ", 1): store8(w + q + start + 8, 57)
+        if ended and sl_like(line, length, "    l0: @ z   ", 1): store8(w + q + start + 8, 57)
+        i += 1
+    return w
+
+pub fn sl_expect(question):          # what r must be for the inputs in SL_INPUTS (sums and products)
+    let kind = sl_kind(question)
+    if kind == 1:
+        let x = load(SL_INPUTS + (load8(question + 7) - 97) * 4)
+        let y = load(SL_INPUTS + (load8(question + 9) - 97) * 4)
+        return (x * y) & 65535
+    let total = 0
+    let i = 7
+    let sign = 43
+    while load8(question + i) != 58:
+        let c = load8(question + i)
+        if c == 43 or c == 45: sign = c
+        else:
+            let v = load(SL_INPUTS + (c - 97) * 4)
+            if sign == 43: total = total + v
+            else: total = total - v
+        i += 1
+    return total & 65535
+
+pub fn sl_judge(program):            # the question and answer: 1 right, 0 wrong, -1 does not assemble,
+    let n = slen(program)            #   -2 does not stop; tried on 6 sets of inputs (products: y 0 to 20)
+    let q_end = 0
+    while q_end < n and load8(program + q_end) != 10: q_end += 1
+    let question = sl_token(program, 0, q_end)
+    let kind = sl_kind(question)
+    if kind < 0: return -1
+    let trial = 0
+    while trial < 6:
+        let k = 0
+        while k < 5:
+            store(SL_INPUTS + k * 4, (sl_draw() % 2001) - 1000)
+            k += 1
+        if kind == 1: store(SL_INPUTS + (load8(question + 9) - 97) * 4, sl_draw() % 21)
+        if sl_assemble(program) == 0: return -1
+        if sl_run(20000) == 0: return -2
+        if kind == 2:
+            let word = sl_token(question, 11, q_end - 1)
+            if SL_OUT_N != slen(word): return 0
+            let i = 0
+            while i < SL_OUT_N:
+                if load8(SL_OUT + i) != load8(word + i): return 0
+                i += 1
+            return 1
+        if SL_R < 0: return 0
+        if load(SL_MEM + SL_R * 4) != sl_expect(question): return 0
+        trial += 1
+    return 1
+
+# ---- the tasks drawn for training and testing (os_rand: the same every run) ----
+pub fn pc_held(question):            # kept back from training: tested on, never learned from
+    if sl_kind(question) == 1:
+        let x = load8(question + 7)
+        let y = load8(question + 9)
+        if (x == 97 and y == 101) or (x == 99 and y == 97) or (x == 100 and y == 98) or (x == 101 and y == 99): return 1
+        return 0
+    let h = 0
+    let i = 0
+    while load8(question + i) != 0:
+        h = (h * 31 + load8(question + i)) % 1000003
+        i += 1
+    if h % 10 == 3: return 1
+    return 0
+
+pub fn pc_sum():                     # "prog r=...:" of 1 to 5 terms
+    let terms = 1 + os_rand() % 4
+    let q = "prog r="
+    let k = 0
+    while k < terms:
+        if k > 0:
+            if os_rand() % 2 == 0: q = concat(q, "+")
+            else: q = concat(q, "-")
+        let v = alloc(2)
+        store8(v, 97 + os_rand() % 5)
+        store8(v + 1, 0)
+        q = concat(q, v)
+        k += 1
+    return concat(q, ":")
+
+pub fn pc_product():
+    let x = os_rand() % 5
+    let y = os_rand() % 5
+    while y == x: y = os_rand() % 5
+    let q = alloc(16)
+    mem_copy(q, "prog r=a*b:", 12)
+    store8(q + 7, 97 + x)
+    store8(q + 9, 97 + y)
+    return q
+
+pub fn pc_word():                    # "prog print ...:" of 1 to 8 letters
+    let n = 1 + os_rand() % 8
+    let w = alloc(n + 1)
+    let i = 0
+    while i < n:
+        store8(w + i, 97 + os_rand() % 26)
+        i += 1
+    store8(w + n, 0)
+    return concat(concat("prog print ", w), ":")
+

@@ -1,0 +1,738 @@
+module model
+
+# model -- a tiny transformer language model, reading text a byte at a time: the Llama shape (a norm
+# before each part, attention with rotated positions, a gated feed-forward, the embedding reused as the
+# output matrix), with BitNet b1.58's rounding. Every layer matrix is used as weights of -1, 0 or +1
+# times one scale (its weights' average size), and every input to one is rounded to whole numbers from
+# -127 to 127 times one scale per token -- so the product itself is a sum of whole numbers, scaled once
+# after. Training keeps the weights as floats and rounds them on the way forward; on the way back the
+# rounding counts as if it were not there (the straight-through estimator). With QUANTIZE 0 nothing is
+# rounded: the plain model, whose gradients the gradient check compares with the slopes it measures.
+#
+# The work is done on one sequence of T tokens at a time: model_forward keeps what each step made, and
+# model_backward walks it back, adding every parameter's gradient into GRADS.
+
+import std
+import os
+import mathf
+import fastmath
+
+# ---- the shape (model_shape sets it) ---------------------------------------------------------------------
+let VOCAB = 256
+let DIM = 64
+let LAYERS = 4                       # the layers each byte goes through: BLOCK x LOOPS
+let BLOCK = 4                        # the layers that hold weights: a looped model runs them LOOPS times
+let LOOPS = 1                        #   over, each pass's gradient added into the same weights
+let HEADS = 4
+let HEAD = 16                        # DIM / HEADS
+let HIDDEN = 176                     # the feed-forward's width
+let CONTEXT = 128                    # the longest sequence
+let QUANTIZE = 1
+
+# where each parameter is in PARAMS, counted in f64s: the embedding, then each layer, then the last gains
+let LAYER_SIZE = 0
+let OFF_LAYERS = 0
+let OFF_FINAL = 0
+let PARAM_COUNT = 0
+let L_G1 = 0                         # within a layer: the gains of the norm before attention,
+let L_WQ = 0                         #   the four attention matrices (DIM x DIM each),
+let L_WK = 0
+let L_WV = 0
+let L_WO = 0
+let L_G2 = 0                         #   the gains of the norm before the feed-forward,
+let L_W1 = 0                         #   its gate and up matrices (HIDDEN x DIM),
+let L_W3 = 0
+let L_W2 = 0                         #   and its down matrix (DIM x HIDDEN)
+
+let PARAMS = 0                       # the weights as trained (f64 each)
+let GRADS = 0                        # their gradients
+let TERNARY = 0                      # each layer matrix rounded to -1, 0 or +1, where PARAMS has it
+let SCALES = 0                       # each layer matrix's scale, 7 a layer: q k v o, gate up down
+let ROPE_COS = 0                     # cos and sin of each position's angle for each pair of a head
+let ROPE_SIN = 0
+let ATT_SCALE: f64 = 0.0             # attention's 1 / sqrt(HEAD), worked out once
+
+pub fn model_shape(vocab, dim, layers, heads, hidden, context):
+    VOCAB = vocab                    # layers: how many hold weights, or, for a looped model, that number
+    DIM = dim                        #   plus 65,536 times how often they run (model_layers_field)
+    BLOCK = layers
+    LOOPS = 1
+    if layers >= 65536:
+        BLOCK = layers & 65535
+        LOOPS = layers >> 16
+    LAYERS = BLOCK * LOOPS
+    layers = BLOCK
+    HEADS = heads
+    HEAD = dim / heads
+    HIDDEN = hidden
+    CONTEXT = context
+    L_G1 = 0
+    L_WQ = dim
+    L_WK = L_WQ + dim * dim
+    L_WV = L_WK + dim * dim
+    L_WO = L_WV + dim * dim
+    L_G2 = L_WO + dim * dim
+    L_W1 = L_G2 + dim
+    L_W3 = L_W1 + hidden * dim
+    L_W2 = L_W3 + hidden * dim
+    LAYER_SIZE = L_W2 + dim * hidden
+    OFF_LAYERS = vocab * dim
+    OFF_FINAL = OFF_LAYERS + layers * LAYER_SIZE
+    PARAM_COUNT = OFF_FINAL + dim
+    ATT_SCALE = 1.0 / fsqrt(f64(HEAD))
+    return PARAM_COUNT
+
+pub fn model_loops(loops):           # the block run loops times: the same weights, LAYERS = BLOCK x loops
+    LOOPS = loops
+    LAYERS = BLOCK * loops
+    return LAYERS
+
+pub fn model_layers_field():         # the layers as a file's header holds them (model_shape reads it back)
+    if LOOPS > 1: return BLOCK + LOOPS * 65536
+    return BLOCK
+
+pub fn layer_base(l):                # where applied layer l's weights are: its place in the block
+    return OFF_LAYERS + (l % BLOCK) * LAYER_SIZE
+
+pub fn layer_scales(l):              # the first of its seven matrices' scales in SCALES
+    return (l % BLOCK) * 7
+
+fn f64s(count): return alloc(count * 8)
+
+# ---- the parameters ---------------------------------------------------------------------------------------
+fn normal() -> f64:                  # a number drawn from the standard normal (Box-Muller)
+    let u1: f64 = (f64(os_rand()) + 1.0) / 2147483649.0
+    let u2: f64 = f64(os_rand()) / 2147483648.0
+    return fsqrt(0.0 - 2.0 * flog(u1)) * fcos(6.283185307179586 * u2)
+
+fn fill_normal(at, count, spread: f64):
+    let i = 0
+    while i < count:
+        storef(PARAMS + (at + i) * 8, normal() * spread)
+        i += 1
+
+fn fill_ones(at, count):
+    let i = 0
+    while i < count:
+        storef(PARAMS + (at + i) * 8, 1.0)
+        i += 1
+
+pub fn model_room():                 # room for the parameters, nothing drawn: all the engine needs
+    PARAMS = f64s(PARAM_COUNT)
+    TERNARY = f64s(PARAM_COUNT)
+    SCALES = f64s(BLOCK * 7)
+    model_rope()
+
+pub fn model_start():                # the parameters drawn, and room for training
+    model_room()
+    model_buffers()
+    let out_spread: f64 = 1.0 / fsqrt(f64(2 * LAYERS))            # (outputs into the running sum)
+    fill_normal(0, VOCAB * DIM, 0.1)
+    let l = 0
+    while l < BLOCK:
+        let base = OFF_LAYERS + l * LAYER_SIZE
+        let by_dim: f64 = 1.0 / fsqrt(f64(DIM))
+        fill_ones(base + L_G1, DIM)
+        fill_normal(base + L_WQ, DIM * DIM, by_dim)
+        fill_normal(base + L_WK, DIM * DIM, by_dim)
+        fill_normal(base + L_WV, DIM * DIM, by_dim)
+        fill_normal(base + L_WO, DIM * DIM, by_dim * out_spread)
+        fill_ones(base + L_G2, DIM)
+        fill_normal(base + L_W1, HIDDEN * DIM, by_dim)
+        fill_normal(base + L_W3, HIDDEN * DIM, by_dim)
+        fill_normal(base + L_W2, DIM * HIDDEN, out_spread / fsqrt(f64(HIDDEN)))
+        l += 1
+    fill_ones(OFF_FINAL, DIM)
+
+# How many values a layer weight may take: 3 (-1, 0 or +1), or, for training experiments, another odd
+# number -- 9 is -4 to +4 -- each a step of WEIGHT_STEP times the matrix's average size. The engine and the
+# packer know 3 alone, and with 3 the rounding below is the one it always was.
+let WEIGHT_LEVELS = 3
+let WEIGHT_STEP: f64 = 1.0
+
+pub fn model_quantize(q): QUANTIZE = q   # (0: nothing rounded, the plain model)
+
+pub fn model_levels(levels, step_per_mille):
+    WEIGHT_LEVELS = levels
+    WEIGHT_STEP = f64(step_per_mille) / 1000.0
+
+fn round_matrix_levels(at, count, which, sum: f64):   # (WEIGHT_LEVELS other than 3)
+    let most: f64 = f64((WEIGHT_LEVELS - 1) / 2)
+    let step: f64 = sum / f64(count) * WEIGHT_STEP + 0.00000001
+    storef(SCALES + which * 8, step)
+    let i = 0
+    while i < count:
+        let t: f64 = round_half_away(loadf(PARAMS + (at + i) * 8) / step)
+        if t > most: t = most
+        if t < 0.0 - most: t = 0.0 - most
+        storef(TERNARY + (at + i) * 8, t)
+        i += 1
+
+fn round_matrix(at, count, which):   # TERNARY and SCALES for one matrix, from PARAMS
+    let sum: f64 = 0.0
+    let i = 0
+    while i < count:
+        let w: f64 = loadf(PARAMS + (at + i) * 8)
+        if w < 0.0: sum = sum - w
+        else: sum = sum + w
+        i += 1
+    if WEIGHT_LEVELS != 3: return round_matrix_levels(at, count, which, sum)
+    let scale: f64 = sum / f64(count) + 0.00000001
+    storef(SCALES + which * 8, scale)
+    let half: f64 = 0.5 * scale
+    i = 0
+    while i < count:
+        let w: f64 = loadf(PARAMS + (at + i) * 8)
+        let t: f64 = 0.0
+        if w >= half: t = 1.0
+        elif w <= 0.0 - half: t = -1.0
+        storef(TERNARY + (at + i) * 8, t)
+        i += 1
+
+pub fn model_round():                # every layer matrix rounded: after each change to PARAMS
+    let l = 0
+    while l < BLOCK:
+        let base = OFF_LAYERS + l * LAYER_SIZE
+        round_matrix(base + L_WQ, DIM * DIM, l * 7)
+        round_matrix(base + L_WK, DIM * DIM, l * 7 + 1)
+        round_matrix(base + L_WV, DIM * DIM, l * 7 + 2)
+        round_matrix(base + L_WO, DIM * DIM, l * 7 + 3)
+        round_matrix(base + L_W1, HIDDEN * DIM, l * 7 + 4)
+        round_matrix(base + L_W3, HIDDEN * DIM, l * 7 + 5)
+        round_matrix(base + L_W2, DIM * HIDDEN, l * 7 + 6)
+        l += 1
+
+pub fn model_rope():                 # the angle of pair j at position p is p / 10000^(2j / HEAD)
+    let pairs = HEAD / 2
+    ROPE_COS = f64s(CONTEXT * pairs)
+    ROPE_SIN = f64s(CONTEXT * pairs)
+    let p = 0
+    while p < CONTEXT:
+        let j = 0
+        while j < pairs:
+            let angle: f64 = f64(p) / fpow(10000.0, f64(2 * j) / f64(HEAD))
+            storef(ROPE_COS + (p * pairs + j) * 8, fcos(angle))
+            storef(ROPE_SIN + (p * pairs + j) * 8, fsin(angle))
+            j += 1
+        p += 1
+
+# ---- what a forward pass keeps (for CONTEXT tokens) ----------------------------------------------------
+let X = 0                            # each layer's input, and after the last its output: (LAYERS + 1) x T x DIM
+let XM = 0                           # each layer's running sum after attention
+let H1 = 0                           # the normed inputs of attention and of the feed-forward
+let H2 = 0
+let R1 = 0                           # their 1 / rms, a number a token
+let R2 = 0
+let Q1 = 0                           # the inputs of the layer matrices as rounded (or, unrounded, copied),
+let QO = 0                           #   and their scales: attention's input, its output, the
+let Q2 = 0                           #   feed-forward's input, and its gated middle
+let Q3 = 0
+let S1 = 0
+let SO = 0
+let S2 = 0
+let S3 = 0
+let QQ = 0                           # queries, keys (both rotated) and values
+let KK = 0
+let VV = 0
+let PP = 0                           # attention's weights: LAYERS x HEADS x T x T
+let AA = 0                           # attention's output
+let GT = 0                           # the feed-forward's gate, up, and gated middle (T x HIDDEN)
+let UP = 0
+let AC = 0
+let HF = 0                           # the last norm's output, its 1 / rms, and each next byte's chances
+let RF = 0
+let PR = 0
+let TMP = 0                          # a matrix's output before it is added into the running sum
+# the backward pass's own
+let DX = 0
+let DXM = 0
+let DH = 0
+let DQ = 0
+let DK = 0
+let DV = 0
+let DA = 0
+let DGT = 0
+let DUP = 0
+let DAC = 0
+let DHF = 0
+let DP = 0
+
+pub fn model_buffers():              # what the forward and backward passes keep
+    let rows = CONTEXT * DIM
+    let wide = CONTEXT * HIDDEN
+    GRADS = f64s(PARAM_COUNT)
+    X = f64s((LAYERS + 1) * rows)
+    XM = f64s(LAYERS * rows)
+    H1 = f64s(LAYERS * rows)
+    H2 = f64s(LAYERS * rows)
+    R1 = f64s(LAYERS * CONTEXT)
+    R2 = f64s(LAYERS * CONTEXT)
+    Q1 = f64s(LAYERS * rows)
+    QO = f64s(LAYERS * rows)
+    Q2 = f64s(LAYERS * rows)
+    Q3 = f64s(LAYERS * wide)
+    S1 = f64s(LAYERS * CONTEXT)
+    SO = f64s(LAYERS * CONTEXT)
+    S2 = f64s(LAYERS * CONTEXT)
+    S3 = f64s(LAYERS * CONTEXT)
+    QQ = f64s(LAYERS * rows)
+    KK = f64s(LAYERS * rows)
+    VV = f64s(LAYERS * rows)
+    PP = f64s(LAYERS * HEADS * CONTEXT * CONTEXT)
+    AA = f64s(LAYERS * rows)
+    GT = f64s(LAYERS * wide)
+    UP = f64s(LAYERS * wide)
+    AC = f64s(LAYERS * wide)
+    HF = f64s(rows)
+    RF = f64s(CONTEXT)
+    PR = f64s(CONTEXT * VOCAB)
+    TMP = f64s(wide)
+    DX = f64s(rows)
+    DXM = f64s(rows)
+    DH = f64s(rows)
+    DQ = f64s(rows)
+    DK = f64s(rows)
+    DV = f64s(rows)
+    DA = f64s(rows)
+    DGT = f64s(wide)
+    DUP = f64s(wide)
+    DAC = f64s(wide)
+    DHF = f64s(rows)
+    DP = f64s(CONTEXT)
+
+# ---- the parts -------------------------------------------------------------------------------------------
+fn round_half_away(x: f64) -> f64:   # the nearest whole number, a half going away from 0
+    if x >= 0.0: return f64(i32(x + 0.5))
+    return 0.0 - f64(i32(0.5 - x))
+
+# the T rows of inp (K numbers each) made ready to go into a layer matrix: rounded to whole numbers
+# from -127 to 127 times 1 / sa[t] (sa[t] = 127 / the row's largest size), or, with QUANTIZE 0, copied
+pub fn prepare_rows(inp, qin, sa, T, K):
+    let t = 0
+    while t < T:
+        let row = inp + t * K * 8
+        let qrow = qin + t * K * 8
+        let s: f64 = 1.0
+        if QUANTIZE:
+            let most: f64 = 0.0
+            let i = 0
+            while i < K:
+                let v: f64 = loadf(row + i * 8)
+                if v < 0.0: v = 0.0 - v
+                if v > most: most = v
+                i += 1
+            if most < 0.000000000001: most = 0.000000000001
+            s = 127.0 / most
+            i = 0
+            while i < K:
+                storef(qrow + i * 8, round_half_away(loadf(row + i * 8) * s))
+                i += 1
+        else:
+            mem_copy(qrow, row, K * 8)
+        storef(sa + t * 8, s)
+        t += 1
+
+# out (T x N) = the matrix at w (N x K, a row an output) times each prepared row: rounded, the sum of
+# whole numbers times the matrix's scale, divided by the row's -- in that order, as the engine does it
+pub fn apply_matrix(out, qin, sa, w, which, T, N, K):
+    let weights = PARAMS
+    let scale: f64 = 1.0
+    if QUANTIZE:
+        weights = TERNARY
+        scale = loadf(SCALES + which * 8)
+    let t = 0
+    while t < T:
+        let qrow = qin + t * K * 8
+        let s: f64 = loadf(sa + t * 8)
+        let o = 0
+        while o < N:
+            let acc: f64 = dot_f64(weights + (w + o * K) * 8, qrow, K)
+            storef(out + (t * N + o) * 8, acc * scale / s)
+            o += 1
+        t += 1
+
+# the way back through apply_matrix: the matrix's gradient (into GRADS) from dout and the inputs as
+# prepared (their rounding taken as if absent), and dinp += the matrix (as used) times dout
+fn apply_matrix_back(dout, dinp, qin, sa, w, which, T, N, K):
+    let weights = PARAMS
+    let scale: f64 = 1.0
+    if QUANTIZE:
+        weights = TERNARY
+        scale = loadf(SCALES + which * 8)
+    let t = 0
+    while t < T:
+        let qrow = qin + t * K * 8
+        let drow = dinp + t * K * 8
+        let inv: f64 = 1.0 / loadf(sa + t * 8)
+        let o = 0
+        while o < N:
+            let g: f64 = loadf(dout + (t * N + o) * 8)
+            let gi: f64 = g * inv
+            let gs: f64 = g * scale
+            add_scaled_f64(GRADS + (w + o * K) * 8, qrow, gi, K)
+            add_scaled_f64(drow, weights + (w + o * K) * 8, gs, K)
+            o += 1
+        t += 1
+
+# h = x / rms(x) * gains, for each of T rows of DIM; 1 / rms into r
+pub fn norm_rows(h, x, r, gains, T):
+    let t = 0
+    while t < T:
+        let row = x + t * DIM * 8
+        let ss: f64 = 0.0
+        let i = 0
+        while i < DIM:
+            let v: f64 = loadf(row + i * 8)
+            ss = ss + v * v
+            i += 1
+        let inv: f64 = fast_rsqrt(ss / f64(DIM) + 0.00001)
+        storef(r + t * 8, inv)
+        i = 0
+        while i < DIM:
+            storef(h + (t * DIM + i) * 8, loadf(row + i * 8) * inv * loadf(PARAMS + (gains + i) * 8))
+            i += 1
+        t += 1
+
+fn norm_rows_back(dx, dh, x, r, gains, T):         # dx += the way back through norm_rows; gains' into GRADS
+    let t = 0
+    while t < T:
+        let row = x + t * DIM * 8
+        let drow = dh + t * DIM * 8
+        let inv: f64 = loadf(r + t * 8)
+        let dot: f64 = 0.0
+        let i = 0
+        while i < DIM:
+            dot = dot + loadf(drow + i * 8) * loadf(PARAMS + (gains + i) * 8) * loadf(row + i * 8)
+            i += 1
+        let c: f64 = inv * inv * inv * dot / f64(DIM)
+        i = 0
+        while i < DIM:
+            let d: f64 = loadf(drow + i * 8)
+            let xi: f64 = loadf(row + i * 8)
+            let gi = GRADS + (gains + i) * 8
+            storef(gi, loadf(gi) + d * xi * inv)
+            let ox = dx + (t * DIM + i) * 8
+            storef(ox, loadf(ox) + inv * loadf(PARAMS + (gains + i) * 8) * d - c * xi)
+            i += 1
+        t += 1
+
+pub fn rotate_rows(v, T, sign: f64):                # each head's pairs turned by the position's angles
+    let pairs = HEAD / 2                            #   (sign -1: turned back, for the way back)
+    let t = 0
+    while t < T:
+        let h = 0
+        while h < HEADS:
+            let j = 0
+            while j < pairs:
+                let at = v + (t * DIM + h * HEAD + 2 * j) * 8
+                let c: f64 = loadf(ROPE_COS + (t * pairs + j) * 8)
+                let s: f64 = sign * loadf(ROPE_SIN + (t * pairs + j) * 8)
+                let a: f64 = loadf(at)
+                let b: f64 = loadf(at + 8)
+                storef(at, a * c - b * s)
+                storef(at + 8, a * s + b * c)
+                j += 1
+            h += 1
+        t += 1
+
+pub fn clamp_exp(x: f64) -> f64:
+    if x < -60.0: return 0.0
+    if x > 60.0: x = 60.0
+    return fast_exp(x)
+
+# clamp_exp over a run, all the exponentials at once: each number made what clamp_exp would take (under
+# -60, -1000, whose exponential is 0; over 60, 60), then exp_f64 -- nitropz's, fast_exp's steps exactly,
+# so the same numbers. exp_shifted: p[i] = clamp_exp(p[i] - most); negated_exp: to[i] = clamp_exp(0 - from[i])
+pub fn exp_shifted(p, n, most: f64):
+    let low: f64 = -60.0
+    let high: f64 = 60.0
+    let gone: f64 = -1000.0
+    let i = 0
+    while i < n:
+        let x: f64 = loadf(p + i * 8) - most
+        if x < low: x = gone
+        if x > high: x = high
+        storef(p + i * 8, x)
+        i += 1
+    exp_f64(p, p, n)
+
+pub fn negated_exp(to, from, n):
+    let zero: f64 = 0.0
+    let low: f64 = -60.0
+    let high: f64 = 60.0
+    let gone: f64 = -1000.0
+    let i = 0
+    while i < n:
+        let x: f64 = zero - loadf(from + i * 8)
+        if x < low: x = gone
+        if x > high: x = high
+        storef(to + i * 8, x)
+        i += 1
+    exp_f64(to, to, n)
+
+# (the two loops every pass spends its time in are nitropz built-ins, one instruction each, four floats at
+#  a time where the processor takes them: dot_f64(a, b, n), a[0] b[0] + ... + a[n-1] b[n-1], its products
+#  added in eight lanes -- nitropz says in which order -- and add_scaled_f64(to, from, by, n), to[i] +=
+#  by * from[i] one after another)
+
+# attention for layer l: each position's query against the keys up to it, the weights (PP) and the
+# weighted values (AA)
+fn attend(l, T):
+    let q = QQ + l * CONTEXT * DIM * 8
+    let k = KK + l * CONTEXT * DIM * 8
+    let v = VV + l * CONTEXT * DIM * 8
+    let a = AA + l * CONTEXT * DIM * 8
+    let scale: f64 = ATT_SCALE
+    let h = 0
+    while h < HEADS:
+        let t = 0
+        while t < T:
+            let p = PP + ((l * HEADS + h) * CONTEXT + t) * CONTEXT * 8
+            let most: f64 = -1000000000000.0
+            let j = 0
+            while j <= t:
+                let dot: f64 = dot_f64(q + (t * DIM + h * HEAD) * 8, k + (j * DIM + h * HEAD) * 8, HEAD) * scale
+                storef(p + j * 8, dot)
+                if dot > most: most = dot
+                j += 1
+            exp_shifted(p, t + 1, most)
+            let sum: f64 = 0.0
+            j = 0
+            while j <= t:
+                sum = sum + loadf(p + j * 8)
+                j += 1
+            j = 0
+            while j <= t:
+                storef(p + j * 8, loadf(p + j * 8) / sum)
+                j += 1
+            let arow = a + (t * DIM + h * HEAD) * 8
+            mem_fill(arow, 0, HEAD * 8)
+            j = 0
+            while j <= t:
+                add_scaled_f64(arow, v + (j * DIM + h * HEAD) * 8, loadf(p + j * 8), HEAD)
+                j += 1
+            t += 1
+        h += 1
+
+fn attend_back(l, T):                # from DA: DQ, DK, DV (each cleared first)
+    let q = QQ + l * CONTEXT * DIM * 8
+    let k = KK + l * CONTEXT * DIM * 8
+    let v = VV + l * CONTEXT * DIM * 8
+    let scale: f64 = ATT_SCALE
+    mem_fill(DQ, 0, T * DIM * 8)
+    mem_fill(DK, 0, T * DIM * 8)
+    mem_fill(DV, 0, T * DIM * 8)
+    let h = 0
+    while h < HEADS:
+        let t = 0
+        while t < T:
+            let p = PP + ((l * HEADS + h) * CONTEXT + t) * CONTEXT * 8
+            let weighted: f64 = 0.0
+            let j = 0
+            while j <= t:
+                let dp: f64 = dot_f64(DA + (t * DIM + h * HEAD) * 8, v + (j * DIM + h * HEAD) * 8, HEAD)
+                storef(DP + j * 8, dp)
+                weighted = weighted + loadf(p + j * 8) * dp
+                j += 1
+            j = 0
+            while j <= t:
+                let pj: f64 = loadf(p + j * 8)
+                let ds: f64 = pj * (loadf(DP + j * 8) - weighted) * scale
+                let tq = (t * DIM + h * HEAD) * 8
+                let jk = (j * DIM + h * HEAD) * 8
+                add_scaled_f64(DQ + tq, k + jk, ds, HEAD)
+                add_scaled_f64(DK + jk, q + tq, ds, HEAD)
+                add_scaled_f64(DV + jk, DA + tq, pj, HEAD)
+                j += 1
+            t += 1
+        h += 1
+
+# AC = silu(GT) * UP, over count numbers of layer l: silu(x) = x times the sigmoid of x, 1 / (1 + e^-x),
+# the e^-x first, all at once (into AC)
+fn gate_rows(count, l):
+    let g = GT + l * CONTEXT * HIDDEN * 8
+    let u = UP + l * CONTEXT * HIDDEN * 8
+    let a = AC + l * CONTEXT * HIDDEN * 8
+    negated_exp(a, g, count)
+    let one: f64 = 1.0
+    let i = 0
+    while i < count:
+        let x: f64 = loadf(g + i * 8)
+        storef(a + i * 8, x * (one / (one + loadf(a + i * 8))) * loadf(u + i * 8))
+        i += 1
+
+fn gate_rows_back(count, l):         # from DAC: DGT and DUP (the e^-x first, into DGT)
+    let g = GT + l * CONTEXT * HIDDEN * 8
+    let u = UP + l * CONTEXT * HIDDEN * 8
+    negated_exp(DGT, g, count)
+    let one: f64 = 1.0
+    let i = 0
+    while i < count:
+        let x: f64 = loadf(g + i * 8)
+        let sg: f64 = one / (one + loadf(DGT + i * 8))
+        let d: f64 = loadf(DAC + i * 8)
+        storef(DGT + i * 8, d * loadf(u + i * 8) * sg * (one + x * (one - sg)))
+        storef(DUP + i * 8, d * x * sg)
+        i += 1
+
+fn add_rows(into, from, count):
+    let i = 0
+    while i < count:
+        storef(into + i * 8, loadf(into + i * 8) + loadf(from + i * 8))
+        i += 1
+
+# ---- the whole model -----------------------------------------------------------------------------------
+# LOSS_WEIGHTS, when not 0, is a weight for each position's loss (T doubles): a position weighted 0 is
+# not learned from, one weighted 8 eight times over. 0 -- every position alike -- unless a trainer sets it.
+let LOSS_WEIGHTS = 0
+
+# the forward pass over T tokens (i32 each): every step kept; PR holds each position's chances of the
+# next byte. With targets (i32 each, or 0), the sum over the T positions of -ln(the chance of the target),
+# each times its weight in LOSS_WEIGHTS when there are weights
+pub fn model_forward(tokens, targets, T) -> f64:
+    let rows = CONTEXT * DIM
+    let wide = CONTEXT * HIDDEN
+    let t = 0
+    while t < T:
+        mem_copy(X + t * DIM * 8, PARAMS + load(tokens + t * 4) * DIM * 8, DIM * 8)
+        t += 1
+    let l = 0
+    while l < LAYERS:
+        let base = layer_base(l)
+        let s7 = layer_scales(l)
+        let x = X + l * rows * 8
+        let xm = XM + l * rows * 8
+        let h1 = H1 + l * rows * 8
+        let h2 = H2 + l * rows * 8
+        let q1 = Q1 + l * rows * 8
+        let qo = QO + l * rows * 8
+        let q2 = Q2 + l * rows * 8
+        let q3 = Q3 + l * wide * 8
+        let s1 = S1 + l * CONTEXT * 8
+        let so = SO + l * CONTEXT * 8
+        let s2 = S2 + l * CONTEXT * 8
+        let s3 = S3 + l * CONTEXT * 8
+        norm_rows(h1, x, R1 + l * CONTEXT * 8, base + L_G1, T)
+        prepare_rows(h1, q1, s1, T, DIM)
+        apply_matrix(QQ + l * rows * 8, q1, s1, base + L_WQ, s7, T, DIM, DIM)
+        apply_matrix(KK + l * rows * 8, q1, s1, base + L_WK, s7 + 1, T, DIM, DIM)
+        apply_matrix(VV + l * rows * 8, q1, s1, base + L_WV, s7 + 2, T, DIM, DIM)
+        rotate_rows(QQ + l * rows * 8, T, 1.0)
+        rotate_rows(KK + l * rows * 8, T, 1.0)
+        attend(l, T)
+        prepare_rows(AA + l * rows * 8, qo, so, T, DIM)
+        apply_matrix(TMP, qo, so, base + L_WO, s7 + 3, T, DIM, DIM)
+        mem_copy(xm, x, T * DIM * 8)
+        add_rows(xm, TMP, T * DIM)
+        norm_rows(h2, xm, R2 + l * CONTEXT * 8, base + L_G2, T)
+        prepare_rows(h2, q2, s2, T, DIM)
+        apply_matrix(GT + l * wide * 8, q2, s2, base + L_W1, s7 + 4, T, HIDDEN, DIM)
+        apply_matrix(UP + l * wide * 8, q2, s2, base + L_W3, s7 + 5, T, HIDDEN, DIM)
+        gate_rows(T * HIDDEN, l)
+        prepare_rows(AC + l * wide * 8, q3, s3, T, HIDDEN)
+        apply_matrix(TMP, q3, s3, base + L_W2, s7 + 6, T, DIM, HIDDEN)
+        let next = X + (l + 1) * rows * 8
+        mem_copy(next, xm, T * DIM * 8)
+        add_rows(next, TMP, T * DIM)
+        l += 1
+    norm_rows(HF, X + LAYERS * rows * 8, RF, OFF_FINAL, T)
+    let loss: f64 = 0.0
+    t = 0
+    while t < T:
+        let p = PR + t * VOCAB * 8
+        let hrow = HF + t * DIM * 8
+        let most: f64 = -1000000000000.0
+        let v = 0
+        while v < VOCAB:
+            let dot: f64 = dot_f64(hrow, PARAMS + v * DIM * 8, DIM)
+            storef(p + v * 8, dot)
+            if dot > most: most = dot
+            v += 1
+        exp_shifted(p, VOCAB, most)
+        let sum: f64 = 0.0
+        v = 0
+        while v < VOCAB:
+            sum = sum + loadf(p + v * 8)
+            v += 1
+        v = 0
+        while v < VOCAB:
+            storef(p + v * 8, loadf(p + v * 8) / sum)
+            v += 1
+        if targets:
+            let chance: f64 = loadf(p + load(targets + t * 4) * 8)
+            if chance < 0.000000000000000001: chance = 0.000000000000000001
+            if LOSS_WEIGHTS: loss = loss - flog(chance) * loadf(LOSS_WEIGHTS + t * 8)
+            else: loss = loss - flog(chance)
+        t += 1
+    return loss
+
+# the way back from the loss model_forward(tokens, targets, T) returned, times `weight` (and each
+# position's LOSS_WEIGHTS weight, when there are weights): every parameter's gradient added into GRADS
+pub fn model_backward(tokens, targets, T, weight: f64):
+    let rows = CONTEXT * DIM
+    let wide = CONTEXT * HIDDEN
+    mem_fill(DHF, 0, T * DIM * 8)
+    let t = 0
+    while t < T:
+        let p = PR + t * VOCAB * 8
+        let hrow = HF + t * DIM * 8
+        let drow = DHF + t * DIM * 8
+        let target = load(targets + t * 4)
+        let w: f64 = weight
+        if LOSS_WEIGHTS: w = weight * loadf(LOSS_WEIGHTS + t * 8)
+        let v = 0
+        while v < VOCAB:
+            let dl: f64 = loadf(p + v * 8)
+            if v == target: dl = dl - 1.0
+            dl = dl * w
+            add_scaled_f64(GRADS + v * DIM * 8, hrow, dl, DIM)
+            add_scaled_f64(drow, PARAMS + v * DIM * 8, dl, DIM)
+            v += 1
+        t += 1
+    mem_fill(DX, 0, T * DIM * 8)
+    norm_rows_back(DX, DHF, X + LAYERS * rows * 8, RF, OFF_FINAL, T)
+    let l = LAYERS - 1
+    while l >= 0:
+        let base = layer_base(l)
+        let s7 = layer_scales(l)
+        let x = X + l * rows * 8
+        let xm = XM + l * rows * 8
+        let q1 = Q1 + l * rows * 8
+        let qo = QO + l * rows * 8
+        let q2 = Q2 + l * rows * 8
+        let q3 = Q3 + l * wide * 8
+        let s1 = S1 + l * CONTEXT * 8
+        let so = SO + l * CONTEXT * 8
+        let s2 = S2 + l * CONTEXT * 8
+        let s3 = S3 + l * CONTEXT * 8
+        # the feed-forward: DX is the gradient of its output and of the running sum it was added to
+        mem_copy(DXM, DX, T * DIM * 8)
+        mem_fill(DAC, 0, T * HIDDEN * 8)
+        apply_matrix_back(DX, DAC, q3, s3, base + L_W2, s7 + 6, T, DIM, HIDDEN)
+        gate_rows_back(T * HIDDEN, l)
+        mem_fill(DH, 0, T * DIM * 8)
+        apply_matrix_back(DGT, DH, q2, s2, base + L_W1, s7 + 4, T, HIDDEN, DIM)
+        apply_matrix_back(DUP, DH, q2, s2, base + L_W3, s7 + 5, T, HIDDEN, DIM)
+        norm_rows_back(DXM, DH, xm, R2 + l * CONTEXT * 8, base + L_G2, T)
+        # attention: DXM is the gradient of its output and of the running sum before it
+        mem_copy(DX, DXM, T * DIM * 8)
+        mem_fill(DA, 0, T * DIM * 8)
+        apply_matrix_back(DXM, DA, qo, so, base + L_WO, s7 + 3, T, DIM, DIM)
+        attend_back(l, T)
+        rotate_rows(DQ, T, -1.0)
+        rotate_rows(DK, T, -1.0)
+        mem_fill(DH, 0, T * DIM * 8)
+        apply_matrix_back(DQ, DH, q1, s1, base + L_WQ, s7, T, DIM, DIM)
+        apply_matrix_back(DK, DH, q1, s1, base + L_WK, s7 + 1, T, DIM, DIM)
+        apply_matrix_back(DV, DH, q1, s1, base + L_WV, s7 + 2, T, DIM, DIM)
+        norm_rows_back(DX, DH, x, R1 + l * CONTEXT * 8, base + L_G1, T)
+        l -= 1
+    t = 0
+    while t < T:
+        let grow = GRADS + load(tokens + t * 4) * DIM * 8
+        let drow = DX + t * DIM * 8
+        let i = 0
+        while i < DIM:
+            storef(grow + i * 8, loadf(grow + i * 8) + loadf(drow + i * 8))
+            i += 1
+        t += 1

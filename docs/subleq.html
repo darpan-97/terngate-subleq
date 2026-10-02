@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SUBLEQ Playground</title>
+<meta name="description" content="A 15 KB model writes a SUBLEQ program; it runs, step by step, on a one-instruction computer made of logic gates a model learned.">
+<style>
+  :root{
+    color-scheme:light;
+    --bg:#f7f5f1; --panel:#ffffff; --ink:#1a1c20; --ink-soft:#4a4e57; --muted:#8a8f9a;
+    --line:#e4e0d8; --line-strong:#d3cec3;
+    --teal:#12a08c; --teal-ink:#053c34; --teal-wash:#dff2ee;
+    --amber:#c67f22; --amber-wash:#f5e6cf;
+    --shadow:0 1px 2px rgba(20,22,28,.04),0 8px 30px rgba(20,22,28,.06);
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,"Times New Roman",serif;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      color-scheme:dark;
+      --bg:#0e1013; --panel:#171a20; --ink:#e9e7e1; --ink-soft:#b3b7c0; --muted:#6c7280;
+      --line:#242832; --line-strong:#333846;
+      --teal:#2fb8a6; --teal-ink:#03110e; --teal-wash:#123029;
+      --amber:#dc9a3c; --amber-wash:#2a2113;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 34px rgba(0,0,0,.35);
+    }
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased}
+  .wrap{padding-inline:clamp(16px,5vw,48px);padding-block:clamp(24px,5vw,56px)}
+  .col{max-width:1060px;margin:0 auto;display:flex;flex-direction:column;gap:28px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--teal);font-weight:600;margin:0 0 12px}
+  h1{font-family:var(--serif);font-weight:600;letter-spacing:-.01em;line-height:1.08;font-size:clamp(28px,4.6vw,46px);margin:0 0 14px;text-wrap:balance}
+  h1 em{font-style:italic;color:var(--ink-soft)}
+  .dek{font-size:clamp(16px,2vw,18px);color:var(--ink-soft);max-width:68ch;margin:0}
+  .kicker{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 8px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:clamp(14px,2.6vw,22px);min-width:0}
+  .tasks{display:flex;flex-wrap:wrap;gap:8px}
+  .tasks button{font-family:var(--mono);font-size:13px;padding:6px 10px;border-radius:8px;border:1px solid var(--line-strong);background:var(--bg);color:var(--ink);cursor:pointer}
+  .tasks button[aria-pressed="true"]{background:var(--teal);border-color:var(--teal);color:var(--teal-ink);font-weight:600}
+  .tasks .ok{color:var(--teal);margin-left:4px}
+  .tasks button[aria-pressed="true"] .ok{color:var(--teal-ink)}
+  .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:20px}
+  @media (max-width:820px){.grid{grid-template-columns:minmax(0,1fr)}}
+  pre{margin:0;font-family:var(--mono);font-size:13.5px;line-height:1.7;overflow-x:auto}
+  .line{display:block;padding:0 8px;border-radius:6px;white-space:pre}
+  .line .at{color:var(--muted);display:inline-block;width:3.2em}
+  .line.now{background:var(--amber-wash);box-shadow:inset 3px 0 0 var(--amber)}
+  details{margin-top:14px;font-size:13px;color:var(--ink-soft)}
+  details pre{margin-top:8px;color:var(--ink-soft);font-size:12.5px;line-height:1.6}
+  .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px}
+  .controls button{font-family:var(--sans);font-size:14px;font-weight:600;padding:8px 13px;border-radius:8px;border:1px solid var(--line-strong);background:var(--panel);color:var(--ink);cursor:pointer}
+  .controls button.primary{background:var(--teal);border-color:var(--teal);color:var(--teal-ink)}
+  .controls button:disabled{opacity:.45;cursor:default}
+  .controls select{font-family:var(--sans);font-size:13px;padding:7px 8px;border-radius:8px;border:1px solid var(--line-strong);background:var(--panel);color:var(--ink)}
+  button:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid var(--teal);outline-offset:2px}
+  .status{font-family:var(--mono);font-size:13px;color:var(--muted);margin-left:auto}
+  .say{font-size:15px;min-height:3.2em;margin:0 0 14px;padding:10px 12px;border-radius:10px;background:var(--bg);border:1px solid var(--line)}
+  .say b{font-family:var(--mono);font-weight:600}
+  .cells{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:8px;margin-bottom:14px}
+  .cell{border:1px solid var(--line);border-radius:9px;padding:6px 8px;background:var(--panel);transition:background .25s,border-color .25s}
+  .cell .name{font-family:var(--mono);font-size:12px;color:var(--muted)}
+  .cell .val{font-family:var(--mono);font-size:17px;font-weight:600}
+  .cell.input .name{color:var(--teal)}
+  .cell.hit{background:var(--amber-wash);border-color:var(--amber)}
+  .out{font-family:var(--mono);font-size:16px;padding:10px 12px;border-radius:10px;border:1px dashed var(--line-strong)}
+  .out .label{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:2px;font-family:var(--mono)}
+  .rule{color:var(--ink-soft);font-size:14px;max-width:80ch}
+  .rule code{font-family:var(--mono);font-size:13px}
+  a{color:var(--teal)}
+</style>
+</head>
+<body>
+<div class="wrap"><div class="col">
+  <header>
+    <p class="eyebrow">terngate · SUBLEQ</p>
+    <h1>A program written by a <em>15 KB model</em>, run on a computer made of learned gates</h1>
+    <p class="dek">Pick a task. The 35k model writes a SUBLEQ program for it; the program runs on a computer with one
+      instruction, whose subtracting, testing and jumping are made of nothing but five logic gates another small model
+      wrote from their truth tables. Every step below is the machine's own.</p>
+  </header>
+
+  <section class="panel" aria-labelledby="tasks-k">
+    <p class="kicker" id="tasks-k">Tasks <span style="text-transform:none;letter-spacing:0">(✓ judged right on 6 sets of inputs)</span></p>
+    <div class="tasks" id="tasks" role="group" aria-label="Tasks"></div>
+  </section>
+
+  <div class="grid">
+    <section class="panel" aria-labelledby="prog-k">
+      <p class="kicker" id="prog-k">What the model wrote</p>
+      <pre id="program" aria-label="The program"></pre>
+      <details><summary>What the model was shown</summary><pre id="prompt"></pre></details>
+    </section>
+
+    <section class="panel" aria-labelledby="mach-k">
+      <p class="kicker" id="mach-k">The machine</p>
+      <div class="controls">
+        <button id="reset" type="button">Reset</button>
+        <button id="back" type="button" aria-label="Step back">◀ Back</button>
+        <button id="step" type="button" class="primary">Step ▶</button>
+        <button id="play" type="button">Play</button>
+        <select id="speed" aria-label="Speed"><option value="900">slow</option><option value="400" selected>steady</option><option value="120">fast</option></select>
+        <span class="status" id="status"></span>
+      </div>
+      <p class="say" id="say" aria-live="polite"></p>
+      <div class="cells" id="cells"></div>
+      <div class="out"><span class="label" id="out-label">r</span><span id="out"></span></div>
+    </section>
+  </div>
+
+  <section class="rule">
+    <p><b>The one instruction</b>, <code>a b c</code>: memory[b] −= memory[a]; if the result is 0 or less, go to c, else to
+      the next instruction. With b = −1 (<code>out</code>) it prints memory[a] instead, and a jump to a negative address
+      stops. Words are 16 bits. A missing c means the next instruction either way.</p>
+    <p><b>The gates</b> are NOT, OR, the full adder's sum and carry, and "choose" (a ? c : b), written by the 35k gate model
+      from their truth tables and checked row by row. The subtractor (x + NOT y + 1, a digit at a time), the "0 or less" test
+      and the jump are made of them alone. Inputs here: a = 3, b = 5, c = 7, d = 11, e = 13.</p>
+    <p>Made by <code>out/subleq_write export</code> (<code>subleq/write.nitropz</code>) from <code>models/35k_subleq.tlm2</code>.
+      <a href="../README.md">The README</a></p>
+  </section>
+</div></div>
+
+<script src="subleq_data.js"></script>
+<script>
+(function(){
+  const runs = window.SUBLEQ_RUNS || [];
+  const $ = id => document.getElementById(id);
+  const inputs = {a:3, b:5, c:7, d:11, e:13};
+  let run = null, s = 0, timer = null;
+
+  const tasksEl = $('tasks');
+  runs.forEach((r, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = r.task.replace(/^prog /, '').replace(/:$/, '');
+    if (r.right === 1) { const ok = document.createElement('span'); ok.className = 'ok'; ok.textContent = '✓'; b.appendChild(ok); }
+    b.addEventListener('click', () => choose(i));
+    tasksEl.appendChild(b);
+  });
+
+  function lines(text){ return text.replace(/\n$/, '').split('\n'); }
+  function name(at){ const c = run.cells.find(c => c[1] === at); return c ? c[0] : '#' + at; }
+  function show(v){ return String(v); }
+
+  function state(){                    // memory and output after s steps
+    const mem = run.memory.slice();
+    for (let k = mem.length; k < 512; k++) mem.push(0);
+    let out = '';
+    for (let i = 0; i < s; i++) {
+      const [pc, a, b, c, before, after, next, printed] = run.steps[i];
+      if (b !== -1) mem[b] = after;
+      if (printed >= 0) out += String.fromCharCode(printed);
+    }
+    return {mem, out};
+  }
+
+  function explain(){
+    if (s >= run.steps.length) {
+      const last = run.steps[run.steps.length - 1];
+      return 'Stopped: the last instruction jumped to ' + last[6] + ', a negative address. ' + run.steps.length + ' steps.';
+    }
+    const [pc, a, b, c, before, after, next, printed] = run.steps[s];
+    if (b === -1) return 'At ' + pc + ': <b>' + name(a) + ' out</b> prints memory[' + name(a) + '] = ' + printed + ', the byte <b>' + JSON.stringify(String.fromCharCode(printed)) + '</b>. On to ' + next + '.';
+    const st = state();
+    const av = st.mem[a] >= 32768 ? st.mem[a] - 65536 : st.mem[a];
+    let t = 'At ' + pc + ': <b>' + name(b) + ' = ' + name(b) + ' − ' + name(a) + '</b> = ' + show(before) + ' − ' + (av < 0 ? '(' + av + ')' : show(av)) + ' = <b>' + show(after) + '</b>. ';
+    if (next < 0) t += 'That is 0 or less, and c is ' + next + ': the machine stops.';
+    else if (c === pc + 3) t += 'On to ' + next + ' (no c: the next instruction either way).';
+    else if (after <= 0) t += 'That is 0 or less: jump to c, ' + next + '.';
+    else t += 'More than 0: on to ' + next + '.';
+    return t;
+  }
+
+  function render(){
+    const progLines = lines(run.program);
+    const pc = s < run.steps.length ? run.steps[s][0] : -1;
+    $('program').innerHTML = '';
+    progLines.forEach((ln, k) => {
+      const span = document.createElement('span');
+      span.className = 'line' + (k * 3 === pc ? ' now' : '');
+      const at = document.createElement('span'); at.className = 'at'; at.textContent = k * 3;
+      span.appendChild(at); span.appendChild(document.createTextNode(ln.replace(/^ {4}/, '')));
+      $('program').appendChild(span); $('program').appendChild(document.createTextNode('\n'));
+    });
+    $('prompt').textContent = run.prompt;
+    const st = state();
+    const written = s > 0 && run.steps[s - 1][2] !== -1 ? run.steps[s - 1][2] : -1;
+    $('cells').innerHTML = '';
+    run.cells.forEach(([nm, at]) => {
+      const d = document.createElement('div');
+      d.className = 'cell' + ('abcde'.includes(nm) && nm.length === 1 ? ' input' : '') + (at === written ? ' hit' : '');
+      let v = st.mem[at]; if (v >= 32768) v -= 65536;
+      const shown = nm.startsWith("'") ? v + ' (' + JSON.stringify(String.fromCharCode(v)) + ')' : v;
+      d.innerHTML = '<div class="name">' + nm + '</div><div class="val">' + shown + '</div>';
+      $('cells').appendChild(d);
+    });
+    if (run.kind === 2) { $('out-label').textContent = 'printed'; $('out').textContent = st.out === '' ? '—' : st.out; }
+    else { const v = st.mem[run.r]; $('out-label').textContent = 'the answer, r'; $('out').textContent = (v >= 32768 ? v - 65536 : v) + (s >= run.steps.length ? '' : ' (so far)'); }
+    $('say').innerHTML = explain();
+    $('status').textContent = 'step ' + s + ' of ' + run.steps.length;
+    $('back').disabled = s === 0;
+    $('step').disabled = s >= run.steps.length;
+    $('play').textContent = timer ? 'Pause' : 'Play';
+  }
+
+  function stop(){ if (timer) { clearInterval(timer); timer = null; } }
+  function choose(i){
+    stop(); run = runs[i]; s = 0;
+    [...tasksEl.children].forEach((b, k) => b.setAttribute('aria-pressed', k === i ? 'true' : 'false'));
+    render();
+  }
+  $('reset').onclick = () => { stop(); s = 0; render(); };
+  $('back').onclick = () => { stop(); if (s > 0) s--; render(); };
+  $('step').onclick = () => { stop(); if (s < run.steps.length) s++; render(); };
+  $('play').onclick = () => {
+    if (timer) { stop(); render(); return; }
+    if (s >= run.steps.length) s = 0;
+    timer = setInterval(() => { if (s < run.steps.length) { s++; render(); } if (s >= run.steps.length) { stop(); render(); } }, +$('speed').value);
+    render();
+  };
+  $('speed').onchange = () => { if (timer) { stop(); $('play').onclick(); } };
+  if (runs.length) choose(2); else $('say').textContent = 'No runs: docs/subleq_data.js is missing (out/subleq_write export).';
+})();
+</script>
+</body>
+</html>

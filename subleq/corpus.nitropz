@@ -1,0 +1,91 @@
+# corpus.nitropz KIND COUNT TEXT WEIGHTS [focused] [PARTS] -- the text the language model learns to
+# program from: COUNT tasks of KIND (products, words of 1 to PARTS letters, or sums of 1 to PARTS
+# parts; every length there is unless said: 8 letters, 4 parts), each
+# its prompt (subleq_lib's sl_prompt: the template it is shown) and then its reference program, and a
+# blank line; and a digit a byte for how much each byte counts in learning (sl_weights: the prompt 0, the
+# program 8, or "focused", 1 with each letter it copies from the prompt 9). Every program is run on the
+# gate machine and judged right before it is written. The tasks kept back for testing (pc_held) are left
+# out. The tasks are drawn from os_rand, the same in every run, so the same arguments make the same text.
+import std
+import std_io
+import std_fmt
+import fs
+import os
+import subleq_lib
+
+fn tell(text): write(1, text, slen(text))
+
+let CO_TEXT = 0
+let CO_WEIGHTS = 0
+let CO_N = 0
+
+fn co_add(question, focused):        # the task's prompt and program, and their weights
+    let prompt = sl_prompt(question)
+    let answer = sl_answer(question)
+    if sl_judge(concat(concat(question, "\n"), answer)) != 1:
+        tell(concat(concat("corpus: the reference program is wrong: ", question), "\n"))
+        exit(1)
+    let whole = concat(prompt, answer)
+    let n = slen(whole)
+    mem_copy(CO_TEXT + CO_N, whole, n)
+    mem_copy(CO_WEIGHTS + CO_N, sl_weights(prompt, answer, focused), n + 1)
+    store8(CO_TEXT + CO_N + n, 10)
+    CO_N += n + 1
+    return 1
+
+fn co_parts(question):               # how many parts a sum adds up, or letters a word has
+    if sl_kind(question) == 2: return slen(question) - 12
+    let n = 0
+    let i = 7
+    while load8(question + i) != 58:
+        let c = load8(question + i)
+        if c >= 97 and c <= 101: n += 1
+        i += 1
+    return n
+
+fn main():
+    let arg = alloc(4096)
+    if os_argc() < 4:
+        tell("corpus.nitropz KIND COUNT TEXT WEIGHTS [focused] [PARTS]: KIND products, words or sums\n")
+        return 2
+    let kind = alloc(64)
+    os_arg(0, kind, 64)
+    os_arg(1, arg, 4096)
+    let count = atoi(arg)
+    let text_path = alloc(4096)
+    let weights_path = alloc(4096)
+    os_arg(2, text_path, 4096)
+    os_arg(3, weights_path, 4096)
+    let focused = 0
+    if os_arg(4, arg, 4096) > 0 and str_cmp(arg, "focused") == 0: focused = 1
+    let parts = 8
+    if os_arg(5, arg, 4096) > 0: parts = atoi(arg)
+    let which = -1
+    if str_cmp(kind, "sums") == 0: which = 0
+    if str_cmp(kind, "products") == 0: which = 1
+    if str_cmp(kind, "words") == 0: which = 2
+    if str_cmp(kind, "held") == 0: which = 3      # only kept-back tasks, of every kind in turn: the
+    if which < 0 or count <= 0:                     #   text to measure held-out bits on
+        tell("corpus: KIND is products, words, sums or held, and COUNT a number above 0\n")
+        return 2
+    CO_TEXT = alloc(count * 320 + 4096)          # a task and its program: 311 bytes at most
+    CO_WEIGHTS = alloc(count * 320 + 4096)
+    let held = 0
+    if which == 3: held = 1
+    let made = 0
+    while made < count:
+        let q = 0
+        let kind_now = which
+        if which == 3: kind_now = made % 3
+        if kind_now == 0: q = pc_sum()
+        if kind_now == 1: q = pc_product()
+        if kind_now == 2: q = pc_word()
+        if pc_held(q) == held and (kind_now == 1 or co_parts(q) <= parts):
+            co_add(q, focused)
+            made += 1
+    fs_write_file(text_path, CO_TEXT, CO_N)
+    fs_write_file(weights_path, CO_WEIGHTS, CO_N)
+    tell(concat(concat(concat(str(made), " "), kind), concat(concat(", ", str(CO_N)), " bytes, every program run on the gate machine and right\n")))
+    return 0
+
+exit(main())

@@ -1,0 +1,39 @@
+module sample
+
+# sample -- the next byte, drawn by its chance in CHANCES (engine.nitropz): each chance raised to
+# 1 / the temperature first (under 1 leans toward the likelier bytes), and none with a chance under 1/100
+# of the likeliest's (the long tail of unlikely bytes is where nonsense comes from); a temperature of 0
+# takes the likeliest every time. os_rand's numbers are the same in every run, so a run can be had again.
+import std
+import os
+import mathf
+import fastmath
+import model
+import engine
+
+let SAMPLE_WEIGHTS = 0               # each byte's chance raised to 1 / the temperature
+
+pub fn sample_draw(temperature: f64):
+    if temperature <= 0.0: return engine_likeliest()
+    if SAMPLE_WEIGHTS == 0: SAMPLE_WEIGHTS = alloc(VOCAB * 8)
+    let floor: f64 = loadf(CHANCES + engine_likeliest() * 8) / 100.0
+    let total: f64 = 0.0
+    let v = 0
+    while v < VOCAB:
+        let p: f64 = loadf(CHANCES + v * 8)
+        let q: f64 = 0.0
+        if p >= floor: q = fast_exp(flog(p) / temperature)
+        storef(SAMPLE_WEIGHTS + v * 8, q)
+        total = total + q
+        v += 1
+    let pick: f64 = f64(os_rand()) / 2147483648.0 * total
+    let last = 0
+    v = 0
+    while v < VOCAB:
+        let q: f64 = loadf(SAMPLE_WEIGHTS + v * 8)
+        if q > 0.0:
+            last = v
+            pick = pick - q
+            if pick < 0.0: return v
+        v += 1
+    return last

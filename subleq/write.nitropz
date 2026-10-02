@@ -1,0 +1,332 @@
+# write.nitropz [MODEL] [check | live QUESTION | export [FILE]] -- the language model writes programs for the
+# one-instruction computer built from its own gates, and each is run there and judged (subleq_lib).
+# Asked "prog r=a+b-c:" (or a product, or "prog print hi:"), it is shown the task's template (sl_prompt)
+# and writes the lines after it, taking the likeliest byte each time; the program ends where a line does
+# not start with a space. Unless said, it is asked what it was never taught: 150 sums and 60 words kept
+# back, and the 4 products kept back, then the same numbers of the kinds it was taught, and says how
+# many run right. "check": 120 sums, 16 products and 60 words of the kinds it was taught, from seed 7,
+# and the count right last: to choose among saves by. "live QUESTION": one program, written as you
+# watch, then run. The judge is checked first: right programs judged right, and four broken ones (a
+# line changed, a jump lost, a letter changed, a loop that never ends) judged wrong. MODEL is
+# models/35k_subleq.tlm2 unless said.
+import std
+import std_io
+import std_fmt
+import os
+import fs
+import host_calls
+import model
+import engine
+import sample
+import subleq_lib
+
+
+fn tell(text): write(1, text, slen(text))
+
+let WP_TEXT = alloc(4096)
+let WP_LIVE = 0
+
+fn wp_task_text(question, written): # the task and the lines the model wrote after its prompt: what the
+    return concat(concat(question, "\n"), written + slen(sl_prompt(question)))    #   judge reads
+
+fn wp_write(question):               # the program the model writes after its prompt (sl_prompt: the
+    let q = sl_prompt(question)      #   kind, and the parts numbered): prompt and all
+    let length = slen(q)
+    if WP_LIVE: tell(q)
+    mem_copy(WP_TEXT, q, length)
+    let pos = 0
+    while pos < length:
+        engine_step(load8(WP_TEXT + pos) & 255, pos)
+        pos += 1
+    while length < 1000:
+        if pos == CONTEXT:
+            let keep = CONTEXT / 2
+            let from = length - keep
+            pos = 0
+            while pos < keep:
+                engine_step(load8(WP_TEXT + from + pos) & 255, pos)
+                pos += 1
+        let next = sample_draw(0.0)
+        if next != 32 and load8(WP_TEXT + length - 1) == 10: break
+        store8(WP_TEXT + length, next)
+        if WP_LIVE: write(1, WP_TEXT + length, 1)
+        length += 1
+        engine_step(next, pos)
+        pos += 1
+    store8(WP_TEXT + length, 0)
+    return concat(WP_TEXT, "")
+
+fn wp_judge_works():                 # 1 when the judge tells right programs from broken ones
+    if sl_judge(concat(concat("prog r=a+b-c:\n", sl_list("prog r=a+b-c:")), sl_answer("prog r=a+b-c:"))) != 1: return 0
+    if sl_judge(concat(concat("prog r=c*e:\n", sl_list("prog r=c*e:")), sl_answer("prog r=c*e:"))) != 1: return 0
+    if sl_judge(concat(concat("prog print hi:\n", sl_list("prog print hi:")), sl_answer("prog print hi:"))) != 1: return 0
+    if sl_judge("prog r=a+b-c:\n    a z\n    z r\n    z z\n    b z\n    r z\n    z z\n    c r\n    z z -1\n") == 1: return 0
+    if sl_judge("prog r=c*e:\n    top: z e end\n    c z\n    z r\n    z z\n    one e\n    z z\n    end: z z -1\n") == 1: return 0
+    if sl_judge("prog print hi:\n    'h out\n    'j out\n    z z -1\n") == 1: return 0
+    if sl_judge("prog r=a:\n    top: a z\n    z r\n    z z top\n") != -2: return 0
+    return 1
+
+let WP_RIGHT = 0
+let WP_ASKED = 0
+
+fn wp_ask(question, show):           # the model asked; judged; counted
+    let program = wp_write(question)
+    let verdict = sl_judge(wp_task_text(question, program))
+    WP_ASKED += 1
+    if verdict == 1: WP_RIGHT += 1
+    elif show > 0:
+        let what = "wrong"
+        if verdict == -1: what = "does not assemble"
+        if verdict == -2: what = "does not stop"
+        tell(concat(concat(concat("  ", what), ": "), concat(program, "\n")))
+    return verdict
+
+fn wp_count(what):
+    tell(concat(concat(concat(concat("  ", what), ": "), str(WP_RIGHT)), concat(concat(" of ", str(WP_ASKED)), " right\n")))
+    WP_RIGHT = 0
+    WP_ASKED = 0
+    return 0
+
+fn wp_set(kind, held, count, show):  # count questions of a kind (0 sums, 1 products, 2 words), kept back or not
+    let n = 0
+    while n < count:
+        let q = pc_sum()
+        if kind == 1: q = pc_product()
+        if kind == 2: q = pc_word()
+        if pc_held(q) == held:
+            wp_ask(q, show)
+            n += 1
+    return 0
+
+fn wp_letter(c): return c >= 97 and c <= 101         # a to e
+
+fn wp_starts(q, word):
+    let i = 0
+    while load8(word + i):
+        if load8(q + i) != load8(word + i): return 0
+        i += 1
+    return 1
+
+# can the question be asked? The template it is shown holds a sum of 1 to 4 parts (the letters a to e, each
+# after the first a + or -), a product of two letters, or a word of 1 to 8 small letters, and the question is
+# read by position: anything else would be cut to fit and judged as cut ("a*b+c" as "a*b"), so it is refused
+pub fn wp_askable(q):
+    let n = slen(q)
+    if n < 10 or load8(q + n - 1) != 58: return 0
+    if wp_starts(q, "prog print "):
+        if n - 12 < 1 or n - 12 > 8: return 0
+        let i = 11
+        while i < n - 1:
+            if load8(q + i) < 97 or load8(q + i) > 122: return 0
+            i += 1
+        return 1
+    if wp_starts(q, "prog r=") == 0: return 0
+    if n == 11 and load8(q + 8) == 42: return wp_letter(load8(q + 7)) and wp_letter(load8(q + 9))
+    let parts = 0
+    let want_letter = 1
+    let i = 7
+    while i < n - 1:
+        let c = load8(q + i)
+        if want_letter:
+            if wp_letter(c) == 0: return 0
+            parts += 1
+            want_letter = 0
+        else:
+            if c != 43 and c != 45: return 0
+            want_letter = 1
+        i += 1
+    return parts >= 1 and parts <= 4 and want_letter == 0
+
+# ---- export: programs the model writes, and every step the gate machine takes, for docs/subleq.html ----
+let WX_TASKS = ["prog r=a+b:", "prog r=e-a:", "prog r=c-d-e+b:", "prog r=a+b+c+d:", "prog r=d*b:", "prog r=c*a:", "prog r=e*b:", "prog print hi:", "prog print gate:", "prog print subleq:", "prog print ternary:", "prog print computer:"]
+let WX_INPUTS = [3, 5, 7, 11, 13]                # a to e
+
+fn wx_js(text):                      # text as a JavaScript string, quoted
+    let n = slen(text)
+    let out = alloc(n * 2 + 3)
+    let k = 0
+    store8(out, 34)
+    k = 1
+    let i = 0
+    while i < n:
+        let c = load8(text + i) & 255
+        if c == 10:
+            store8(out + k, 92)
+            store8(out + k + 1, 110)
+            k += 2
+        elif c == 34 or c == 92:
+            store8(out + k, 92)
+            store8(out + k + 1, c)
+            k += 2
+        elif c >= 32:
+            store8(out + k, c)
+            k += 1
+        i += 1
+    store8(out + k, 34)
+    store8(out + k + 1, 0)
+    return out
+
+fn wx_signed(v):
+    if v >= 32768: return v - 65536
+    return v
+
+fn wx_trace(limit):                  # the assembled program run on the gate machine (subleq_lib's datapath,
+    let rows = ""                    #   the gate model's five gates), a row a step: [pc, a, b, c, b's value
+    let pc = 0                       #   before, after, the next pc, a byte printed or -1]
+    let steps = 0
+    while pc < 32768 and steps < limit and pc <= SL_SIZE - 3:
+        let a = load(SL_MEM + pc * 4)
+        let b = load(SL_MEM + (pc + 1) * 4)
+        let c = load(SL_MEM + (pc + 2) * 4)
+        let before = 0
+        let after = 0
+        let printed = -1
+        let next = 0
+        if b == 65535:
+            printed = load(SL_MEM + a * 4) & 255
+            next = sl_add16(pc, 3)
+        else:
+            before = load(SL_MEM + b * 4)
+            after = sl_sub16(before, load(SL_MEM + a * 4))
+            store(SL_MEM + b * 4, after)
+            next = sl_choose16(sl_at_most_zero(after), sl_add16(pc, 3), c)
+        let row = concat(concat(concat(concat(concat(concat(concat(concat("[", str(pc)), ","), str(a)), ","), str(wx_signed(b))), ","), str(wx_signed(c))), ",")
+        row = concat(concat(concat(concat(concat(concat(row, str(wx_signed(before))), ","), str(wx_signed(after))), ","), str(wx_signed(next))), concat(concat(",", str(printed)), "]"))
+        if steps > 0: rows = concat(rows, ",")
+        rows = concat(rows, row)
+        pc = next
+        steps += 1
+    return rows
+
+fn wx_export(path):                  # the tasks above, each written by the model, judged, and traced: a JS file
+    let out = "// written by subleq/write.nitropz export: each task, the model's program, every step\nwindow.SUBLEQ_RUNS = [\n"
+    let t = 0
+    while t < len(WX_TASKS):
+        let question = load(WX_TASKS + t * 4)
+        let whole = wp_write(question)
+        let prompt = sl_prompt(question)
+        let text = wp_task_text(question, whole)
+        let right = sl_judge(text)
+        let k = 0
+        while k < 5:
+            store(SL_INPUTS + k * 4, load(WX_INPUTS + k * 4))
+            k += 1
+        sl_assemble(text)
+        let cells = ""
+        let i = 0
+        while i < SL_CELLS:
+            if i > 0: cells = concat(cells, ",")
+            cells = concat(cells, concat(concat(concat(concat("[", wx_js(load(SL_CELL_NAME + i * 4))), ","), str(load(SL_CELL_AT + i * 4))), "]"))
+            i += 1
+        let memory = ""
+        i = 0
+        while i < 64:
+            if i > 0: memory = concat(memory, ",")
+            memory = concat(memory, str(wx_signed(load(SL_MEM + i * 4))))
+            i += 1
+        let steps = wx_trace(2000)
+        out = concat(out, concat(concat("{\"task\":", wx_js(question)), concat(",\"kind\":", str(sl_kind(question)))))
+        out = concat(out, concat(concat(",\"prompt\":", wx_js(prompt)), concat(",\"program\":", wx_js(whole + slen(prompt)))))
+        out = concat(out, concat(concat(",\"right\":", str(right)), concat(",\"r\":", str(SL_R))))
+        out = concat(out, concat(concat(",\"cells\":[", cells), concat("],\"memory\":[", memory)))
+        out = concat(out, concat(concat("],\"steps\":[", steps), "]}"))
+        if t + 1 < len(WX_TASKS): out = concat(out, ",\n")
+        tell(concat(concat(concat(question, "  "), str(right)), "\n"))
+        t += 1
+    out = concat(out, "\n];\n")
+    fs_write_file(path, out, slen(out))
+    tell(concat(concat("wrote ", path), "\n"))
+    return 0
+
+fn main():
+    let model_path = "models/35k_subleq.tlm2"
+    let arg = alloc(4096)
+    let mode = 0                     # 0 the test, 1 check, 2 live, 3 export
+    let first = 0
+    if os_arg(0, arg, 4096) > 0:
+        if str_cmp(arg, "check") == 0: mode = 1
+        elif str_cmp(arg, "live") == 0: mode = 2
+        elif str_cmp(arg, "export") == 0: mode = 3
+        else:
+            model_path = concat(arg, "")
+            first = 1
+    if os_arg(first, arg, 4096) > 0:
+        if str_cmp(arg, "check") == 0: mode = 1
+        if str_cmp(arg, "live") == 0: mode = 2
+        if str_cmp(arg, "export") == 0: mode = 3
+    if engine_load(model_path) == 0:
+        tell(concat(concat("not a model: ", model_path), "\n"))
+        return 2
+    SL_SEED = 12345
+    if wp_judge_works() == 0:
+        tell("the judge is wrong: a right program judged wrong, or a broken one judged right\n")
+        return 1
+    if mode == 3:
+        let path = alloc(4096)
+        if os_arg(first + 1, path, 4096) <= 0: path = "docs/subleq_data.js"
+        return wx_export(path)
+    if mode == 2:
+        let question = alloc(256)
+        if os_arg(first + 1, question, 256) <= 0:
+            tell("live QUESTION, as: \"prog r=a+b-c:\" or \"prog print hi:\"\n")
+            return 2
+        if wp_askable(question) == 0:
+            tell("not a task it can be asked: a sum of 1 to 4 of the letters a to e (\"prog r=c-d-e+b:\"), a product of two (\"prog r=a*e:\"), or a word of 1 to 8 small letters (\"prog print hello:\")\n")
+            return 2
+        WP_LIVE = 1
+        let program = wp_write(question)
+        WP_LIVE = 0
+        let verdict = sl_judge(wp_task_text(question, program))
+        if verdict == -1:
+            tell("  => does not assemble\n")
+            return 0
+        if verdict == -2:
+            tell("  => does not stop\n")
+            return 0
+        tell(concat(concat(concat("  => run on the gate machine, ", str(SL_STEPS)), " steps: "), ""))
+        if sl_kind(question) == 2:
+            store8(SL_OUT + SL_OUT_N, 0)
+            tell(concat(concat("printed \"", SL_OUT), "\""))
+        elif SL_R >= 0:
+            let v = load(SL_MEM + SL_R * 4)
+            if v >= 32768: v = v - 65536
+            tell(concat("r = ", str(v)))
+        if verdict == 1: tell(" -- right on 6 sets of inputs\n")
+        else: tell(" -- WRONG\n")
+        return 0
+    if mode == 1:
+        SL_SEED = 7
+        let total = 0
+        wp_set(0, 0, 120, 0)
+        total += WP_RIGHT
+        wp_count("sums")
+        wp_set(1, 0, 16, 0)
+        total += WP_RIGHT
+        wp_count("products")
+        wp_set(2, 0, 60, 0)
+        total += WP_RIGHT
+        wp_count("words")
+        tell(concat(str(total), " of 196 right (the check, seed 7)\n"))
+        return 0
+    tell(concat(concat("\n", model_path), " writes programs for the one-instruction computer; each run there on 6 sets of inputs\n"))
+    tell("\nnever taught:\n")
+    SL_SEED = 2025
+    wp_set(0, 1, 150, 3)
+    wp_count("sums")
+    wp_ask("prog r=a*e:", 3)
+    wp_ask("prog r=c*a:", 3)
+    wp_ask("prog r=d*b:", 3)
+    wp_ask("prog r=e*c:", 3)
+    wp_count("products")
+    wp_set(2, 1, 60, 3)
+    wp_count("words")
+    tell("\ntaught (of the same kinds, not necessarily the same ones):\n")
+    wp_set(0, 0, 150, 0)
+    wp_count("sums")
+    wp_set(1, 0, 16, 0)
+    wp_count("products")
+    wp_set(2, 0, 60, 0)
+    wp_count("words")
+    return 0
+
+exit(main())

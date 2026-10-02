@@ -1,0 +1,158 @@
+module gate_judge
+
+# gate_judge -- logic gates as nitropz, and whether a piece of nitropz is the gate it says it is. A gate of
+# 1, 2 or 3 inputs is named by its answers, one a row, the rows counted n = a*4 + b*2 + c: XOR is
+# gate_0110, AND gate_0001, the one-digit adder's sum digit gate_01101001 and its carry gate_00010111.
+# Written from its truth table, a gate is the rows where it gives 1 -- its minterms, as a logic designer
+# writes any gate from its table before making it smaller:
+#     fn gate_0110(a, b):
+#         # 0:0 1:1 2:1 3:0
+#         let n = a * 2 + b
+#         if n == 1 or n == 2: return 1
+#         return 0
+# The first two lines are the question -- the name and the truth table -- and the rest the answer.
+# A text is judged by running it, not by reading it: the function, and after it every row of the gate
+# checked, compiled and run in this process by nitropz's own compiler and machine (lib/eval).
+#
+#   judge_name(g, ins)          "gate_0110" for gate 6 of 2 inputs: its answers, row 0 first
+#   judge_word(g)               what gate g of 2 inputs is called: "xor", "a and not b", "always"
+#   judge_held_out(g, ins)      1 for the 61 gates kept out of the gate model's training:
+#                               of 2 inputs XOR, AND, OR, XNOR, 0010, 0100, 1011 and 1101; of 3 the
+#                               adder's sum digit (01101001) and carry (00010111), and every gate whose
+#                               number is a multiple of 5
+#   judge_question(g, ins)      the name line and the truth table line
+#   judge_answer(g, ins)        the rest, written from the table: the lines the model is to write, in the
+#                               form JUDGE_FORM names -- 0, its minterms, as above; 1, every row in turn,
+#                               as a hardware description writes a truth table (a case a row), the same
+#                               line for every row, then a last return that no row reaches:
+#                                   let n = a * 2 + b
+#                                   if n == 0: return 0
+#                                   if n == 1: return 1
+#                                   if n == 2: return 1
+#                                   if n == 3: return 0
+#                                   return 0
+#   judge_gate(code, g, ins)    1 when the function gives every row's answer, 0 when it runs and gives a
+#                               wrong one, -1 when it does not compile or fails as it runs, -2 when it
+#                               has a loop (a `while`: a gate needs none, and one could run forever)
+#   judge_adder(x, a)           XOR (gate_0110) and AND (gate_0001) wired into an adder, a binary digit
+#                               at a time: 1 when it adds every pair of numbers below 100, and every pair
+#                               up to a billion in steps of 17,777,777, right; 0 when a sum is wrong; -1
+#                               when it does not run
+#   judge_full_adder(s, c)      the one-digit adder's sum (gate_01101001) and carry (gate_00010111)
+#                               chained a digit at a time, the same sums checked
+#   judge_start()               the compiler found: from NITROPZ_LIB, as lib/eval finds it, or else at
+#                               NITROPZ (../nitropz unless set)/bin/nitropzc.nitropzb; 0 when it is not
+import std
+import os
+import eval
+
+fn judge_has(text, word):            # does word appear in text?
+    let n = slen(text)
+    let m = slen(word)
+    let i = 0
+    while i + m <= n:
+        let k = 0
+        while k < m and load8(text + i + k) == load8(word + k): k += 1
+        if k == m: return 1
+        i += 1
+    return 0
+
+fn judge_bit(g, ins, r): return (g >> ((1 << ins) - 1 - r)) & 1          # gate g's answer on row r
+
+fn judge_input(r, ins, k): return (r >> (ins - 1 - k)) & 1              # input k's bit on row r
+
+let JUDGE_WORDS = ["never", "and", "a and not b", "a", "b and not a", "b", "xor", "or", "nor", "xnor", "not b", "a or not b", "not a", "b or not a", "nand", "always"]
+let JUDGE_PARAMS = ["", "(a)", "(a, b)", "(a, b, c)"]
+let JUDGE_ROW = ["", "a", "a * 2 + b", "a * 4 + b * 2 + c"]
+
+pub fn judge_word(g): return load(JUDGE_WORDS + g * 4)
+
+pub fn judge_held_out(g, ins):
+    if ins == 2:
+        if g == 1 or g == 2 or g == 4 or g == 6 or g == 7 or g == 9 or g == 11 or g == 13: return 1
+    if ins == 3:
+        if g == 105 or g == 23 or g % 5 == 0: return 1
+    return 0
+
+pub fn judge_name(g, ins):
+    let rows = 1 << ins
+    let name = alloc(6 + rows)
+    mem_copy(name, "gate_", 5)
+    let r = 0
+    while r < rows:
+        store8(name + 5 + r, 48 + judge_bit(g, ins, r))
+        r += 1
+    store8(name + 5 + rows, 0)
+    return name
+
+pub fn judge_question(g, ins):
+    let text = concat(concat(concat("fn ", judge_name(g, ins)), load(JUDGE_PARAMS + ins * 4)), ":\n    #")
+    let r = 0
+    while r < (1 << ins):
+        text = concat(concat(concat(concat(text, " "), str(r)), ":"), str(judge_bit(g, ins, r)))
+        r += 1
+    return concat(text, "\n")
+
+let JUDGE_FORM = 0                   # the answer's form: 0 minterms, 1 every row
+
+pub fn judge_form(form): JUDGE_FORM = form
+
+pub fn judge_answer(g, ins):
+    let text = concat(concat("    let n = ", load(JUDGE_ROW + ins * 4)), "\n")
+    if JUDGE_FORM == 1:
+        let row = 0
+        while row < (1 << ins):
+            text = concat(concat(concat(concat(text, "    if n == "), str(row)), ": return "), concat(str(judge_bit(g, ins, row)), "\n"))
+            row += 1
+        return concat(text, "    return 0\n")
+    let terms = ""
+    let r = 0
+    while r < (1 << ins):
+        if judge_bit(g, ins, r):
+            if slen(terms) > 0: terms = concat(terms, " or ")
+            terms = concat(concat(terms, "n == "), str(r))
+        r += 1
+    if slen(terms) > 0: text = concat(concat(concat(text, "    if "), terms), ": return 1\n")
+    return concat(text, "    return 0\n")
+
+pub fn judge_start():
+    let folders = alloc(4096)
+    if os_env("NITROPZ_LIB", folders, 4096) > 0: return 1
+    let home = alloc(4096)
+    if os_env("NITROPZ", home, 4096) <= 0: home = "../nitropz"
+    return eval_set_compiler(concat(home, "/bin/nitropzc.nitropzb"))
+
+pub fn judge_gate(code, g, ins):
+    if judge_has(code, "while"): return -2
+    let name = judge_name(g, ins)
+    let program = concat(code, "\nlet wrong = 0\n")
+    let r = 0
+    while r < (1 << ins):
+        let call = concat(concat(name, "("), str(judge_input(r, ins, 0)))
+        let k = 1
+        while k < ins:
+            call = concat(concat(call, ", "), str(judge_input(r, ins, k)))
+            k += 1
+        program = concat(concat(concat(concat(program, "if "), call), ") != "), concat(str(judge_bit(g, ins, r)), ": wrong += 1\n"))
+        r += 1
+    program = concat(program, "exit(wrong)\n")
+    let status = eval_text(program)
+    if eval_failed(): return -1
+    if status == 0: return 1
+    return 0
+
+# the sums both adders are checked on: every pair below 100, and every pair up to a billion in steps
+let JUDGE_SUMS = "let wrong = 0\nlet x = 0\nwhile x < 100:\n    let y = 0\n    while y < 100:\n        if add(x, y, 8) != x + y: wrong += 1\n        y += 1\n    x += 1\nx = 0\nwhile x < 1000000000:\n    let y = 0\n    while y < 1000000000:\n        if add(x, y, 31) != x + y: wrong += 1\n        y += 17777777\n    x += 17777777\nif wrong > 0: exit(1)\nexit(0)\n"
+let JUDGE_ADDER = "\nfn add(x, y, bits):\n    let result = 0\n    let carry = 0\n    let i = 0\n    while i < bits:\n        let a = (x >> i) & 1\n        let b = (y >> i) & 1\n        let half = gate_0110(a, b)\n        result = result | (gate_0110(half, carry) << i)\n        carry = gate_0110(gate_0001(a, b), gate_0001(carry, half))\n        i += 1\n    return result | (carry << bits)\n"
+let JUDGE_FULL_ADDER = "\nfn add(x, y, bits):\n    let result = 0\n    let carry = 0\n    let i = 0\n    while i < bits:\n        let a = (x >> i) & 1\n        let b = (y >> i) & 1\n        result = result | (gate_01101001(a, b, carry) << i)\n        carry = gate_00010111(a, b, carry)\n        i += 1\n    return result | (carry << bits)\n"
+
+fn judge_sums(first, second, wiring):
+    if judge_has(first, "while") or judge_has(second, "while"): return -1
+    let status = eval_text(concat(concat(concat(concat(first, "\n"), second), wiring), JUDGE_SUMS))
+    if eval_failed(): return -1
+    if status == 0: return 1
+    return 0
+
+pub fn judge_adder(xor_code, and_code): return judge_sums(xor_code, and_code, JUDGE_ADDER)
+
+pub fn judge_full_adder(sum_code, carry_code): return judge_sums(sum_code, carry_code, JUDGE_FULL_ADDER)

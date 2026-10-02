@@ -1,0 +1,430 @@
+# machine.nitropz -- a one-instruction computer whose every working part is a gate the model wrote.
+# The one instruction, SUBLEQ a b c: memory[b] -= memory[a]; if the result is 0 or less, go to c, else
+# to the next instruction (b = -1: print memory[a] as a character instead; a jump to a negative address
+# stops). Words are 16 bits. The gate model writes five gates, as you watch, each judged on its rows and
+# checked to be, byte for byte, the functions below: NOT, OR, the full adder's sum and carry, and
+# "choose" (a ? c : b). From them alone: the subtractor (x + NOT y + 1, a digit at a time), the "0 or
+# less" test (the sign, OR no bit set), the step to the next instruction (+3), and the jump chooser --
+# 114 gates a step. Only the memory and the clock (the loop) are plain code. Every program runs twice,
+# on this machine and on a plain one (ordinary - and <=), and must print and leave the same; a copy
+# with one row of the carry gate wrong must not.
+import std
+import std_io
+import std_fmt
+import os
+import host_calls
+import model
+import engine
+import sample
+import eval
+import gate_judge
+
+fn tell(text): write(1, text, slen(text))
+
+# ---- the five gates, as the model writes them (checked against it before anything runs) ----
+fn gate_10(a):
+    # 0:1 1:0
+    let n = a
+    if n == 0: return 1
+    if n == 1: return 0
+    return 0
+
+fn gate_0111(a, b):
+    # 0:0 1:1 2:1 3:1
+    let n = a * 2 + b
+    if n == 0: return 0
+    if n == 1: return 1
+    if n == 2: return 1
+    if n == 3: return 1
+    return 0
+
+fn gate_01101001(a, b, c):
+    # 0:0 1:1 2:1 3:0 4:1 5:0 6:0 7:1
+    let n = a * 4 + b * 2 + c
+    if n == 0: return 0
+    if n == 1: return 1
+    if n == 2: return 1
+    if n == 3: return 0
+    if n == 4: return 1
+    if n == 5: return 0
+    if n == 6: return 0
+    if n == 7: return 1
+    return 0
+
+fn gate_00010111(a, b, c):
+    # 0:0 1:0 2:0 3:1 4:0 5:1 6:1 7:1
+    let n = a * 4 + b * 2 + c
+    if n == 0: return 0
+    if n == 1: return 0
+    if n == 2: return 0
+    if n == 3: return 1
+    if n == 4: return 0
+    if n == 5: return 1
+    if n == 6: return 1
+    if n == 7: return 1
+    return 0
+
+fn gate_00110101(a, b, c):
+    # 0:0 1:0 2:1 3:1 4:0 5:1 6:0 7:1
+    let n = a * 4 + b * 2 + c
+    if n == 0: return 0
+    if n == 1: return 0
+    if n == 2: return 1
+    if n == 3: return 1
+    if n == 4: return 0
+    if n == 5: return 1
+    if n == 6: return 0
+    if n == 7: return 1
+    return 0
+
+let SQ_GATES = [2, 1, 7, 2, 105, 3, 23, 3, 53, 3]     # each gate's number and inputs, in the order above
+let SQ_TEXTS = ["fn gate_10(a):\n    # 0:1 1:0\n    let n = a\n    if n == 0: return 1\n    if n == 1: return 0\n    return 0\n", "fn gate_0111(a, b):\n    # 0:0 1:1 2:1 3:1\n    let n = a * 2 + b\n    if n == 0: return 0\n    if n == 1: return 1\n    if n == 2: return 1\n    if n == 3: return 1\n    return 0\n", "fn gate_01101001(a, b, c):\n    # 0:0 1:1 2:1 3:0 4:1 5:0 6:0 7:1\n    let n = a * 4 + b * 2 + c\n    if n == 0: return 0\n    if n == 1: return 1\n    if n == 2: return 1\n    if n == 3: return 0\n    if n == 4: return 1\n    if n == 5: return 0\n    if n == 6: return 0\n    if n == 7: return 1\n    return 0\n", "fn gate_00010111(a, b, c):\n    # 0:0 1:0 2:0 3:1 4:0 5:1 6:1 7:1\n    let n = a * 4 + b * 2 + c\n    if n == 0: return 0\n    if n == 1: return 0\n    if n == 2: return 0\n    if n == 3: return 1\n    if n == 4: return 0\n    if n == 5: return 1\n    if n == 6: return 1\n    if n == 7: return 1\n    return 0\n", "fn gate_00110101(a, b, c):\n    # 0:0 1:0 2:1 3:1 4:0 5:1 6:0 7:1\n    let n = a * 4 + b * 2 + c\n    if n == 0: return 0\n    if n == 1: return 0\n    if n == 2: return 1\n    if n == 3: return 1\n    if n == 4: return 0\n    if n == 5: return 1\n    if n == 6: return 0\n    if n == 7: return 1\n    return 0\n"]
+let SQ_ROLES = ["NOT", "OR", "the sum of a full adder", "the carry of a full adder", "choose (a ? c : b)"]
+
+let SQ_TEXT = alloc(4096)
+
+fn sq_write(question):               # the gate the model writes after the question, written out as it goes
+    let length = slen(question)
+    tell(question)
+    mem_copy(SQ_TEXT, question, length)
+    let pos = 0
+    while pos < length:
+        engine_step(load8(SQ_TEXT + pos) & 255, pos)
+        pos += 1
+    while length < 400:
+        if pos == CONTEXT:
+            let keep = CONTEXT / 2
+            let from = length - keep
+            pos = 0
+            while pos < keep:
+                engine_step(load8(SQ_TEXT + from + pos) & 255, pos)
+                pos += 1
+        let next = sample_draw(0.0)
+        if next != 32 and load8(SQ_TEXT + length - 1) == 10: break
+        store8(SQ_TEXT + length, next)
+        write(1, SQ_TEXT + length, 1)
+        length += 1
+        engine_step(next, pos)
+        pos += 1
+    store8(SQ_TEXT + length, 0)
+    return concat(SQ_TEXT, "")
+
+# ---- the datapath, nothing but those five gates ----
+let SQ_BAD_CARRY = 0                 # the control: 1 turns row 7 of the carry gate (1, 1, 1) to 0
+
+fn sq_carry(a, b, c):
+    if SQ_BAD_CARRY and a == 1 and b == 1 and c == 1: return 0
+    return gate_00010111(a, b, c)
+
+fn g_sub16(x, y):                    # x - y: x + NOT y + 1, a digit at a time
+    let r = 0
+    let carry = 1
+    let i = 0
+    while i < 16:
+        let a = (x >> i) & 1
+        let b = gate_10((y >> i) & 1)
+        r = r | (gate_01101001(a, b, carry) << i)
+        carry = sq_carry(a, b, carry)
+        i += 1
+    return r
+
+fn g_add16(x, y):
+    let r = 0
+    let carry = 0
+    let i = 0
+    while i < 16:
+        let a = (x >> i) & 1
+        let b = (y >> i) & 1
+        r = r | (gate_01101001(a, b, carry) << i)
+        carry = sq_carry(a, b, carry)
+        i += 1
+    return r
+
+fn g_at_most_zero(r):                # the sign bit, OR no bit set at all
+    let any = 0
+    let i = 0
+    while i < 16:
+        any = gate_0111(any, (r >> i) & 1)
+        i += 1
+    return gate_0111((r >> 15) & 1, gate_10(any))
+
+fn g_choose16(s, x0, x1):            # s ? x1 : x0, bit by bit
+    let r = 0
+    let i = 0
+    while i < 16:
+        r = r | (gate_00110101(s, (x0 >> i) & 1, (x1 >> i) & 1) << i)
+        i += 1
+    return r
+
+# ---- programs: built in memory, 16-bit words; 0-2 jump over the data; Z (0) at 3, ONE (1) at 4 ----
+let SQ_SIZE = 256
+let SQ_MEM = alloc(SQ_SIZE * 4)
+let SQ_AT = 0
+let SQ_WATCH = -1                    # a cell whose last value is part of the answer, or -1
+
+fn sq_word(v):
+    store(SQ_MEM + SQ_AT * 4, v & 65535)
+    SQ_AT += 1
+    return SQ_AT - 1
+
+fn sq_op(a, b, c):
+    sq_word(a)
+    sq_word(b)
+    sq_word(c)
+    return SQ_AT - 3
+
+fn sq_patch(op, c): store(SQ_MEM + (op + 2) * 4, c & 65535)
+fn sq_next(): return SQ_AT + 3
+fn sq_begin():
+    mem_fill(SQ_MEM, 0, SQ_SIZE * 4)
+    SQ_AT = 3
+    SQ_WATCH = -1
+    sq_word(0)
+    sq_word(1)
+    return 0
+fn sq_code():                        # the code starts here: the jump at 0 comes here
+    store(SQ_MEM, 3)
+    store(SQ_MEM + 4, 3)
+    store(SQ_MEM + 8, SQ_AT)
+    return 0
+fn sq_jump(to): return sq_op(3, 3, to)
+fn sq_add(a, b):                     # b += a
+    sq_op(a, 3, sq_next())
+    sq_op(3, b, sq_next())
+    sq_op(3, 3, sq_next())
+    return 0
+fn sq_clear(a): return sq_op(a, a, sq_next())
+fn sq_print(a): return sq_op(a, 65535, sq_next())
+fn sq_halt(): return sq_op(3, 3, 65535)
+
+fn prog_hello():
+    sq_begin()
+    let msg = "Hello from the model's gates!\n"
+    let first = SQ_AT
+    let i = 0
+    while load8(msg + i) != 0:
+        sq_word(load8(msg + i))
+        i += 1
+    sq_code()
+    let k = 0
+    while k < i:
+        sq_print(first + k)
+        k += 1
+    sq_halt()
+    return 0
+
+fn prog_countdown():
+    sq_begin()
+    let ch = sq_word(57)
+    let n = sq_word(10)
+    let nl = sq_word(10)
+    sq_code()
+    let top = sq_print(ch)
+    sq_op(4, ch, sq_next())
+    let test = sq_op(4, n, 0)
+    sq_jump(top)
+    sq_patch(test, SQ_AT)
+    sq_print(nl)
+    sq_halt()
+    return 0
+
+fn prog_multiply(x, y):
+    sq_begin()
+    let a = sq_word(x)
+    let b = sq_word(y)
+    let r = sq_word(0)
+    sq_code()
+    let top = sq_op(3, b, 0)
+    sq_op(a, 3, sq_next())
+    sq_op(3, r, sq_next())
+    sq_op(3, 3, sq_next())
+    sq_op(4, b, sq_next())
+    sq_jump(top)
+    sq_patch(top, SQ_AT)
+    sq_halt()
+    SQ_WATCH = r
+    return 0
+
+fn prog_fibonacci(count):
+    sq_begin()
+    let x = sq_word(0)
+    let y = sq_word(1)
+    let t = sq_word(0)
+    let n = sq_word(count)
+    sq_code()
+    let top = sq_op(3, n, 0)
+    sq_clear(t)
+    sq_add(x, t)
+    sq_add(y, t)
+    sq_clear(x)
+    sq_add(y, x)
+    sq_clear(y)
+    sq_add(t, y)
+    sq_op(4, n, sq_next())
+    sq_jump(top)
+    sq_patch(top, SQ_AT)
+    sq_halt()
+    SQ_WATCH = x
+    return 0
+
+fn prog_spin(count):                 # count down from count: the timing program
+    sq_begin()
+    let n = sq_word(count)
+    sq_code()
+    let top = sq_op(4, n, 0)
+    sq_jump(top)
+    sq_patch(top, SQ_AT)
+    sq_halt()
+    return 0
+
+# ---- the two machines ----
+let SQ_RUN = alloc(SQ_SIZE * 4)
+let SQ_OUT = alloc(4096)
+let SQ_OUT_N = 0
+let SQ_STEPS = 0
+
+fn sq_emit(ch):
+    if SQ_OUT_N < 4000:
+        store8(SQ_OUT + SQ_OUT_N, ch & 255)
+        SQ_OUT_N += 1
+    return 0
+
+fn sq_run(gates):                    # the program in SQ_MEM, run to its stop; 1 if it stopped
+    mem_copy(SQ_RUN, SQ_MEM, SQ_SIZE * 4)
+    SQ_OUT_N = 0
+    SQ_STEPS = 0
+    let pc = 0
+    while pc < 32768:
+        if SQ_STEPS >= 2000000: return 0
+        if pc > SQ_SIZE - 3: return 0
+        let a = load(SQ_RUN + pc * 4)
+        let b = load(SQ_RUN + (pc + 1) * 4)
+        let c = load(SQ_RUN + (pc + 2) * 4)
+        if a >= SQ_SIZE: return 0
+        if b == 65535:
+            sq_emit(load(SQ_RUN + a * 4))
+            if gates: pc = g_add16(pc, 3)
+            else: pc = pc + 3
+        else:
+            if b >= SQ_SIZE: return 0
+            if gates:
+                let r = g_sub16(load(SQ_RUN + b * 4), load(SQ_RUN + a * 4))
+                store(SQ_RUN + b * 4, r)
+                pc = g_choose16(g_at_most_zero(r), g_add16(pc, 3), c)
+            else:
+                let r = (load(SQ_RUN + b * 4) - load(SQ_RUN + a * 4)) & 65535
+                store(SQ_RUN + b * 4, r)
+                if r == 0 or r >= 32768: pc = c
+                else: pc = pc + 3
+        SQ_STEPS += 1
+    return 1
+
+fn sq_signed(v):
+    if v >= 32768: return v - 65536
+    return v
+
+let SQ_PLAIN_OUT = alloc(4096)
+
+fn sq_compare(name):                 # the program in SQ_MEM on both machines: 1 when they agree
+    let stopped_plain = sq_run(0)
+    mem_copy(SQ_PLAIN_OUT, SQ_OUT, SQ_OUT_N)
+    let plain_n = SQ_OUT_N
+    let plain_steps = SQ_STEPS
+    let plain_watch = 0
+    if SQ_WATCH >= 0: plain_watch = load(SQ_RUN + SQ_WATCH * 4)
+    let stopped_gates = sq_run(1)
+    let same = 1
+    if stopped_plain == 0 or stopped_gates == 0: same = 0
+    if SQ_OUT_N != plain_n or SQ_STEPS != plain_steps: same = 0
+    let i = 0
+    while same and i < plain_n:
+        if load8(SQ_OUT + i) != load8(SQ_PLAIN_OUT + i): same = 0
+        i += 1
+    if SQ_WATCH >= 0 and load(SQ_RUN + SQ_WATCH * 4) != plain_watch: same = 0
+    if name != 0:
+        tell(concat(concat(concat("  ", name), ": "), concat(str(SQ_STEPS), " steps")))
+        if SQ_WATCH >= 0: tell(concat(", result ", str(sq_signed(load(SQ_RUN + SQ_WATCH * 4)))))
+        if SQ_OUT_N > 0:
+            store8(SQ_OUT + SQ_OUT_N, 0)
+            tell(", printed: ")
+            write(1, SQ_OUT, SQ_OUT_N)
+            if load8(SQ_OUT + SQ_OUT_N - 1) != 10: tell("\n")
+        else: tell("\n")
+        if same: tell("    the same as the plain machine, step for step\n")
+        else: tell("    DIFFERENT from the plain machine\n")
+    return same
+
+fn sq_rate(steps, ms): return (steps / (ms + 1)) * 1000
+
+fn main():
+    if engine_load("models/35k_gates.tlm2") == 0:
+        tell("run from this repository's folder: no models/35k_gates.tlm2\n")
+        return 2
+    if judge_start() == 0:
+        tell("no compiler\n")
+        return 2
+    judge_form(1)
+    tell("the processor's five gates, asked of the model by their truth tables:\n\n")
+    let k = 0
+    while k < 5:
+        let g = load(SQ_GATES + k * 8)
+        let ins = load(SQ_GATES + k * 8 + 4)
+        tell(concat(load(SQ_ROLES + k * 4), ":\n"))
+        let text = sq_write(judge_question(g, ins))
+        if judge_gate(text, g, ins) != 1:
+            tell("  => WRONG on its truth table\n")
+            return 1
+        if str_cmp(text, load(SQ_TEXTS + k * 4)) != 0:
+            tell("  => right, but not the text this machine was built with\n")
+            return 1
+        tell("  => right on every row\n\n")
+        k += 1
+    tell("the datapath: a 16-bit subtractor (48 gates), the \"0 or less\" test (18), the +3 to the next\n")
+    tell("instruction (32) and the jump chooser (16): 114 gates a step. The programs:\n\n")
+    let all = 1
+    prog_hello()
+    all = all * sq_compare("hello")
+    prog_countdown()
+    all = all * sq_compare("countdown")
+    prog_multiply(7, 6)
+    all = all * sq_compare("multiply 7 x 6")
+    prog_multiply(123, 200)
+    all = all * sq_compare("multiply 123 x 200")
+    prog_fibonacci(20)
+    all = all * sq_compare("Fibonacci, the 20th")
+    prog_fibonacci(23)
+    all = all * sq_compare("Fibonacci, the 23rd")
+
+    SQ_BAD_CARRY = 1                 # the control: the carry gate wrong on one row of eight
+    let caught = 0
+    prog_multiply(123, 200)
+    if sq_compare(0) == 0: caught += 1
+    prog_fibonacci(23)
+    if sq_compare(0) == 0: caught += 1
+    SQ_BAD_CARRY = 0
+    if caught == 0:
+        tell("\nthe control was not caught: a wrong carry gate changed nothing -- the check proves nothing\n")
+        return 1
+    tell(concat(concat("\ncontrol: with row 7 of the carry gate wrong, ", str(caught)), " of 2 programs came out different, as they must\n"))
+
+    prog_spin(30000)                 # speed: 60,000 steps a run
+    let started = hostcall(ASK_MILLISECONDS)
+    let r = 0
+    while r < 100:
+        sq_run(0)
+        r += 1
+    let plain_ms = hostcall(ASK_MILLISECONDS) - started
+    started = hostcall(ASK_MILLISECONDS)
+    r = 0
+    while r < 5:
+        sq_run(1)
+        r += 1
+    let gates_ms = hostcall(ASK_MILLISECONDS) - started
+    tell(concat(concat("\nspeed, one core: the plain machine ", str(sq_rate(6000000, plain_ms))), " steps a second; "))
+    tell(concat(concat("the model's gates ", str(sq_rate(300000, gates_ms))), " steps a second\n"))
+    if all == 0:
+        tell("\nsome program ran DIFFERENTLY on the gates\n")
+        return 1
+    return 0
+
+exit(main())

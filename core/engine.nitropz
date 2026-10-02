@@ -1,0 +1,477 @@
+module engine
+
+# engine -- the trained model, run one byte at a time, as fast as whole numbers go. The input to a
+# ternary layer matrix is rounded to whole numbers, and for each group of four of them the 81 sums that
+# four weights of -1, 0 or +1 can make are worked out once (the tables). Each row of the matrix is then
+# a list of where its groups' sums are, and a row times the input is the sum of what its list points
+# at: a quarter of the adds of one a weight, no multiplying, and the tables shared by every row that
+# reads the same input (q, k and v share them; so do gate and up). The keys and values of every byte so
+# far are kept (a cache), so each new byte is one step, not the whole text again.
+#
+# Every step is the training forward pass's own, in the same order, so the chances it gives for each
+# next byte are that pass's to the last bit (enginecheck.nitropz holds it to that): the whole-number sums
+# are exact in any order, and each float sum is added in model.nitropz's order. The loops walk
+# addresses and take four at a time: the compiler keeps every variable in memory and works each index
+# out again, so the fewer of both, the fewer instructions.
+
+import std
+import fs
+import mathf
+import model
+
+let ROWS_OF = 0                      # for each layer matrix (7 a layer): its rows' lists, one after another,
+                                     #   each an address a group of four weights, into TABLES
+let TABLES = 0                       # for each group of four rounded inputs, the 81 sums (i32 each)
+let K_CACHE = 0                      # the keys so far: LAYERS x CONTEXT x DIM, a position after another
+let V_CACHE = 0                      # the values so far: LAYERS x CONTEXT x DIM, as the keys (the weighted
+                                     #   sum adds a position's row at a time, as training does)
+let EX = 0                           # the running sum (DIM), a norm's output (DIM), the input rounded
+let EH = 0                           #   (i32, up to HIDDEN and on to a multiple of 4), its scale (1),
+let EQ = 0                           #   queries, the new value, attention's output, the feed-forward's
+let ES = 0                           #   gate, up and middle (HIDDEN), a matrix's output, the attention
+let EQRY = 0                         #   weights (CONTEXT), and the next byte's chances
+let EV = 0
+let EATT = 0
+let EGATE = 0
+let EUP = 0
+let EACT = 0
+let EOUT = 0
+let EW = 0
+let CHANCES = 0
+
+# a model: the checkpoint train.nitropz wrote ("TLM1", the shape, every parameter a double), or one
+# pack.nitropz made of it ("TLM2", below); 0 when it is neither
+pub fn engine_load(path):
+    let size = fs_size(path)
+    if size < 28: return 0
+    let bytes = fs_read_file(path)
+    if bytes == 0: return 0
+    let magic = load(bytes)
+    if magic != 827149396 and magic != 843926612: return 0         # "TLM1", "TLM2"
+    model_shape(load(bytes + 4), load(bytes + 8), load(bytes + 12), load(bytes + 16), load(bytes + 20), load(bytes + 24))
+    QUANTIZE = 1
+    if magic == 827149396:
+        if size != 28 + PARAM_COUNT * 8: return 0
+        model_room()
+        mem_copy(PARAMS, bytes + 28, PARAM_COUNT * 8)
+        model_round()
+    else:
+        if size != packed_size(): return 0
+        model_room()
+        unpack(bytes + 28)
+    engine_prepare()
+    return 1
+
+# ---- the packed model, "TLM2": after the shape, each layer matrix's scale (a double, 7 a layer: q k
+# v o, gate up down); every layer matrix's weights in that order, a row after another, as digits 0 1 2
+# (for -1 0 +1) five to a byte, the first the lowest (3^5 = 243 fits: 1.6 bits a weight), made up to a
+# multiple of 4 bytes; each embedding row's scale (a float); the embedding, a byte a number (-127 to
+# 127, times its row's scale); and the gains, as floats: each layer's two, then the last norm's.
+pub fn packed_size():                # (a looped model's block once: its weights are the same each pass)
+    let trits = BLOCK * (4 * DIM * DIM + 3 * HIDDEN * DIM)
+    return 28 + BLOCK * 7 * 8 + ((trits + 4) / 5 + 3) / 4 * 4 + VOCAB * 4 + VOCAB * DIM + (2 * BLOCK + 1) * DIM * 4
+
+let DIGITS = 0                       # unpacking: the next byte of digits, the digits left in the one read,
+let DIGITS_LEFT = 0                  #   and what is left of it
+let DIGITS_BYTE = 0
+
+fn next_digit():
+    if DIGITS_LEFT == 0:
+        DIGITS_BYTE = load8(DIGITS) & 255
+        DIGITS += 1
+        DIGITS_LEFT = 5
+    let d = DIGITS_BYTE % 3
+    DIGITS_BYTE = DIGITS_BYTE / 3
+    DIGITS_LEFT -= 1
+    return d
+
+fn unpack_weights(at, count):        # count weights of TERNARY from at, from the digits
+    let w = TERNARY + at * 8
+    let stop = w + count * 8
+    while w < stop:
+        storef(w, f64(next_digit() - 1))
+        w += 8
+
+fn unpack_floats(at, count, from):   # count parameters of PARAMS from at, from floats at from
+    let i = 0
+    while i < count:
+        storef(PARAMS + (at + i) * 8, loadf32(from + i * 4))
+        i += 1
+    return from + count * 4
+
+fn unpack(from):                     # TERNARY, SCALES and the parameters the engine reads, from TLM2
+    let i = 0
+    while i < BLOCK * 7:
+        storef(SCALES + i * 8, loadf(from + i * 8))
+        i += 1
+    DIGITS = from + BLOCK * 7 * 8
+    DIGITS_LEFT = 0
+    let l = 0
+    while l < BLOCK:
+        let base = OFF_LAYERS + l * LAYER_SIZE
+        unpack_weights(base + L_WQ, 4 * DIM * DIM)                   # q k v o, side by side
+        unpack_weights(base + L_W1, 3 * HIDDEN * DIM)                # gate up down, the same
+        l += 1
+    let trits = BLOCK * (4 * DIM * DIM + 3 * HIDDEN * DIM)
+    let scales = from + BLOCK * 7 * 8 + ((trits + 4) / 5 + 3) / 4 * 4
+    let numbers = scales + VOCAB * 4
+    let v = 0
+    while v < VOCAB:
+        let s: f64 = loadf32(scales + v * 4)
+        let j = 0
+        while j < DIM:
+            storef(PARAMS + (v * DIM + j) * 8, f64(load8(numbers + v * DIM + j)) * s)
+            j += 1
+        v += 1
+    let gains = numbers + VOCAB * DIM
+    l = 0
+    while l < BLOCK:
+        let base = OFF_LAYERS + l * LAYER_SIZE
+        gains = unpack_floats(base + L_G1, DIM, gains)
+        gains = unpack_floats(base + L_G2, DIM, gains)
+        l += 1
+    unpack_floats(OFF_FINAL, DIM, gains)
+
+pub fn engine_prepare():             # the engine made from TERNARY, SCALES and PARAMS: listed, room made
+    let widest = DIM
+    if HIDDEN > widest: widest = HIDDEN
+    let groups = (widest + 3) / 4
+    EQ = alloc(groups * 16)
+    TABLES = alloc(groups * 81 * 4)
+    engine_lists()
+    K_CACHE = alloc(LAYERS * CONTEXT * DIM * 8)
+    V_CACHE = alloc(LAYERS * DIM * CONTEXT * 8)
+    EX = alloc(DIM * 8)
+    EH = alloc(DIM * 8)
+    ES = alloc(8)
+    EQRY = alloc(DIM * 8)
+    EV = alloc(DIM * 8)
+    EATT = alloc(DIM * 8)
+    EGATE = alloc(HIDDEN * 8)
+    EUP = alloc(HIDDEN * 8)
+    EACT = alloc(HIDDEN * 8)
+    EOUT = alloc(HIDDEN * 8)
+    EW = alloc(CONTEXT * 8)
+    CHANCES = alloc(VOCAB * 8)
+
+# each row's list of one matrix, from TERNARY: for each group of four weights (past K, 0), the
+# address of the sum they make, the first weight's digit the lowest
+fn group_matrix(at, which, N, K):
+    let G = (K + 3) / 4
+    let list = alloc(N * G * 4 + 4)
+    let next = list
+    let o = 0
+    while o < N:
+        let g = 0
+        while g < G:
+            let code = 0
+            let unit = 1
+            let i = g * 4
+            while i < g * 4 + 4:
+                let digit = 1
+                if i < K: digit = i32(loadf(TERNARY + (at + o * K + i) * 8)) + 1
+                code += digit * unit
+                unit *= 3
+                i += 1
+            store(next, TABLES + (g * 81 + code) * 4)
+            next += 4
+            g += 1
+        o += 1
+    store(ROWS_OF + which * 4, list)
+
+fn engine_lists():
+    ROWS_OF = alloc(BLOCK * 7 * 4)
+    let l = 0
+    while l < BLOCK:
+        let base = OFF_LAYERS + l * LAYER_SIZE
+        group_matrix(base + L_WQ, l * 7, DIM, DIM)
+        group_matrix(base + L_WK, l * 7 + 1, DIM, DIM)
+        group_matrix(base + L_WV, l * 7 + 2, DIM, DIM)
+        group_matrix(base + L_WO, l * 7 + 3, DIM, DIM)
+        group_matrix(base + L_W1, l * 7 + 4, HIDDEN, DIM)
+        group_matrix(base + L_W3, l * 7 + 5, HIDDEN, DIM)
+        group_matrix(base + L_W2, l * 7 + 6, DIM, HIDDEN)
+        l += 1
+
+# one row of K floats made ready for a layer matrix: rounded to whole numbers (i32, into EQ, zeros on
+# to a multiple of 4), its scale into ES -- prepare_rows' steps, for one row -- and the tables made
+fn round_row(row, K):
+    let most: f64 = 0.0
+    let r = row
+    let stop = row + K * 8
+    while r < stop:
+        let v: f64 = loadf(r)
+        if v < 0.0: v = 0.0 - v
+        if v > most: most = v
+        r += 8
+    if most < 0.000000000001: most = 0.000000000001
+    let s: f64 = 127.0 / most
+    storef(ES, s)
+    r = row
+    let e = EQ
+    while r < stop:
+        let v: f64 = loadf(r) * s
+        if v >= 0.0: store(e, i32(v + 0.5))
+        else: store(e, 0 - i32(0.5 - v))
+        r += 8
+        e += 4
+    let padded = EQ + (K + 3) / 4 * 16
+    while e < padded:
+        store(e, 0)
+        e += 4
+    build_tables(padded)
+
+# for each group of four rounded inputs a b c d (EQ up to stop), the 81 sums of them weighed by -1, 0
+# or +1: the one for weights ta tb tc td at (ta + 1) + 3 (tb + 1) + 9 (tc + 1) + 27 (td + 1)
+fn build_tables(stop):
+    let x = EQ
+    let t = TABLES
+    while x < stop:
+        let a = load(x)
+        let b = load(x + 4)
+        let c = load(x + 8)
+        let d = load(x + 12)
+        let s0 = 0 - a - b                # a and b's nine, (ta + 1) + 3 (tb + 1): the fifth is 0
+        let s1 = 0 - b
+        let s2 = a - b
+        let s3 = 0 - a
+        let s5 = a
+        let s6 = b - a
+        let s7 = b
+        let s8 = a + b
+        let cd = 0 - c - d                # each with c and d's nine added: tc the inner, td the outer
+        let j = 0
+        while j < 3:
+            let e = cd
+            let k = 0
+            while k < 3:
+                store(t, s0 + e)
+                store(t + 4, s1 + e)
+                store(t + 8, s2 + e)
+                store(t + 12, s3 + e)
+                store(t + 16, e)
+                store(t + 20, s5 + e)
+                store(t + 24, s6 + e)
+                store(t + 28, s7 + e)
+                store(t + 32, s8 + e)
+                t += 36
+                e += c
+                k += 1
+            cd += d
+            j += 1
+        x += 16
+
+# out (N floats) = the matrix which times the rounded row (K long): each row's list of sums added up,
+# times the matrix's scale, divided by the row's -- apply_matrix's arithmetic
+fn apply_groups(out, which, N, K):
+    let p = load(ROWS_OF + which * 4)
+    let per = (K + 3) / 4 * 4
+    let scale: f64 = loadf(SCALES + which * 8)
+    let s: f64 = loadf(ES)
+    let o = out
+    let stop = out + N * 8
+    while o < stop:
+        let end = p + per
+        let four = end - 12
+        let acc = 0
+        while p < four:
+            acc = acc + load(load(p)) + load(load(p + 4)) + load(load(p + 8)) + load(load(p + 12))
+            p += 16
+        while p < end:
+            acc += load(load(p))
+            p += 4
+        storef(o, f64(acc) * scale / s)
+        o += 8
+
+fn rotate_at(v, pos):                # one row's pairs turned by position pos's angles (rotate_rows')
+    let pairs = HEAD / 2
+    let h = 0
+    while h < HEADS:
+        let j = 0
+        while j < pairs:
+            let at = v + (h * HEAD + 2 * j) * 8
+            let c: f64 = loadf(ROPE_COS + (pos * pairs + j) * 8)
+            let s: f64 = 1.0 * loadf(ROPE_SIN + (pos * pairs + j) * 8)
+            let a: f64 = loadf(at)
+            let b: f64 = loadf(at + 8)
+            storef(at, a * c - b * s)
+            storef(at + 8, a * s + b * c)
+            j += 1
+        h += 1
+
+fn add_into(into, from, count):      # into += from, count f64s (add_rows')
+    let a = into
+    let b = from
+    let stop = into + count * 8
+    while a < stop:
+        storef(a, loadf(a) + loadf(b))
+        a += 8
+        b += 8
+
+# the attention weights of one head, in EW (count of them): each made e^(it - the largest), then each
+# divided by their sum -- attend's softmax
+fn softmax_weights(count, most: f64):
+    let w = EW
+    let stop = EW + count * 8
+    exp_shifted(EW, count, most)
+    let sum: f64 = 0.0
+    while w < stop:
+        sum = sum + loadf(w)
+        w += 8
+    w = EW
+    while w < stop:
+        storef(w, loadf(w) / sum)
+        w += 8
+
+# ---- watching: with engine_watch(into, width), engine_step writes down each part's numbers as it makes
+# them -- a program that draws the engine at work sees its real numbers, and nothing else changes. Part
+# `stage` of layer l goes to into + ((stage * 8 + l) * width + where) doubles (whole numbers as doubles):
+#   0 the running sum a layer starts from (layer 0: the byte's row of the embedding)   1 its norm
+#   2 the norm rounded to whole numbers   3 the query   4 the key   5 the value (q and k turned)
+#   6 each head's attention weights, head h from h * CONTEXT   7 attention's output
+#   8 the output matrix's answer   9 the running sum after it   10 its norm   11 the gate   12 up
+#   13 the gated middle   14 down's answer   15 the running sum after the layer
+#   16 (layer 0) the last norm   17 each byte's score   18 each byte's chance
+#   19 the query before it is turned   20 the key before it is turned   21 each head's scores, before
+#   the softmax (head h from h * CONTEXT)   22 attention's mix rounded to whole numbers   23 the second
+#   norm rounded   24 the gated middle rounded   25 the tables built from the first rounding: for each
+#   group of four, its 81 sums (group g from g * 81)
+let WATCH = 0
+let WATCH_WIDTH = 0
+
+pub fn engine_watch(into, width):
+    WATCH = into
+    WATCH_WIDTH = width
+
+fn note(stage, l, where, from, count, whole):
+    let to = WATCH + ((stage * 8 + l) * WATCH_WIDTH + where) * 8
+    let i = 0
+    while i < count:
+        if whole: storef(to + i * 8, f64(load(from + i * 4)))
+        else: storef(to + i * 8, loadf(from + i * 8))
+        i += 1
+
+# the byte `token` at position pos (0 up to CONTEXT - 1): through every layer, its key and value into
+# the cache; CHANCES then holds each next byte's chance
+pub fn engine_step(token, pos):
+    mem_copy(EX, PARAMS + token * DIM * 8, DIM * 8)
+    let scale: f64 = ATT_SCALE
+    let row_bytes = DIM * 8
+    let l = 0
+    while l < LAYERS:
+        let base = layer_base(l)
+        let s7 = layer_scales(l)
+        let kc = K_CACHE + l * CONTEXT * DIM * 8
+        let vc = V_CACHE + l * CONTEXT * DIM * 8
+        let key = kc + pos * DIM * 8
+        if WATCH: note(0, l, 0, EX, DIM, 0)
+        norm_rows(EH, EX, EW, base + L_G1, 1)
+        if WATCH: note(1, l, 0, EH, DIM, 0)
+        round_row(EH, DIM)
+        if WATCH:
+            note(2, l, 0, EQ, DIM, 1)
+            note(25, l, 0, TABLES, (DIM + 3) / 4 * 81, 1)
+        apply_groups(EQRY, s7, DIM, DIM)
+        apply_groups(key, s7 + 1, DIM, DIM)
+        apply_groups(EV, s7 + 2, DIM, DIM)
+        if WATCH:
+            note(19, l, 0, EQRY, DIM, 0)
+            note(20, l, 0, key, DIM, 0)
+        rotate_at(EQRY, pos)
+        rotate_at(key, pos)
+        if WATCH:
+            note(3, l, 0, EQRY, DIM, 0)
+            note(4, l, 0, key, DIM, 0)
+            note(5, l, 0, EV, DIM, 0)
+        mem_copy(vc + pos * DIM * 8, EV, DIM * 8)    # the value into the cache, its row
+        let h = 0
+        while h < HEADS:                 # attend's steps, for this position's query
+            let qh = EQRY + h * HEAD * 8
+            let most: f64 = -1000000000000.0
+            let w = EW
+            let stop = EW + (pos + 1) * 8
+            let krow = kc + h * HEAD * 8
+            while w < stop:
+                let dot: f64 = dot_f64(qh, krow, HEAD) * scale
+                storef(w, dot)
+                if dot > most: most = dot
+                w += 8
+                krow += row_bytes
+            if WATCH: note(21, l, h * CONTEXT, EW, pos + 1, 0)
+            softmax_weights(pos + 1, most)
+            if WATCH: note(6, l, h * CONTEXT, EW, pos + 1, 0)
+            let a = EATT + h * HEAD * 8              # the values, each times its weight, added a
+            mem_fill(a, 0, HEAD * 8)                 #   position after another, as attend does
+            let j = 0
+            while j <= pos:
+                add_scaled_f64(a, vc + (j * DIM + h * HEAD) * 8, loadf(EW + j * 8), HEAD)
+                j += 1
+            h += 1
+        if WATCH: note(7, l, 0, EATT, DIM, 0)
+        round_row(EATT, DIM)
+        if WATCH: note(22, l, 0, EQ, DIM, 1)
+        apply_groups(EOUT, s7 + 3, DIM, DIM)
+        if WATCH: note(8, l, 0, EOUT, DIM, 0)
+        add_into(EX, EOUT, DIM)
+        if WATCH: note(9, l, 0, EX, DIM, 0)
+        norm_rows(EH, EX, EW, base + L_G2, 1)
+        if WATCH: note(10, l, 0, EH, DIM, 0)
+        round_row(EH, DIM)
+        if WATCH: note(23, l, 0, EQ, DIM, 1)
+        apply_groups(EGATE, s7 + 4, HIDDEN, DIM)
+        apply_groups(EUP, s7 + 5, HIDDEN, DIM)
+        if WATCH:
+            note(11, l, 0, EGATE, HIDDEN, 0)
+            note(12, l, 0, EUP, HIDDEN, 0)
+        negated_exp(EACT, EGATE, HIDDEN)             # (e^-x for each, all at once)
+        let g = EGATE
+        let u = EUP
+        let m = EACT
+        let wide = EACT + HIDDEN * 8
+        let one: f64 = 1.0
+        while m < wide:
+            let x: f64 = loadf(g)
+            storef(m, x * (one / (one + loadf(m))) * loadf(u))
+            g += 8
+            u += 8
+            m += 8
+        if WATCH: note(13, l, 0, EACT, HIDDEN, 0)
+        round_row(EACT, HIDDEN)
+        if WATCH: note(24, l, 0, EQ, HIDDEN, 1)
+        apply_groups(EOUT, s7 + 6, DIM, HIDDEN)
+        if WATCH: note(14, l, 0, EOUT, DIM, 0)
+        add_into(EX, EOUT, DIM)
+        if WATCH: note(15, l, 0, EX, DIM, 0)
+        l += 1
+    norm_rows(EH, EX, EW, OFF_FINAL, 1)
+    if WATCH: note(16, 0, 0, EH, DIM, 0)
+    let most: f64 = -1000000000000.0
+    let c = CHANCES
+    let last = CHANCES + VOCAB * 8
+    let erow = PARAMS
+    while c < last:
+        let dot: f64 = dot_f64(EH, erow, DIM)
+        storef(c, dot)
+        if dot > most: most = dot
+        c += 8
+        erow += row_bytes
+    if WATCH: note(17, 0, 0, CHANCES, VOCAB, 0)
+    exp_shifted(CHANCES, VOCAB, most)
+    let sum: f64 = 0.0
+    c = CHANCES
+    while c < last:
+        sum = sum + loadf(c)
+        c += 8
+    c = CHANCES
+    while c < last:
+        storef(c, loadf(c) / sum)
+        c += 8
+    if WATCH: note(18, 0, 0, CHANCES, VOCAB, 0)
+
+pub fn engine_likeliest():           # the byte CHANCES likes best (the lowest, on a tie)
+    let best = 0
+    let v = 1
+    while v < VOCAB:
+        if loadf(CHANCES + v * 8) > loadf(CHANCES + best * 8): best = v
+        v += 1
+    return best

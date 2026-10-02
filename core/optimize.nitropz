@@ -1,0 +1,108 @@
+module optimize
+
+# optimize -- a training step: the layer matrices rounded (model_round), BATCH windows of the text at
+# random places, each forward and back, then AdamW moves every parameter (0.9 and 0.95 for its two
+# running averages; weight decay 0.1 on the layer matrices alone). The learning rate: a warm-up over
+# 1/20 of the steps, then down a cosine to a tenth. A step takes no memory it does not give back
+# (leakcheck.nitropz holds it to that): one that did, 8 bytes a parameter, filled 512 MB in 300 steps.
+
+import std
+import os
+import mathf
+import fastmath
+import model
+
+let M1 = 0                           # AdamW's two running averages, a double each for each parameter
+let M2 = 0
+let DECAYS = 0                       # 1 for each parameter weight decay acts on (the layer matrices)
+let WEIGHT_TEXT = 0                  # optimize_weights': a digit for each byte of the text, 0 to 9 -- how
+                                     #   much learning to write that byte counts; 0 when every byte counts 1
+
+# a weight for each byte of the training text, as a digit (weights, as long as the text): each window's
+# positions weighted by the bytes they are to write (LOSS_WEIGHTS)
+pub fn optimize_weights(weights):
+    WEIGHT_TEXT = weights
+    LOSS_WEIGHTS = alloc(CONTEXT * 8)
+
+pub fn optimize_start():             # (after model_start)
+    M1 = alloc(PARAM_COUNT * 8)
+    M2 = alloc(PARAM_COUNT * 8)
+    DECAYS = alloc(PARAM_COUNT)
+    let l = 0
+    while l < BLOCK:                 # q k v o, then gate up down (each weight once, however often run)
+        let base = OFF_LAYERS + l * LAYER_SIZE
+        mem_fill(DECAYS + base + L_WQ, 1, 4 * DIM * DIM)
+        mem_fill(DECAYS + base + L_W1, 1, 3 * HIDDEN * DIM)
+        l += 1
+
+pub fn window(text, at, tokens, targets, T):     # T bytes of text from at: the tokens, and each one's next
+    let i = 0
+    while i < T:
+        store(tokens + i * 4, load8(text + at + i) & 255)
+        store(targets + i * 4, load8(text + at + i + 1) & 255)
+        i += 1
+
+# one AdamW step at learning rate rate, step number n (from 1)
+fn adamw(rate: f64, n):
+    let b1: f64 = 0.9
+    let b2: f64 = 0.95
+    let fix1: f64 = 1.0 - fpow(b1, f64(n))
+    let fix2: f64 = 1.0 - fpow(b2, f64(n))
+    let i = 0
+    while i < PARAM_COUNT:
+        let g: f64 = loadf(GRADS + i * 8)
+        let m: f64 = b1 * loadf(M1 + i * 8) + (1.0 - b1) * g
+        let v: f64 = b2 * loadf(M2 + i * 8) + (1.0 - b2) * g * g
+        storef(M1 + i * 8, m)
+        storef(M2 + i * 8, v)
+        let p: f64 = loadf(PARAMS + i * 8)
+        let move: f64 = (m / fix1) / (fast_sqrt(v / fix2) + 0.00000001)
+        if load8(DECAYS + i): move = move + 0.1 * p
+        storef(PARAMS + i * 8, p - rate * move)
+        i += 1
+
+pub fn rate_at(step, steps, peak: f64) -> f64:    # step from 0
+    let warm = steps / 20
+    if warm < 1: warm = 1
+    if step < warm: return peak * f64(step + 1) / f64(warm)
+    let done: f64 = f64(step - warm) / f64(steps - warm)
+    return peak * (0.1 + 0.9 * 0.5 * (1.0 + fcos(3.141592653589793 * done)))
+
+# one window's forward and back, the text at at, its gradients added into GRADS; its loss. train_step's
+# work for one window, for the parallel trainer (train.nitropz with par.sh): each worker does its share
+# of a step's windows this way, and the lead adds their gradients up in order
+pub fn optimize_window(text, at, tokens, targets, weight: f64) -> f64:
+    let T = CONTEXT
+    window(text, at, tokens, targets, T)
+    if WEIGHT_TEXT:
+        let i = 0
+        while i < T:
+            storef(LOSS_WEIGHTS + i * 8, f64((load8(WEIGHT_TEXT + at + i + 1) & 255) - 48))
+            i += 1
+    let loss: f64 = model_forward(tokens, targets, T)
+    model_backward(tokens, targets, T, weight)
+    return loss
+
+pub fn optimize_apply(rate: f64, n): adamw(rate, n)     # AdamW on GRADS as they are (the parallel lead)
+
+# step n (from 1) at learning rate rate, on batch windows of the text (size bytes): their summed loss
+pub fn train_step(text, size, tokens, targets, batch, rate: f64, n) -> f64:
+    let T = CONTEXT
+    model_round()
+    mem_fill(GRADS, 0, PARAM_COUNT * 8)
+    let weight: f64 = 1.0 / f64(batch * T)
+    let loss: f64 = 0.0
+    let b = 0
+    while b < batch:
+        let at = os_rand() % (size - T - 1)
+        window(text, at, tokens, targets, T)
+        if WEIGHT_TEXT:                  # position i writes byte at + i + 1
+            let i = 0
+            while i < T:
+                storef(LOSS_WEIGHTS + i * 8, f64((load8(WEIGHT_TEXT + at + i + 1) & 255) - 48))
+                i += 1
+        loss = loss + model_forward(tokens, targets, T)
+        model_backward(tokens, targets, T, weight)
+        b += 1
+    adamw(rate, n)
+    return loss

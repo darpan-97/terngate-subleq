@@ -49,7 +49,10 @@
   .tasks button[aria-pressed="true"] { background: var(--field); border-color: var(--soft); font-weight: 600; }
   .own { display: flex; gap: 6px; align-items: center; margin-left: 6px; }
   .own label { color: var(--soft); }
-  .own input { font-family: var(--mono); font-size: 13px; width: 12em; padding: 4px 8px; }
+  .own input { font-family: var(--mono); font-size: 13px; width: 10.5em; padding: 4px 8px; }
+  .inputs { display: inline-flex; flex-wrap: wrap; gap: 4px 5px; align-items: center; margin-left: 4px; }
+  .inputs label { color: var(--soft); font-family: var(--mono); font-size: 12px; display: inline-flex; gap: 3px; align-items: center; }
+  .inputs input { font-family: var(--mono); font-size: 13px; width: 2.9em; padding: 3px 3px; }
   .refused { color: var(--soft); margin-top: 6px; font-size: 14px; }
 
   .main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 40px; margin-top: 18px; }
@@ -148,6 +151,7 @@
         <input id="task" autocomplete="off" spellcheck="false" placeholder="(a+b)*c-3 or print hi">
         <button type="submit">Write and run</button>
       </form>
+      <span class="inputs" role="group" aria-label="The inputs a to e"><span class="label">Inputs</span><label>a <input type="number" min="0" max="20" step="1" value="3" data-k="0" aria-label="a"></label><label>b <input type="number" min="0" max="20" step="1" value="5" data-k="1" aria-label="b"></label><label>c <input type="number" min="0" max="20" step="1" value="7" data-k="2" aria-label="c"></label><label>d <input type="number" min="0" max="20" step="1" value="11" data-k="3" aria-label="d"></label><label>e <input type="number" min="0" max="20" step="1" value="13" data-k="4" aria-label="e"></label></span>
     </div>
     <p class="refused" id="trefused" hidden></p>
     <div class="trio">
@@ -170,7 +174,7 @@
     </div>
     <p class="note">Ordinary code only turns the written lines into memory words, and checks each step against the gate machine.
       A token is a byte: <code>v</code> value, <code>a</code> address, <code>n</code> next pc, <code>p</code> printed; lowest
-      digit first. Lit: the line being run, the words read. a = 3, b = 5, c = 7, d = 11, e = 13.</p>
+      digit first. Lit: the line being run, the words read. Inputs: <span class="inputs-said">a = 3, b = 5, c = 7, d = 11, e = 13</span>.</p>
   </section>
 
   <section id="view-programs" role="tabpanel" aria-labelledby="tab-programs" hidden>
@@ -182,6 +186,7 @@
         <input id="ask" autocomplete="off" spellcheck="false" placeholder="(a+b)*c-3 or print hi">
         <button type="submit">Write</button>
       </form>
+      <span class="inputs" role="group" aria-label="The inputs a to e"><span class="label">Inputs</span><label>a <input type="number" min="0" max="20" step="1" value="3" data-k="0" aria-label="a"></label><label>b <input type="number" min="0" max="20" step="1" value="5" data-k="1" aria-label="b"></label><label>c <input type="number" min="0" max="20" step="1" value="7" data-k="2" aria-label="c"></label><label>d <input type="number" min="0" max="20" step="1" value="11" data-k="3" aria-label="d"></label><label>e <input type="number" min="0" max="20" step="1" value="13" data-k="4" aria-label="e"></label></span>
     </div>
     <p class="refused" id="refused" hidden></p>
 
@@ -218,8 +223,8 @@
         <p class="verdict" id="verdict"></p>
         <p class="note">The one instruction, <code>a b c</code>: take memory[a] from memory[b]; if that leaves 0 or less,
           go to c, else to the next line (no c: the next line either way). With <code>out</code> as b it prints
-          memory[a]; a jump to −1 stops. <code>z</code> holds 0, <code>one</code> 1, and the inputs are a = 3, b = 5,
-          c = 7, d = 11, e = 13. It multiplies and divides by counting down, so a number it counts must not be below 0.</p>
+          memory[a]; a jump to −1 stops. <code>z</code> holds 0, <code>one</code> 1, and the inputs are <span class="inputs-said">a = 3, b = 5,
+          c = 7, d = 11, e = 13</span>. It multiplies and divides by counting down, so a number it counts must not be below 0.</p>
       </section>
     </div>
   </section>
@@ -249,7 +254,12 @@
   'use strict';
   const S = window.Subleq, C = window.SubleqCompiler;
   const $ = id => document.getElementById(id);
-  const INPUTS = [3, 5, 7, 11, 13];
+  const INPUTS = [3, 5, 7, 11, 13];  // a to e: the boxes beside the tasks change them (whole numbers, 0 to 20)
+  const inputsSaid = () => 'abcde'.split('').map((l, k) => l + ' = ' + INPUTS[k]).join(', ');
+  function showInputs() {            // every box, and every note naming the inputs, as INPUTS are now
+    document.querySelectorAll('.inputs input').forEach(box => { box.value = INPUTS[+box.dataset.k]; });
+    document.querySelectorAll('.inputs-said').forEach(e => { e.textContent = inputsSaid(); });
+  }
   const EXAMPLES = ['r=a+b', 'r=c-d-e+b', 'r=d*b', 'r=e/b', 'print subleq', '(a+b)*c-3', 'a%b+100/(c+1)'];
   const DESCRIBE = { NOT: '1 when a is 0', OR: '1 when a or b is 1', sum: 'last digit of a + b + c',
                      carry: 'carry of a + b + c', choose: 'b if a is 0, else c' };
@@ -507,7 +517,7 @@
       'No inputs from 0 to 20 keep every count and divisor here 0 or more.';
     if (!cur.asm) { $('say').textContent = 'This program does not assemble, so the computer cannot run it.'; return; }
     if (cur.compiled && cur.want === null) {
-      $('say').textContent = 'With a = 3, b = 5, c = 7, d = 11, e = 13, a number it would count is below 0, so this run is not shown.';
+      $('say').textContent = 'With ' + inputsSaid() + ', a number it would count is below 0, so this run is not shown.';
       return;
     }
     const st = state();
@@ -558,6 +568,24 @@
     render();
     if (!$('view-computer').hidden) runComputer();
   }
+
+  // an input changed: the same program put in memory again with the new values, then traced and run again
+  // (the model's program does not change: it works for any inputs; that is what "right every time" checks)
+  document.querySelectorAll('.inputs input').forEach(box => box.addEventListener('change', () => {
+    let v = Math.round(Number(box.value));
+    if (!(v >= 0)) v = 0;
+    if (v > 20) v = 20;
+    INPUTS[+box.dataset.k] = v;
+    showInputs();
+    if (cur && cur.done && cur.program) {
+      stop();
+      s = 0;
+      cjob += 1;
+      cran = null;
+      finish(cur.question, cur.program, cur.compiled || null);
+    }
+  }));
+  showInputs();
 
   async function write(question, label) {     // one task the model has been taught
     if (!programModel) return;

@@ -50,9 +50,10 @@
   .own { display: flex; gap: 6px; align-items: center; margin-left: 6px; }
   .own label { color: var(--soft); }
   .own input { font-family: var(--mono); font-size: 13px; width: 10.5em; padding: 4px 8px; }
-  .inputs { display: inline-flex; flex-wrap: wrap; gap: 4px 5px; align-items: center; margin-left: 4px; }
-  .inputs label { color: var(--soft); font-family: var(--mono); font-size: 12px; display: inline-flex; gap: 3px; align-items: center; }
-  .inputs input { font-family: var(--mono); font-size: 13px; width: 2.9em; padding: 3px 3px; }
+  .tasks .inputs { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
+  .inputs label { color: var(--soft); font-family: var(--mono); font-size: 13px; display: inline-flex; gap: 6px; align-items: center; }
+  .inputs input { font-family: var(--mono); font-size: 13px; width: 3.4em; padding: 4px 6px; text-align: center; appearance: textfield; -moz-appearance: textfield; }
+  .inputs input::-webkit-outer-spin-button, .inputs input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
   .refused { color: var(--soft); margin-top: 6px; font-size: 14px; }
 
   .main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 40px; margin-top: 18px; }
@@ -151,7 +152,7 @@
         <input id="task" autocomplete="off" spellcheck="false" placeholder="(a+b)*c-3 or print hi">
         <button type="submit">Write and run</button>
       </form>
-      <span class="inputs" role="group" aria-label="The inputs a to e"><span class="label">Inputs</span><label>a <input type="number" min="0" max="20" step="1" value="3" data-k="0" aria-label="a"></label><label>b <input type="number" min="0" max="20" step="1" value="5" data-k="1" aria-label="b"></label><label>c <input type="number" min="0" max="20" step="1" value="7" data-k="2" aria-label="c"></label><label>d <input type="number" min="0" max="20" step="1" value="11" data-k="3" aria-label="d"></label><label>e <input type="number" min="0" max="20" step="1" value="13" data-k="4" aria-label="e"></label></span>
+      <span class="inputs" role="group" aria-label="The inputs a to e"><span class="label">Inputs</span><label>a = <input type="number" min="0" max="20" step="1" value="3" data-k="0" aria-label="a"></label><label>b = <input type="number" min="0" max="20" step="1" value="5" data-k="1" aria-label="b"></label><label>c = <input type="number" min="0" max="20" step="1" value="7" data-k="2" aria-label="c"></label><label>d = <input type="number" min="0" max="20" step="1" value="11" data-k="3" aria-label="d"></label><label>e = <input type="number" min="0" max="20" step="1" value="13" data-k="4" aria-label="e"></label></span>
     </div>
     <p class="refused" id="trefused" hidden></p>
     <div class="trio">
@@ -186,7 +187,7 @@
         <input id="ask" autocomplete="off" spellcheck="false" placeholder="(a+b)*c-3 or print hi">
         <button type="submit">Write</button>
       </form>
-      <span class="inputs" role="group" aria-label="The inputs a to e"><span class="label">Inputs</span><label>a <input type="number" min="0" max="20" step="1" value="3" data-k="0" aria-label="a"></label><label>b <input type="number" min="0" max="20" step="1" value="5" data-k="1" aria-label="b"></label><label>c <input type="number" min="0" max="20" step="1" value="7" data-k="2" aria-label="c"></label><label>d <input type="number" min="0" max="20" step="1" value="11" data-k="3" aria-label="d"></label><label>e <input type="number" min="0" max="20" step="1" value="13" data-k="4" aria-label="e"></label></span>
+      <span class="inputs" role="group" aria-label="The inputs a to e"><span class="label">Inputs</span><label>a = <input type="number" min="0" max="20" step="1" value="3" data-k="0" aria-label="a"></label><label>b = <input type="number" min="0" max="20" step="1" value="5" data-k="1" aria-label="b"></label><label>c = <input type="number" min="0" max="20" step="1" value="7" data-k="2" aria-label="c"></label><label>d = <input type="number" min="0" max="20" step="1" value="11" data-k="3" aria-label="d"></label><label>e = <input type="number" min="0" max="20" step="1" value="13" data-k="4" aria-label="e"></label></span>
     </div>
     <p class="refused" id="refused" hidden></p>
 
